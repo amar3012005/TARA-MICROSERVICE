@@ -1,0 +1,35 @@
+# STT/VAD Microservice Dependencies
+# Versions match parent requirements.txt for compatibility
+
+# FastAPI and server
+fastapi>=0.115.0
+uvicorn[standard]>=0.24.0
+websockets>=13.0.0
+python-multipart>=0.0.6
+
+# FastRTC for browser audio streaming
+fastrtc>=0.0.15
+
+# Pydantic for data validation
+pydantic>=2.5.0
+
+# Gemini Live API
+google-genai>=1.33.0
+
+# Audio processing (may not be directly used in service but required by imports)
+sounddevice==0.4.6
+soundfile==0.12.1
+numpy==1.24.3
+
+# Redis client
+redis[asyncio]>=5.0.0
+
+# HTTP client for health checks
+httpx>=0.24.0
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Testing dependencies (optional)
+pytest>=7.4.0
+pytest-asyncio>=0.21.0

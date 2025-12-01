@@ -1,0 +1,37 @@
+# Leibniz TTS Service Dependencies - FULL VERSION
+# For production, install these AFTER building the minimal Docker image
+# Usage: docker exec <container> pip install -r requirements.txt
+
+# FastAPI and server (included in minimal build)
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Audio processing (required for most providers)
+soundfile>=0.12.1
+numpy>=1.24.0
+
+# Google Cloud TTS (optional - ~50MB)
+google-cloud-texttospeech>=2.14.0
+google-auth>=2.23.0
+
+# ElevenLabs TTS (optional - ~10MB)
+elevenlabs>=0.2.26
+
+# Gemini Live TTS (optional - ~20MB)
+google-genai>=1.33.0
+
+# XTTS Local TTS (optional - LARGE ~2GB - for voice cloning)
+# For Linux CPU (recommended for most deployments):
+TTS>=0.22.0
+torch>=2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
+torchaudio>=2.1.0+cpu --index-url https://download.pytorch.org/whl/cpu
+scipy>=1.11.0
+
+# For Linux GPU (CUDA 11.8+):
+# torch>=2.1.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+# torchaudio>=2.1.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+
+# FastRTC Integration (for browser-based audio I/O)
+fastrtc[vad,stt,tts]>=0.1.0

@@ -1,0 +1,14 @@
+# Minimal TTS Service Dependencies (for fast Docker build)
+# Install additional providers later with: pip install -r requirements-full.txt
+
+# Core FastAPI server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# Basic audio processing (lightweight)
+numpy>=1.24.0
+
+# Mock provider (always works, no external dependencies)
+# All providers will gracefully degrade if SDKs not installed

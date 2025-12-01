@@ -1,0 +1,26 @@
+version: '3.9'
+
+services:
+  stt-vad-native:
+    build:
+      context: .
+      dockerfile: stt_vad/Dockerfile.native
+    container_name: stt-vad-native
+    ports:
+      - "7860:7860"
+      # Expose UDP port range for WebRTC media
+      - "50000-50050:50000-50050/udp"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
+      # Tell aiortc which ports to use
+      - AIORTC_UDP_PORT_MIN=50000
+      - AIORTC_UDP_PORT_MAX=50050
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount source code for hot-reloading / immediate updates
+      - ./stt_vad:/app/stt_vad
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"

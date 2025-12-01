@@ -1,0 +1,64 @@
+# Model files - should be downloaded during build/deployment
+*.safetensors
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.pkl
+*.h5
+*.onnx
+
+# Checkpoints and training artifacts
+checkpoint-*/
+**/checkpoint-*/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Gradio certificates
+.gradio/
+
+# Test outputs
+test_output/
+*.wav
+*.mp3
+*.mp4
+
+# Docker
+.dockerignore
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+

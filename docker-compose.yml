@@ -1,0 +1,187 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: leibniz-redis
+    ports:
+      - "6381:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+  stt-vad-service:
+    build:
+      context: .
+      dockerfile: stt_vad/Dockerfile
+    container_name: stt-vad-service
+    ports:
+      - "8009:8001"
+      - "7862:7860"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STT_VAD_HOST=0.0.0.0
+      - STT_VAD_PORT=8001
+      - FAST_RTC_PORT=7860
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
+      - DOCKER_ENVIRONMENT=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  intent-service:
+    build:
+      context: ..
+      dockerfile: services/intent/Dockerfile
+    container_name: intent-service
+    ports:
+      - "8010:8002"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
+      - GEMINI_MODEL=gemini-2.5-flash-lite
+      - REDIS_URL=redis://redis:6379
+      - INTENT_CACHE_TTL=1800
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+  rag-service:
+    # image: leibniz-rag:latest  # Use pre-built image
+    build:
+      context: ..
+      dockerfile: services/rag/Dockerfile
+    container_name: rag-service
+    ports:
+      - "8003:8003"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
+      - GEMINI_MODEL=gemini-2.0-flash-lite
+      - LEIBNIZ_REDIS_HOST=redis
+      - LEIBNIZ_REDIS_PORT=6379
+      - LEIBNIZ_REDIS_DB=0
+      - LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH=/app/leibniz_knowledge_base
+      - LEIBNIZ_RAG_VECTOR_STORE_PATH=/app/index
+      - LEIBNIZ_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - LEIBNIZ_RAG_TOP_K=8
+      - LEIBNIZ_RAG_TOP_N=5
+      - LEIBNIZ_RAG_SIMILARITY_THRESHOLD=0.3
+      - LEIBNIZ_RAG_CACHE_TTL=3600
+      - LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH=true
+      - PORT=8003
+      - LOG_LEVEL=INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    container_name: orchestrator-service
+    ports:
+      - "8011:8004"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+      - LEIBNIZ_REDIS_HOST=redis
+      - LEIBNIZ_REDIS_PORT=6379
+      - LEIBNIZ_REDIS_DB=0
+      - INTENT_SERVICE_URL=http://intent-service:8002
+      - RAG_SERVICE_URL=http://rag-service:8003
+      - STT_SERVICE_URL=http://stt-vad-service:8001
+      - TTS_SERVICE_URL=http://tts-service:8005
+      - LOG_LEVEL=INFO
+      - SESSION_TTL_SECONDS=3600
+      - MAX_CONCURRENT_SESSIONS=1000
+    depends_on:
+      redis:
+        condition: service_healthy
+      intent-service:
+        condition: service_started
+      rag-service:
+        condition: service_started
+      stt-vad-service:
+        condition: service_started
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+  tts-streaming-service:
+    build:
+      context: .
+      dockerfile: tts_streaming/Dockerfile
+    container_name: tts-streaming-service
+    ports:
+      - "8005:8005"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-}
+      - LEIBNIZ_LEMONFOX_VOICE=${LEIBNIZ_LEMONFOX_VOICE:-sarah}
+      - LEIBNIZ_LEMONFOX_LANGUAGE=${LEIBNIZ_LEMONFOX_LANGUAGE:-en-us}
+      - TTS_STREAMING_PORT=8005
+      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+      - LEIBNIZ_TTS_CACHE_ENABLED=true
+      - LEIBNIZ_TTS_CACHE_MAX_SIZE=500
+      - LEIBNIZ_TTS_SAMPLE_RATE=24000
+      - TTS_QUEUE_MAX_SIZE=10
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+volumes:
+  redis_data:
+
+networks:
+  leibniz-network:
+    driver: bridge
