@@ -130,7 +130,7 @@ services:
       - INTENT_SERVICE_URL=http://intent-service:8002
       - RAG_SERVICE_URL=http://rag-service:8003
       - STT_SERVICE_URL=http://stt-vad-service:8001
-      - TTS_SERVICE_URL=http://tts-service:8005
+      - TTS_SERVICE_URL=http://tts-streaming-service-new:8005
       - LOG_LEVEL=INFO
       - SESSION_TTL_SECONDS=3600
       - MAX_CONCURRENT_SESSIONS=1000
@@ -152,16 +152,16 @@ services:
         max-size: "50m"
         max-file: "2"
 
-  tts-streaming-service:
+  tts-streaming-service-new:
     build:
       context: .
       dockerfile: tts_streaming/Dockerfile
-    container_name: tts-streaming-service
+    container_name: tts-streaming-service-v3
     ports:
-      - "8005:8005"
+      - "8012:8005"
     environment:
       - PYTHONUNBUFFERED=1
-      - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-}
+      - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-6KtIDvYHZAlfKcBpjwqlb1g1XdUksVM2}
       - LEIBNIZ_LEMONFOX_VOICE=${LEIBNIZ_LEMONFOX_VOICE:-sarah}
       - LEIBNIZ_LEMONFOX_LANGUAGE=${LEIBNIZ_LEMONFOX_LANGUAGE:-en-us}
       - TTS_STREAMING_PORT=8005
