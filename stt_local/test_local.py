@@ -158,6 +158,7 @@ def test_whisper_service():
         if not torch.cuda.is_available():
             config.whisper_device = "cpu"
             config.whisper_compute_type = "float32"
+            config.use_gpu = False
             print("   ⚠️  CUDA not available, using CPU mode")
         
         print("   Loading Faster Whisper model (this may take a moment on first run)...")
@@ -166,6 +167,28 @@ def test_whisper_service():
             test_result("Whisper Service Init", True)
             test_result("Whisper Model Info", True, str(whisper.get_model_info()))
             return True
+        except (SystemError, OSError, RuntimeError) as e:
+            # CUDA/CUDNN errors - try CPU fallback
+            if "cuda" in str(e).lower() or "cudnn" in str(e).lower():
+                print("   ⚠️  CUDA error detected, retrying with CPU...")
+                config.whisper_device = "cpu"
+                config.whisper_compute_type = "float32"
+                config.use_gpu = False
+                try:
+                    whisper = WhisperService(config)
+                    test_result("Whisper Service Init (CPU fallback)", True)
+                    return True
+                except Exception as e2:
+                    test_result("Whisper Service Init", False, f"CPU fallback also failed: {e2}")
+                    import traceback
+                    traceback.print_exc()
+                    return False
+            else:
+                test_result("Whisper Service Init", False, str(e))
+                print("   ⚠️  This requires faster-whisper. Install heavy deps first.")
+                import traceback
+                traceback.print_exc()
+                return False
         except Exception as e:
             test_result("Whisper Service Init", False, str(e))
             print("   ⚠️  This requires faster-whisper. Install heavy deps first.")

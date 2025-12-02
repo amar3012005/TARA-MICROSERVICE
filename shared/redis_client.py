@@ -93,34 +93,38 @@ async def get_redis_pool() -> redis.ConnectionPool:
     Uses singleton pattern to reuse pool across calls.
     Connection pool provides better performance for high-throughput scenarios.
     
+    Note: This function is called from get_redis_client() which already holds
+    the _lock, so we don't acquire it here to avoid deadlock (asyncio.Lock is
+    not re-entrant).
+    
     Returns:
         redis.ConnectionPool: Connection pool instance
     """
     global _redis_pool
     
-    async with _lock:
-        if _redis_pool is None:
-            config = RedisConfig.from_env()
-            
-            logger.info(
-                f"Creating Redis connection pool: {config.host}:{config.port}/{config.db} "
-                f"(max_connections={config.max_connections})"
-            )
-            
-            # Create connection pool
-            # NOTE: decode_responses=True automatically converts bytes to strings.
-            # This is suitable for most caching use cases (JSON, session data, text).
-            # For binary data (audio chunks, images), store as hex/base64 strings
-            # and decode manually: bytes.fromhex(await redis.get(key))
-            _redis_pool = redis.ConnectionPool.from_url(
-                config.get_redis_url(),
-                max_connections=config.max_connections,
-                socket_timeout=config.socket_timeout,
-                socket_connect_timeout=config.socket_connect_timeout,
-                decode_responses=True,  # Auto-decode bytes to strings
-            )
+    # No lock here - called from get_redis_client() which already holds _lock
+    if _redis_pool is None:
+        config = RedisConfig.from_env()
         
-        return _redis_pool
+        logger.info(
+            f"Creating Redis connection pool: {config.host}:{config.port}/{config.db} "
+            f"(max_connections={config.max_connections})"
+        )
+        
+        # Create connection pool
+        # NOTE: decode_responses=True automatically converts bytes to strings.
+        # This is suitable for most caching use cases (JSON, session data, text).
+        # For binary data (audio chunks, images), store as hex/base64 strings
+        # and decode manually: bytes.fromhex(await redis.get(key))
+        _redis_pool = redis.ConnectionPool.from_url(
+            config.get_redis_url(),
+            max_connections=config.max_connections,
+            socket_timeout=config.socket_timeout,
+            socket_connect_timeout=config.socket_connect_timeout,
+            decode_responses=True,  # Auto-decode bytes to strings
+        )
+    
+    return _redis_pool
 
 
 async def get_redis_client() -> redis.Redis:

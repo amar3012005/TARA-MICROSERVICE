@@ -63,18 +63,30 @@ async def lifespan(app: FastAPI):
     config = OrchestratorConfig.from_env()
     logger.info(f"📋 Configuration loaded")
     
-    # Connect to Redis with timeout
-    try:
-        # Increased timeout to allow for connection retries
-        redis_client = await asyncio.wait_for(get_redis_client(), timeout=20.0)
-        await asyncio.wait_for(ping_redis(redis_client), timeout=5.0)
-        logger.info("✅ Redis connected")
-    except asyncio.TimeoutError:
-        logger.warning(f"⚠️ Redis connection timeout - service will run in degraded mode")
-        redis_client = None
-    except Exception as e:
-        logger.warning(f"⚠️ Redis connection failed: {e}")
-        redis_client = None
+    # Connect to Redis with timeout and retries
+    redis_client = None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting Redis connection (attempt {attempt + 1}/{max_retries})...")
+            redis_client = await asyncio.wait_for(get_redis_client(), timeout=15.0)
+            await asyncio.wait_for(ping_redis(redis_client), timeout=5.0)
+            logger.info("✅ Redis connected")
+            break
+        except asyncio.TimeoutError:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ Redis connection timeout (attempt {attempt + 1}/{max_retries}), retrying...")
+                await asyncio.sleep(2.0)
+            else:
+                logger.warning(f"⚠️ Redis connection timeout after {max_retries} attempts - service will run in degraded mode")
+                redis_client = None
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"⚠️ Redis connection failed (attempt {attempt + 1}/{max_retries}): {e}, retrying...")
+                await asyncio.sleep(2.0)
+            else:
+                logger.warning(f"⚠️ Redis connection failed after {max_retries} attempts: {e}")
+                redis_client = None
     
     # Start Redis subscriber background task
     global redis_listener_task

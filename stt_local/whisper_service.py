@@ -49,33 +49,65 @@ class WhisperService:
         try:
             logger.info(f"📥 Loading Faster Whisper model ({self.config.whisper_model_size})...")
             
+            # Check CUDA availability before attempting GPU load
+            import torch
+            cuda_available = torch.cuda.is_available() if self.config.use_gpu else False
+            
+            if self.config.use_gpu and not cuda_available:
+                logger.warning("⚠️ GPU requested but CUDA not available - falling back to CPU")
+                self.config.whisper_device = "cpu"
+                self.config.whisper_compute_type = "float32"
+                self.config.use_gpu = False
+            
             # Load model with specified settings
-            self.model = WhisperModel(
-                model_size_or_path=self.config.whisper_model_size,
-                device=self.config.whisper_device,
-                compute_type=self.config.whisper_compute_type,
-                num_workers=self.config.num_workers,
-                download_root=None  # Use default cache location
-            )
+            try:
+                self.model = WhisperModel(
+                    model_size_or_path=self.config.whisper_model_size,
+                    device=self.config.whisper_device,
+                    compute_type=self.config.whisper_compute_type,
+                    num_workers=self.config.num_workers,
+                    download_root=None  # Use default cache location
+                )
+                logger.info("✅ Faster Whisper model loaded successfully")
+            except (SystemError, OSError, RuntimeError) as e:
+                # CUDA/CUDNN errors - fallback to CPU
+                if self.config.use_gpu and ("cuda" in str(e).lower() or "cudnn" in str(e).lower()):
+                    logger.warning(f"⚠️ GPU load failed ({e}) - falling back to CPU")
+                    self.config.whisper_device = "cpu"
+                    self.config.whisper_compute_type = "float32"
+                    self.config.use_gpu = False
+                    # Retry with CPU
+                    self.model = WhisperModel(
+                        model_size_or_path=self.config.whisper_model_size,
+                        device="cpu",
+                        compute_type="float32",
+                        num_workers=self.config.num_workers,
+                        download_root=None
+                    )
+                    logger.info("✅ Faster Whisper model loaded with CPU fallback")
+                else:
+                    raise
             
-            logger.info("✅ Faster Whisper model loaded successfully")
-            
-            # Warmup: Run a dummy inference to initialize CUDA kernels
-            if self.config.use_gpu:
+            # Warmup: Only if GPU is actually available and working
+            if self.config.use_gpu and cuda_available:
                 logger.info("🔥 Warming up GPU kernels...")
                 dummy_audio = np.zeros((16000,), dtype=np.float32)  # 1 second of silence
                 try:
                     segments, info = self.model.transcribe(
                         dummy_audio,
                         language=self.config.whisper_language,
-                        beam_size=self.config.whisper_beam_size,
+                        beam_size=1,  # Use minimal beam size for faster warmup
                         vad_filter=False  # We use Silero VAD, so disable Whisper VAD
                     )
-                    # Consume generator
+                    # Consume generator (but don't wait too long)
                     list(segments)
                     logger.info("✅ GPU warmup complete")
-                except Exception as e:
+                except (Exception, SystemError, OSError, RuntimeError) as e:
                     logger.warning(f"⚠️ GPU warmup failed: {e}")
+                    logger.info("   Continuing with GPU (warmup skipped - first request may be slower)")
+                    # Don't reload - just continue, model is already loaded
+            else:
+                logger.info("ℹ️ Skipping GPU warmup (CPU mode or CUDA unavailable)")
             
         except Exception as e:
             logger.error(f"❌ Failed to load Faster Whisper model: {e}")

@@ -24,10 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY services/rag/requirements.txt .
 COPY services/rag/requirements_after.txt .
 
-# Install ONLY lightweight dependencies during build (fast build)
+# Install ALL dependencies during build (includes heavy packages)
 RUN pip install --default-timeout=1000 --user --no-cache-dir -r requirements.txt && \
-    echo "✅ Lightweight dependencies installed (fast build)" && \
-    echo "⚠️  Heavy packages (sentence-transformers, torch) will be installed manually after container starts"
+    echo "✅ All dependencies installed (including sentence-transformers, torch)"
 
 # ============================================================================
 # Index Builder Stage - Build FAISS index
