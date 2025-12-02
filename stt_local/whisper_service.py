@@ -88,24 +88,14 @@ class WhisperService:
                 else:
                     raise
             
-            # Warmup: Only if GPU is actually available and working
+            # Warmup: DISABLED to prevent CUDNN core dump crashes
+            # CRITICAL: CUDNN errors cause core dumps at C++ level that Python cannot catch
+            # Even testing CUDNN can cause crashes if libraries are misconfigured
+            # Solution: Skip warmup entirely - the first real transcription request will warm up the model
+            # This is safer and the first request latency is acceptable
             if self.config.use_gpu and cuda_available:
-                logger.info("🔥 Warming up GPU kernels...")
-                dummy_audio = np.zeros((16000,), dtype=np.float32)  # 1 second of silence
-                try:
-                    segments, info = self.model.transcribe(
-                        dummy_audio,
-                        language=self.config.whisper_language,
-                        beam_size=1,  # Use minimal beam size for faster warmup
-                        vad_filter=False  # We use Silero VAD, so disable Whisper VAD
-                    )
-                    # Consume generator (but don't wait too long)
-                    list(segments)
-                    logger.info("✅ GPU warmup complete")
-                except (Exception, SystemError, OSError, RuntimeError) as e:
-                    logger.warning(f"⚠️ GPU warmup failed: {e}")
-                    logger.info("   Continuing with GPU (warmup skipped - first request may be slower)")
-                    # Don't reload - just continue, model is already loaded
+                logger.info("ℹ️ GPU warmup skipped (CUDNN safety - first request will warm up the model)")
+                logger.info("   Note: First transcription request may be slower as it warms up GPU kernels")
             else:
                 logger.info("ℹ️ Skipping GPU warmup (CPU mode or CUDA unavailable)")
             
@@ -146,27 +136,68 @@ class WhisperService:
                 logger.debug(f"Audio too short for STT: {audio_duration:.2f}s")
                 return "", 0.0
             
-            # Transcribe
+            # Check audio energy - use low threshold
+            audio_rms = np.sqrt(np.mean(audio ** 2))
+            logger.info(f"🔊 Final transcribe RMS: {audio_rms:.4f}")
+            if audio_rms < 0.001:  # Only skip truly silent audio
+                logger.debug(f"Audio too quiet (RMS={audio_rms:.4f}), skipping")
+                return "", 0.0
+            
+            # Transcribe with context prompt to reduce hallucination
             start_time = time.time()
             
             segments, info = self.model.transcribe(
                 audio,
                 language=lang,
                 beam_size=self.config.whisper_beam_size,
-                vad_filter=False,  # We use Silero VAD, so disable Whisper VAD
-                condition_on_previous_text=not is_partial  # Don't condition on previous for partials
+                vad_filter=False,
+                condition_on_previous_text=not is_partial,
+                # NO initial_prompt - it causes hallucination when transcribed as speech
             )
             
-            # Collect segments
+            # Collect segments - relaxed filtering
             transcript_parts = []
             total_confidence = 0.0
             segment_count = 0
+            segments_list = list(segments)
             
-            for segment in segments:
-                text = segment.text.strip()
+            logger.info(f"🔍 Final: Whisper returned {len(segments_list)} segments")
+            
+            # Common hallucination patterns to filter out
+            HALLUCINATION_PATTERNS = [
+                "the following is a conversation",
+                "thank you for watching",
+                "thanks for watching", 
+                "please subscribe",
+                "like and subscribe",
+                "see you next time",
+                "bye bye",
+                "goodbye",
+            ]
+            
+            for segment in segments_list:
+                text = segment.text.strip() if segment.text else ""
+                no_speech = getattr(segment, 'no_speech_prob', 0.0)
+                logprob = getattr(segment, 'avg_logprob', 0.0)
+                
+                logger.info(f"   Segment: '{text[:50]}' | no_speech={no_speech:.2f} | logprob={logprob:.2f}")
+                
+                # Skip if Whisper thinks it might not be speech
+                if no_speech > 0.5:
+                    logger.info(f"   ⏭️ Skipped (no_speech={no_speech:.2f} > 0.5)")
+                    continue
+                
+                # Filter known hallucination patterns
+                text_lower = text.lower()
+                is_hallucination = any(pattern in text_lower for pattern in HALLUCINATION_PATTERNS)
+                if is_hallucination:
+                    logger.info(f"   ⏭️ Skipped (hallucination pattern detected)")
+                    continue
+                    
                 if text:
                     transcript_parts.append(text)
-                    total_confidence += segment.avg_logprob  # Use logprob as confidence proxy
+                    if hasattr(segment, 'avg_logprob'):
+                        total_confidence += segment.avg_logprob
                     segment_count += 1
             
             # Combine transcript
@@ -204,7 +235,8 @@ class WhisperService:
         """
         Transcribe audio for streaming (partial) updates.
         
-        Uses faster settings optimized for low latency.
+        Uses greedy decoding (beam_size=1) for ultra-low latency.
+        Includes hallucination prevention via no_speech_threshold.
         
         Args:
             audio: Audio samples as numpy array
@@ -213,7 +245,100 @@ class WhisperService:
         Returns:
             Tuple[str, float]: (transcript_text, confidence)
         """
-        return self.transcribe(audio, language=language, is_partial=True)
+        if self.model is None:
+            logger.error("Whisper model not loaded")
+            return "", 0.0
+        
+        try:
+            lang = language or self.config.whisper_language
+            
+            # Check minimum audio length
+            audio_duration = len(audio) / self.config.sample_rate
+            if audio_duration < self.config.min_audio_length_for_stt:
+                return "", 0.0
+            
+            # Check audio energy - use low threshold to catch speech
+            audio_rms = np.sqrt(np.mean(audio ** 2))
+            logger.info(f"🔊 Streaming RMS: {audio_rms:.4f}")
+            if audio_rms < 0.001:  # Only skip truly silent audio
+                logger.debug(f"Audio too quiet (RMS={audio_rms:.4f}), skipping")
+                return "", 0.0
+            
+            start_time = time.time()
+            
+            # ULTRA-LOW LATENCY - NO initial_prompt (it causes hallucination)
+            segments, info = self.model.transcribe(
+                audio,
+                language=lang,
+                beam_size=1,  # Greedy decoding for speed
+                best_of=1,    # No sampling
+                vad_filter=False,
+                condition_on_previous_text=False,  # Don't condition for partials
+                # NO initial_prompt - it gets transcribed as speech on silence
+            )
+            
+            # Collect segments - log everything for debugging
+            transcript_parts = []
+            total_confidence = 0.0
+            segment_count = 0
+            segments_list = list(segments)  # Consume generator
+            
+            logger.info(f"🔍 Whisper returned {len(segments_list)} segments")
+            
+            # Common hallucination patterns to filter out
+            HALLUCINATION_PATTERNS = [
+                "the following is a conversation",
+                "thank you for watching",
+                "thanks for watching", 
+                "please subscribe",
+                "like and subscribe",
+                "see you next time",
+                "bye bye",
+                "goodbye",
+            ]
+            
+            for segment in segments_list:
+                text = segment.text.strip() if segment.text else ""
+                no_speech = getattr(segment, 'no_speech_prob', 0.0)
+                logprob = getattr(segment, 'avg_logprob', 0.0)
+                
+                logger.info(f"   Segment: '{text[:50]}' | no_speech={no_speech:.2f} | logprob={logprob:.2f}")
+                
+                # Filter uncertain segments - skip if Whisper thinks it might not be speech
+                if no_speech > 0.5:
+                    logger.info(f"   ⏭️ Skipped (no_speech={no_speech:.2f} > 0.5)")
+                    continue
+                
+                # Filter known hallucination patterns
+                text_lower = text.lower()
+                is_hallucination = any(pattern in text_lower for pattern in HALLUCINATION_PATTERNS)
+                if is_hallucination:
+                    logger.info(f"   ⏭️ Skipped (hallucination pattern detected)")
+                    continue
+                    
+                if text:
+                    transcript_parts.append(text)
+                    total_confidence += logprob
+                    segment_count += 1
+            
+            transcript = " ".join(transcript_parts).strip()
+            
+            # Normalize confidence
+            avg_confidence = 0.0
+            if segment_count > 0:
+                normalized_confidence = (total_confidence / segment_count + 1.0) / 1.0
+                avg_confidence = max(0.0, min(1.0, normalized_confidence))
+            
+            inference_time = time.time() - start_time
+            
+            if self.config.verbose:
+                logger.debug(f"Streaming transcription: '{transcript[:50]}...' | Time: {inference_time:.3f}s")
+            
+            return transcript, avg_confidence
+            
+        except Exception as e:
+            logger.error(f"Streaming transcription error: {e}")
+            return "", 0.0
     
     def transcribe_final(
         self,

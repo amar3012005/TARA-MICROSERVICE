@@ -153,9 +153,21 @@ def test_whisper_service():
         
         config = STTLocalConfig.from_env()
         
-        # Override to use CPU for testing if CUDA not available
+        # Override to use CPU for testing if CUDA not available or CUDNN broken
         import torch
-        if not torch.cuda.is_available():
+        cuda_available = torch.cuda.is_available()
+        
+        # Test if CUDA actually works (CUDNN might be broken even if CUDA reports available)
+        if cuda_available:
+            try:
+                test_tensor = torch.zeros(1).cuda()
+                del test_tensor
+                torch.cuda.empty_cache()
+            except (SystemError, OSError, RuntimeError):
+                cuda_available = False
+                print("   ⚠️  CUDA available but CUDNN broken - using CPU mode")
+        
+        if not cuda_available:
             config.whisper_device = "cpu"
             config.whisper_compute_type = "float32"
             config.use_gpu = False

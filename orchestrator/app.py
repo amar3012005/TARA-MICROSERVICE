@@ -45,6 +45,16 @@ redis_listener_task = None
 active_sessions: Dict[str, Any] = {}
 config: Optional[OrchestratorConfig] = None
 app_start_time: float = time.time()
+STT_GRADIO_URL = os.getenv("STT_GRADIO_URL", "http://localhost:8001/fastrtc")
+TTS_GRADIO_URL = os.getenv("TTS_GRADIO_URL", "http://localhost:8005/fastrtc")
+service_connections = {
+    "stt": {"connected": False, "session_id": None, "timestamp": None},
+    "tts": {"connected": False, "session_id": None, "timestamp": None}
+}
+
+# Workflow control - wait for manual start trigger
+workflow_ready = False  # True when both STT and TTS are connected
+workflow_triggered = False  # True when /start is called
 
 # Intro greeting text (configurable via environment)
 INTRO_GREETING = os.getenv("INTRO_GREETING", "Hello! I'm your assistant at Leibniz University. How can I help you today?")
@@ -97,6 +107,8 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
     logger.info("✅ StateManager Orchestrator Ready")
     logger.info("=" * 70)
+    logger.info(f"🔗 STT FastRTC UI: {STT_GRADIO_URL}")
+    logger.info(f"🔗 TTS FastRTC UI: {TTS_GRADIO_URL}")
     
     yield
     
@@ -175,7 +187,8 @@ async def orchestrate(websocket: WebSocket, session_id: str = Query(...)):
         "interrupt_handler": interrupt_handler,
         "websocket": websocket,
         "tts_task": None,
-        "intro_task": None
+        "intro_task": None,
+        "workflow_started": False
     }
     
     # Send initial connection message
@@ -185,23 +198,24 @@ async def orchestrate(websocket: WebSocket, session_id: str = Query(...)):
         "state": state_mgr.state.value
     })
     
-    # Play intro greeting immediately after connection
-    logger.info("=" * 70)
-    logger.info(f"🎤 Playing intro greeting for session: {session_id}")
-    logger.info("=" * 70)
-    
-    intro_task = asyncio.create_task(
-        play_intro_greeting(session_id, websocket, state_mgr)
-    )
-    active_sessions[session_id]["intro_task"] = intro_task
+    await send_service_status(websocket, session_id, "Waiting for STT/TTS FastRTC clients to connect...")
+    await check_and_start_workflow("session_connected")
     
     try:
         while True:
             try:
-                message = await asyncio.wait_for(websocket.receive_json(), timeout=30.0)
+                # Use a longer timeout (5 minutes) since STT events come via Redis, not WebSocket
+                # The WebSocket only receives client messages (manual controls, etc.)
+                message = await asyncio.wait_for(websocket.receive_json(), timeout=300.0)
             except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Session {session_id} timeout")
-                break
+                # Send a keep-alive ping to keep the connection open
+                try:
+                    await websocket.send_json({"type": "ping", "session_id": session_id})
+                    logger.debug(f"🔄 Keep-alive ping for session {session_id}")
+                    continue  # Don't break, just continue waiting
+                except:
+                    logger.warning(f"⏱️ Session {session_id} disconnected")
+                    break
             
             msg_type = message.get("type")
             
@@ -209,8 +223,10 @@ async def orchestrate(websocket: WebSocket, session_id: str = Query(...)):
             # LISTENING STATE - Buffer STT fragments
             # ═══════════════════════════════════════════════════════════════
             if msg_type == "stt_fragment":
+                # Only process STT when in LISTENING state
                 if state_mgr.state != State.LISTENING:
-                    await state_mgr.transition(State.LISTENING, "stt_start", {})
+                    logger.debug(f"⏸️ Ignoring STT fragment - current state: {state_mgr.state.value}")
+                    continue
                 
                 text = message.get("text", "")
                 is_final = message.get("is_final", False)
@@ -231,6 +247,11 @@ async def orchestrate(websocket: WebSocket, session_id: str = Query(...)):
             # THINKING STATE - Parallel Intent+RAG+LLM
             # ═══════════════════════════════════════════════════════════════
             elif msg_type == "vad_end":
+                # Only process VAD end when in LISTENING state
+                if state_mgr.state != State.LISTENING:
+                    logger.debug(f"⏸️ Ignoring VAD end - current state: {state_mgr.state.value}")
+                    continue
+                
                 logger.info("=" * 70)
                 logger.info(f"🤐 End of turn detected")
                 logger.info(f"📝 Text: {' '.join(state_mgr.context.text_buffer)}")
@@ -392,10 +413,19 @@ async def stream_tts_audio(
                                 audio_bytes = base64.b64decode(audio_b64)
                                 await websocket.send_bytes(audio_bytes)
                         
+                        elif msg_type == "sentence_playing":
+                            # Track when sentence is playing in browser
+                            duration_ms = data.get("duration_ms", 0)
+                            expected_complete_at = data.get("expected_complete_at", 0)
+                            logger.info(f"🔊 Sentence {data.get('index', 0)} playing ({duration_ms:.0f}ms)")
+                            # Wait for browser playback to complete before processing next
+                            await asyncio.sleep(duration_ms / 1000.0)
+                            logger.debug(f"✅ Sentence {data.get('index', 0)} playback complete")
+                        
                         elif msg_type == "sentence_complete":
                             duration_ms = data.get("duration_ms", 0)
                             total_duration_ms += duration_ms
-                            logger.debug(f"✅ Sentence {data.get('index', 0)} complete ({duration_ms:.0f}ms)")
+                            logger.debug(f"✅ Sentence {data.get('index', 0)} synthesis complete ({duration_ms:.0f}ms)")
                         
                         elif msg_type == "complete":
                             logger.info(f"✅ TTS complete: {data.get('total_sentences', 0)} sentences, {data.get('total_duration_ms', 0):.0f}ms")
@@ -440,8 +470,165 @@ async def stream_tts_audio(
         })
 
 
+def get_missing_services():
+    missing = []
+    if not service_connections["stt"]["connected"]:
+        missing.append("STT FastRTC")
+    if not service_connections["tts"]["connected"]:
+        missing.append("TTS FastRTC")
+    return missing
+
+
+async def send_service_status(websocket: WebSocket, session_id: str, note: str = ""):
+    """Send current service connectivity status to a client session."""
+    if not websocket:
+        return
+    message = note
+    if not message:
+        missing = get_missing_services()
+        if missing:
+            message = f"Waiting for {' & '.join(missing)} to connect..."
+        else:
+            message = "All FastRTC clients connected."
+    try:
+        await websocket.send_json({
+            "type": "service_status",
+            "session_id": session_id,
+            "stt_ready": service_connections["stt"]["connected"],
+            "tts_ready": service_connections["tts"]["connected"],
+            "message": message
+        })
+    except Exception as exc:
+        logger.warning(f"⚠️ Failed to send service status to {session_id}: {exc}")
+
+
+async def broadcast_service_status(note: str = ""):
+    """Broadcast service readiness to all connected orchestrator sessions."""
+    if not active_sessions:
+        return
+    for session_id, session_data in active_sessions.items():
+        websocket = session_data.get("websocket")
+        await send_service_status(websocket, session_id, note)
+
+
+async def handle_service_connection(service: str, payload: Dict[str, Any]):
+    """Handle STT/TTS FastRTC connection signals from Redis."""
+    service = service.lower()
+    if service not in service_connections:
+        logger.warning(f"⚠️ Unknown service type '{service}' in connection handler")
+        return
+    
+    info = service_connections[service]
+    info["connected"] = True
+    info["session_id"] = payload.get("session_id")
+    info["timestamp"] = payload.get("timestamp", time.time())
+    
+    logger.info("=" * 70)
+    logger.info(f"📡 {service.upper()} FastRTC connected | session: {info['session_id'] or 'unknown'}")
+    logger.info(f"   Source: {payload.get('source', 'unknown')}")
+    missing = get_missing_services()
+    if missing:
+        logger.info(f"   Waiting for: {', '.join(missing)}")
+    else:
+        logger.info("   All FastRTC clients connected. Preparing workflow...")
+    logger.info("=" * 70)
+    
+    await broadcast_service_status(f"{service.upper()} connected.")
+    await check_and_start_workflow(f"{service}_connected")
+
+
+async def check_and_start_workflow(trigger: str):
+    """
+    Check if workflow can start. Does NOT auto-start - waits for /start trigger.
+    
+    Sets workflow_ready=True when both STT and TTS are connected.
+    Actual workflow start only happens when /start is called.
+    """
+    global workflow_ready
+    
+    missing = get_missing_services()
+    if missing:
+        workflow_ready = False
+        logger.info(f"⏳ [{trigger}] Waiting for {', '.join(missing)} before workflow can start")
+        return
+    
+    # Both services connected - mark as ready but DON'T auto-start
+    workflow_ready = True
+    logger.info("=" * 70)
+    logger.info(f"✅ [{trigger}] All FastRTC clients connected - workflow READY")
+    logger.info(f"🎯 Send POST /start to trigger the intro greeting")
+    logger.info(f"   Example: curl -X POST http://localhost:8004/start")
+    logger.info("=" * 70)
+    
+    # Notify all connected sessions that we're ready
+    await broadcast_service_status("All services connected. Send POST /start to begin.")
+
+
+async def start_intro_sequence(session_id: str):
+    """
+    Play intro greeting and transition to listening once complete.
+    
+    State flow:
+    1. IDLE -> SPEAKING (intro greeting via TTS)
+    2. SPEAKING -> LISTENING (waiting for user speech via STT)
+    """
+    session_data = active_sessions.get(session_id)
+    if not session_data:
+        logger.warning(f"⚠️ Session {session_id} not found for intro sequence")
+        return
+    
+    websocket = session_data.get("websocket")
+    state_mgr = session_data.get("state_mgr")
+    
+    if not websocket or not state_mgr:
+        logger.warning(f"⚠️ Session {session_id} missing websocket or state_mgr")
+        return
+    
+    try:
+        # Transition to SPEAKING state for intro
+        await state_mgr.transition(State.SPEAKING, "intro_start", {"text": INTRO_GREETING})
+        
+        await send_service_status(
+            websocket,
+            session_id,
+            "Playing intro greeting..."
+        )
+        
+        logger.info("=" * 70)
+        logger.info(f"🎤 [SPEAKING] Playing intro greeting for session: {session_id}")
+        logger.info(f"📝 Text: {INTRO_GREETING}")
+        logger.info("=" * 70)
+        
+        # Play intro via TTS
+        await play_intro_greeting(session_id, websocket, state_mgr)
+        
+        # Transition to LISTENING state - now waiting for user speech
+        await state_mgr.transition(State.LISTENING, "intro_complete", {})
+        
+        await websocket.send_json({
+            "type": "intro_complete",
+            "session_id": session_id,
+            "state": State.LISTENING.value,
+            "message": "Intro complete. Listening for your response..."
+        })
+        
+        logger.info("=" * 70)
+        logger.info(f"🎧 [LISTENING] Waiting for user speech via STT")
+        logger.info(f"   STT service should now be active")
+        logger.info("=" * 70)
+    
+    except Exception as exc:
+        logger.error(f"❌ Intro workflow error for session {session_id}: {exc}", exc_info=True)
+        # Reset to IDLE on error
+        await state_mgr.transition(State.IDLE, "intro_error", {"error": str(exc)})
+    finally:
+        session_entry = active_sessions.get(session_id)
+        if session_entry:
+            session_entry["intro_task"] = None
+
+
 async def listen_to_redis_events():
-    """Background task to listen for STT events from Redis"""
+    """Background task to listen for STT transcripts and service connection events via Redis"""
     global redis_client, redis_subscriber
     
     if not redis_client:
@@ -450,14 +637,20 @@ async def listen_to_redis_events():
     
     try:
         logger.info("=" * 70)
-        logger.info("👂 Starting Redis event listener for 'leibniz:events:stt'")
+        logger.info("👂 Starting Redis event listener")
         logger.info("=" * 70)
+        
+        channels = [
+            "leibniz:events:stt",
+            "leibniz:events:stt:connected",
+            "leibniz:events:tts:connected"
+        ]
         
         # Create pubsub subscriber
         redis_subscriber = redis_client.pubsub()
-        await redis_subscriber.subscribe("leibniz:events:stt")
+        await redis_subscriber.subscribe(*channels)
         
-        logger.info("✅ Subscribed to Redis channel 'leibniz:events:stt'")
+        logger.info(f"✅ Subscribed to Redis channels: {', '.join(channels)}")
         
         # Listen for messages
         while True:
@@ -465,36 +658,67 @@ async def listen_to_redis_events():
                 message = await redis_subscriber.get_message(ignore_subscribe_messages=True, timeout=1.0)
                 
                 if message and message.get("type") == "message":
+                    channel = message.get("channel")
+                    raw_data = message.get("data", "{}")
                     try:
-                        event_data = json.loads(message.get("data", "{}"))
+                        event_data = json.loads(raw_data)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"❌ Failed to parse Redis event from {channel}: {e}")
+                        continue
+                    
+                    if channel == "leibniz:events:stt":
                         text = event_data.get("text", "")
                         event_session_id = event_data.get("session_id", "")
+                        is_final = event_data.get("is_final", False)
                         
-                        if text and event_session_id:
+                        if text:
                             logger.info("=" * 70)
                             logger.info(f"📨 Received STT event from Redis")
-                            logger.info(f"   Session: {event_session_id}")
+                            logger.info(f"   STT Session: {event_session_id}")
                             logger.info(f"   Text: {text[:100]}...")
+                            logger.info(f"   Is Final: {is_final}")
                             logger.info("=" * 70)
                             
-                            # Find active session and trigger processing
-                            if event_session_id in active_sessions:
-                                session_data = active_sessions[event_session_id]
-                                websocket = session_data.get("websocket")
+                            # Route STT events to ALL active sessions in LISTENING state
+                            # (STT session ID is different from WebSocket session ID)
+                            routed = False
+                            for ws_session_id, session_data in active_sessions.items():
                                 state_mgr = session_data.get("state_mgr")
+                                websocket = session_data.get("websocket")
+                                workflow_started = session_data.get("workflow_started", False)
                                 
-                                if websocket and state_mgr:
-                                    # Trigger the pipeline processing
-                                    await handle_stt_event(event_session_id, text, websocket, state_mgr)
+                                if not workflow_started:
+                                    logger.debug(f"Skipping session {ws_session_id}: workflow not started")
+                                    continue
+                                    
+                                if state_mgr and state_mgr.state == State.LISTENING:
+                                    if websocket:
+                                        logger.info(f"🎯 Routing STT to session: {ws_session_id}")
+                                        # Only process final transcripts to trigger the pipeline
+                                        if is_final:
+                                            await handle_stt_event(ws_session_id, text, websocket, state_mgr)
+                                        else:
+                                            # For partial transcripts, just notify the client
+                                            try:
+                                                await websocket.send_json({
+                                                    "type": "stt_partial",
+                                                    "text": text,
+                                                    "session_id": ws_session_id
+                                                })
+                                            except:
+                                                pass
+                                        routed = True
+                                    else:
+                                        logger.warning(f"⚠️ Session {ws_session_id} missing websocket")
                                 else:
-                                    logger.warning(f"⚠️ Session {event_session_id} missing websocket or state_mgr")
-                            else:
-                                logger.warning(f"⚠️ No active session found for {event_session_id}")
-                    
-                    except json.JSONDecodeError as e:
-                        logger.error(f"❌ Failed to parse Redis event: {e}")
-                    except Exception as e:
-                        logger.error(f"❌ Error processing Redis event: {e}", exc_info=True)
+                                    if state_mgr:
+                                        logger.debug(f"Skipping session {ws_session_id}: state={state_mgr.state.value}")
+                            
+                            if not routed:
+                                logger.warning(f"⚠️ No active LISTENING sessions to route STT event")
+                    elif channel in ("leibniz:events:stt:connected", "leibniz:events:tts:connected"):
+                        service = "stt" if channel.endswith("stt:connected") else "tts"
+                        await handle_service_connection(service, event_data)
             
             except asyncio.TimeoutError:
                 # Timeout is normal, continue listening
@@ -503,7 +727,7 @@ async def listen_to_redis_events():
     except asyncio.CancelledError:
         logger.info("🛑 Redis event listener cancelled")
         if redis_subscriber:
-            await redis_subscriber.unsubscribe("leibniz:events:stt")
+            await redis_subscriber.unsubscribe("leibniz:events:stt", "leibniz:events:stt:connected", "leibniz:events:tts:connected")
             await redis_subscriber.close()
     except Exception as e:
         logger.error(f"❌ Redis event listener error: {e}", exc_info=True)
@@ -576,6 +800,149 @@ async def handle_stt_event(session_id: str, text: str, websocket: WebSocket, sta
         await state_mgr.transition(State.IDLE, "error", {"error": str(e)})
 
 
+@app.post("/start")
+async def start_workflow():
+    """
+    Trigger the workflow to start.
+    
+    Plays intro greeting via TTS, then transitions to LISTENING state
+    to wait for user speech via STT.
+    
+    Prerequisites:
+    - Both STT and TTS FastRTC clients must be connected
+    - At least one WebSocket session must be active
+    
+    Example:
+        curl -X POST http://localhost:8004/start
+    """
+    global workflow_triggered
+    
+    # Check if services are ready
+    missing = get_missing_services()
+    if missing:
+        return {
+            "success": False,
+            "error": f"Services not ready. Missing: {', '.join(missing)}",
+            "stt_connected": service_connections["stt"]["connected"],
+            "tts_connected": service_connections["tts"]["connected"]
+        }
+    
+    # Check if we have active sessions
+    if not active_sessions:
+        return {
+            "success": False,
+            "error": "No active WebSocket sessions. Connect to /orchestrate first.",
+            "hint": "Open a WebSocket connection to ws://localhost:8004/orchestrate?session_id=my-session"
+        }
+    
+    # Check if workflow already triggered
+    if workflow_triggered:
+        return {
+            "success": False,
+            "error": "Workflow already triggered",
+            "active_sessions": list(active_sessions.keys())
+        }
+    
+    workflow_triggered = True
+    
+    logger.info("=" * 70)
+    logger.info("🚀 WORKFLOW START TRIGGERED via /start endpoint")
+    logger.info("=" * 70)
+    
+    # Start intro sequence for all active sessions
+    started_sessions = []
+    for session_id, session_data in active_sessions.items():
+        if session_data.get("workflow_started"):
+            logger.info(f"⏭️ Session {session_id} already has workflow running")
+            continue
+        
+        session_data["workflow_started"] = True
+        intro_task = asyncio.create_task(start_intro_sequence(session_id))
+        session_data["intro_task"] = intro_task
+        started_sessions.append(session_id)
+        logger.info(f"🎬 Started intro sequence for session: {session_id}")
+    
+    return {
+        "success": True,
+        "message": "Workflow started - playing intro greeting",
+        "sessions_started": started_sessions,
+        "state_flow": [
+            "IDLE -> SPEAKING (intro via TTS)",
+            "SPEAKING -> LISTENING (waiting for user via STT)",
+            "LISTENING -> THINKING (processing user input)",
+            "THINKING -> SPEAKING (response via TTS)",
+            "SPEAKING -> LISTENING (next turn)"
+        ]
+    }
+
+
+@app.get("/status")
+async def get_status():
+    """
+    Get current orchestrator status including service connections and session states.
+    """
+    session_states = {}
+    for session_id, session_data in active_sessions.items():
+        state_mgr = session_data.get("state_mgr")
+        session_states[session_id] = {
+            "state": state_mgr.state.value if state_mgr else "unknown",
+            "workflow_started": session_data.get("workflow_started", False),
+            "turn_number": state_mgr.context.turn_number if state_mgr else 0
+        }
+    
+    return {
+        "workflow_ready": workflow_ready,
+        "workflow_triggered": workflow_triggered,
+        "services": {
+            "stt": {
+                "connected": service_connections["stt"]["connected"],
+                "session_id": service_connections["stt"]["session_id"]
+            },
+            "tts": {
+                "connected": service_connections["tts"]["connected"],
+                "session_id": service_connections["tts"]["session_id"]
+            }
+        },
+        "active_sessions": session_states,
+        "gradio_urls": {
+            "stt": STT_GRADIO_URL,
+            "tts": TTS_GRADIO_URL
+        }
+    }
+
+
+@app.post("/reset")
+async def reset_workflow():
+    """
+    Reset the workflow state. Use this to restart after completion or error.
+    """
+    global workflow_triggered, workflow_ready
+    
+    workflow_triggered = False
+    
+    # Reset workflow_started for all sessions
+    for session_id, session_data in active_sessions.items():
+        session_data["workflow_started"] = False
+        # Cancel any running intro tasks
+        intro_task = session_data.get("intro_task")
+        if intro_task and not intro_task.done():
+            intro_task.cancel()
+        session_data["intro_task"] = None
+        
+        # Reset state to IDLE
+        state_mgr = session_data.get("state_mgr")
+        if state_mgr:
+            await state_mgr.transition(State.IDLE, "reset", {})
+    
+    logger.info("🔄 Workflow reset - ready for new /start trigger")
+    
+    return {
+        "success": True,
+        "message": "Workflow reset. Send POST /start to begin again.",
+        "workflow_ready": workflow_ready
+    }
+
+
 @app.get("/health")
 async def health():
     """Health check endpoint"""
@@ -591,6 +958,8 @@ async def health():
         "service": "orchestrator",
         "active_sessions": len(active_sessions),
         "redis_connected": redis_connected,
+        "workflow_ready": workflow_ready,
+        "workflow_triggered": workflow_triggered,
         "uptime_seconds": time.time() - app_start_time
     }
 

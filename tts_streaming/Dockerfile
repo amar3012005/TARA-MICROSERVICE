@@ -20,9 +20,11 @@ ENV PYTHONPATH=/app
 
 # Copy service code (context is services/ directory)
 COPY tts_streaming /app/leibniz_agent/services/tts_streaming
+COPY shared /app/leibniz_agent/services/shared
 RUN mkdir -p /app/leibniz_agent/services && \
     echo "" > /app/leibniz_agent/__init__.py && \
-    echo "" > /app/leibniz_agent/services/__init__.py
+    echo "" > /app/leibniz_agent/services/__init__.py && \
+    echo "" > /app/leibniz_agent/services/shared/__init__.py
 
 # CRITICAL: Unbuffered Python output for real-time logs
 ENV PYTHONUNBUFFERED=1

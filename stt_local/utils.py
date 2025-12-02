@@ -186,3 +186,6 @@ class TranscriptBuffer:
         self.last_fragment = ""
         self.total_fragments_received = 0
 
+
+
+

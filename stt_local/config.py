@@ -29,7 +29,7 @@ class STTLocalConfig:
     channels: int = 1  # Mono audio
     
     # Faster Whisper settings
-    whisper_model_size: str = "base"  # tiny, base, small, medium, large-v2, large-v3
+    whisper_model_size: str = "medium.en"  # medium.en (769M params, English-only, high accuracy)
     whisper_device: str = "cuda"  # cuda or cpu
     whisper_compute_type: str = "float16"  # float16, float32, int8
     whisper_language: str = "en"  # Language code (en, es, fr, etc.)
@@ -38,13 +38,13 @@ class STTLocalConfig:
     
     # Silero VAD settings
     vad_threshold: float = 0.5  # Speech detection threshold (0.3-0.7)
-    vad_min_speech_duration_ms: int = 250  # Minimum speech duration
-    vad_silence_timeout_ms: int = 800  # Silence before ending speech (600-1000ms)
+    vad_min_speech_duration_ms: int = 200  # Minimum speech duration (lowered for responsiveness)
+    vad_silence_timeout_ms: int = 1000  # Silence before ending speech (increased for natural pauses)
     vad_model_path: Optional[str] = None  # Optional custom model path
     
     # Streaming settings
-    partial_update_interval_ms: int = 500  # Update partial transcripts every 500ms
-    min_audio_length_for_stt: float = 0.5  # Minimum audio length for STT (seconds)
+    partial_update_interval_ms: int = 250  # Update partial transcripts every 250ms (faster updates)
+    min_audio_length_for_stt: float = 0.3  # Minimum audio length for STT (lowered for faster response)
     
     # Timeout settings (seconds)
     initial_timeout_s: float = 20.0
@@ -86,7 +86,7 @@ class STTLocalConfig:
             channels=int(os.getenv("LEIBNIZ_STT_LOCAL_CHANNELS", "1")),
             
             # Whisper settings
-            whisper_model_size=os.getenv("LEIBNIZ_STT_LOCAL_WHISPER_MODEL_SIZE", "base"),
+            whisper_model_size=os.getenv("LEIBNIZ_STT_LOCAL_WHISPER_MODEL_SIZE", "medium.en"),
             whisper_device=os.getenv("LEIBNIZ_STT_LOCAL_WHISPER_DEVICE", device),
             whisper_compute_type=os.getenv("LEIBNIZ_STT_LOCAL_WHISPER_COMPUTE_TYPE", "float16" if use_gpu else "float32"),
             whisper_language=os.getenv("LEIBNIZ_STT_LOCAL_WHISPER_LANGUAGE", "en"),
@@ -126,11 +126,17 @@ class STTLocalConfig:
     
     def __post_init__(self):
         """Validate and normalize configuration."""
-        # Validate Whisper model size
-        valid_sizes = ["tiny", "base", "small", "medium", "large-v2", "large-v3"]
+        # Validate Whisper model size (includes .en English-only variants)
+        valid_sizes = [
+            "tiny", "tiny.en", 
+            "base", "base.en", 
+            "small", "small.en", 
+            "medium", "medium.en", 
+            "large-v2", "large-v3"
+        ]
         if self.whisper_model_size not in valid_sizes:
-            logger.warning(f"Invalid whisper_model_size={self.whisper_model_size}, using default 'base'")
-            self.whisper_model_size = "base"
+            logger.warning(f"Invalid whisper_model_size={self.whisper_model_size}, using default 'medium.en'")
+            self.whisper_model_size = "medium.en"
         
         # Validate device
         if self.whisper_device not in ["cuda", "cpu"]:
@@ -160,4 +166,5 @@ class STTLocalConfig:
                 f"device={self.whisper_device}, sample_rate={self.sample_rate}Hz, "
                 f"timeout={self.initial_timeout_s}s"
             )
+
 

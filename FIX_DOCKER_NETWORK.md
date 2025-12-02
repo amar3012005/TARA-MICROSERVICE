@@ -63,3 +63,6 @@ The `docker-compose-tara.yml` has been updated to use the existing `services_lei
 2. If that doesn't work, use Option 2 to fix iptables
 3. Then rebuild: `docker-compose -p tara-microservice -f docker-compose-tara.yml up -d --build`
 
+
+
+

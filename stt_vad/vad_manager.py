@@ -590,20 +590,21 @@ class VADManager:
                                 logger.info(f"   Session: {session_id}")
                                 logger.info("=" * 70)
                                 
-                                # Publish final transcript to Redis for orchestrator
+                                # Publish partial transcript to Redis for orchestrator
                                 if self.redis_client and normalized_text:
                                     try:
                                         event_data = {
                                             "text": normalized_text,
                                             "session_id": session_id,
                                             "timestamp": time.time(),
-                                            "source": "stt-vad"
+                                            "source": "stt-vad",
+                                            "is_final": False  # This is a partial transcript
                                         }
                                         await self.redis_client.publish(
                                             "leibniz:events:stt",
                                             json.dumps(event_data)
                                         )
-                                        logger.info(f"📢 Published transcript to Redis channel 'leibniz:events:stt'")
+                                        logger.info(f"📢 Published PARTIAL transcript to Redis")
                                     except Exception as e:
                                         logger.warning(f"Failed to publish transcript to Redis: {e}")
 
@@ -635,20 +636,21 @@ class VADManager:
                             logger.info(f"   Session: {session_id}")
                             logger.info("=" * 70)
                             
-                            # Publish final transcript to Redis for orchestrator
+                            # Publish FINAL transcript to Redis for orchestrator
                             if self.redis_client and normalized_transcript:
                                 try:
                                     event_data = {
                                         "text": normalized_transcript,
                                         "session_id": session_id,
                                         "timestamp": time.time(),
-                                        "source": "stt-vad"
+                                        "source": "stt-vad",
+                                        "is_final": True  # Turn complete = final transcript
                                     }
                                     await self.redis_client.publish(
                                         "leibniz:events:stt",
                                         json.dumps(event_data)
                                     )
-                                    logger.info(f"📢 Published transcript to Redis channel 'leibniz:events:stt'")
+                                    logger.info(f"📢 Published FINAL transcript to Redis (turn_complete)")
                                 except Exception as e:
                                     logger.warning(f"Failed to publish transcript to Redis: {e}")
 

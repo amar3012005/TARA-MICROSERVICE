@@ -110,3 +110,6 @@ docker logs tara-stt-vad-service -f
 docker logs tara-tts-streaming-service -f
 ```
 
+
+
+

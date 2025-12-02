@@ -9,16 +9,29 @@ import re
 from typing import List
 
 
-def split_into_sentences(text: str) -> List[str]:
+def split_into_sentences(text: str, min_words: int = 10) -> List[str]:
     """
     Split text into sentences for streaming TTS (English-focused with TARA pattern)
     
+    CRITICAL: Short texts (< min_words total) are returned as a single sentence.
+    This prevents breaking up short greetings like "Hello! How can I help you?"
+    
     Args:
         text: Input text
+        min_words: Minimum word count before splitting is allowed (default: 10)
         
     Returns:
         List of sentences with preserved punctuation
     """
+    text = text.strip()
+    if not text:
+        return []
+    
+    # CRITICAL: If the entire text has fewer than min_words, return as-is (single sentence)
+    total_words = len(text.split())
+    if total_words < min_words:
+        return [text]
+    
     # Preserve abbreviations by protecting periods
     abbrev_map = {
         "Dr.": "Dr<PERIOD>",
@@ -39,13 +52,21 @@ def split_into_sentences(text: str) -> List[str]:
         text = text.replace(abbrev, placeholder)
     
     # Split on sentence delimiters - TARA pattern
-    # Keep punctuation with sentences
-    # Added comma (,) and semicolon (;) to split long sentences for lower latency
-    sentences = re.split(r'(?<=[.?!,;])\s+', text.strip())
+    # Only split on strong terminators (.?!) - NOT on comma/semicolon
+    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
     
     # Filter empty and very short fragments
     valid_sentences = []
     current_fragment = ""
+
+    def should_flush(fragment: str) -> bool:
+        """
+        Decide whether to emit the current fragment as a sentence.
+        A fragment is emitted when it contains at least min_words words.
+        """
+        if not fragment:
+            return False
+        return len(fragment.split()) >= min_words
     
     for sentence in sentences:
         sentence = sentence.strip()
@@ -56,21 +77,16 @@ def split_into_sentences(text: str) -> List[str]:
             
         if not sentence:
             continue
-            
-        # If fragment is too short (e.g. just a comma split like "However,"), buffer it
-        # Unless it ends with a strong terminator (.?!)
-        is_strong_end = sentence[-1] in '.?!'
-        
-        if len(current_fragment) + len(sentence) < 20 and not is_strong_end:
-            current_fragment += " " + sentence
+
+        # Accumulate fragment until we have enough words
+        if current_fragment:
+            current_fragment = (current_fragment + " " + sentence).strip()
         else:
-            if current_fragment:
-                full_sentence = (current_fragment + " " + sentence).strip()
-                current_fragment = ""
-            else:
-                full_sentence = sentence
-            
-            valid_sentences.append(full_sentence)
+            current_fragment = sentence
+
+        if should_flush(current_fragment):
+            valid_sentences.append(current_fragment)
+            current_fragment = ""
             
     # Add any remaining fragment
     if current_fragment:
@@ -93,5 +109,6 @@ def split_into_sentences(text: str) -> List[str]:
             valid_sentences.append(' '.join(chunk))
     
     return valid_sentences
+
 
 

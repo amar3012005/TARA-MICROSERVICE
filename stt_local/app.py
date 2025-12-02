@@ -29,18 +29,66 @@ from fastapi.responses import JSONResponse
 
 from config import STTLocalConfig
 from stt_manager import STTManager
-from utils import validate_audio_chunk
-from shared.redis_client import get_redis_client, close_redis_client, ping_redis
 from fastrtc import Stream
 from fastrtc_handler import FastRTCSTTLocalHandler
 import gradio as gr
 
-# Configure logging
+# Configure logging FIRST (before any logging calls)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy aioice/WebRTC cleanup errors
+logging.getLogger("aioice.ice").setLevel(logging.WARNING)
+logging.getLogger("aioice.stun").setLevel(logging.WARNING)
+
+# Custom asyncio exception handler to suppress WebRTC cleanup errors
+def asyncio_exception_handler(loop, context):
+    """Suppress expected WebRTC cleanup errors, log others."""
+    exception = context.get('exception')
+    message = context.get('message', '')
+    
+    # Suppress expected WebRTC cleanup errors
+    if exception and isinstance(exception, AttributeError):
+        err_str = str(exception)
+        if "'NoneType' object has no attribute" in err_str:
+            # These happen during WebRTC connection cleanup - suppress
+            return
+    
+    # Suppress aioice STUN retry errors during cleanup
+    if 'aioice' in str(context.get('handle', '')):
+        return
+    
+    # Log other exceptions normally
+    logger.error(f"Asyncio exception: {message}")
+    if exception:
+        logger.error(f"  Exception: {exception}")
+
+# Install custom exception handler
+import asyncio
+try:
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
+except RuntimeError:
+    pass  # No running event loop yet - will be set when uvicorn starts
+
+# Optional Redis import (service works without Redis)
+try:
+    from shared.redis_client import get_redis_client, close_redis_client, ping_redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    logger.warning("Redis client not available - service will run without Redis")
+    
+    # Create dummy functions
+    async def get_redis_client():
+        return None
+    async def close_redis_client(client):
+        pass
+    async def ping_redis(client):
+        return False
 
 # Global state
 stt_manager: STTManager = None
@@ -55,6 +103,14 @@ fastrtc_stream: Stream = None
 async def lifespan(app: FastAPI):
     """Lifespan handler for application startup/shutdown"""
     global stt_manager, redis_client
+    
+    # Install asyncio exception handler to suppress WebRTC cleanup noise
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(asyncio_exception_handler)
+        logger.info("✅ Installed asyncio exception handler for WebRTC cleanup errors")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not set exception handler: {e}")
     
     logger.info("=" * 70)
     logger.info("🚀 Starting STT Local Microservice")
@@ -104,6 +160,9 @@ async def lifespan(app: FastAPI):
                 logger.info(f"✅ Redis connected (attempt {retry_attempt + 1})")
                 # Update STT manager with Redis client
                 stt_manager.redis_client = redis_client
+                if fastrtc_handler:
+                    fastrtc_handler.redis_client = redis_client
+                    logger.info("✅ FastRTC handler updated with Redis client")
                 break
             except asyncio.TimeoutError:
                 logger.warning(f"⏳ Redis connection timeout (attempt {retry_attempt + 1}/5)")
@@ -129,8 +188,12 @@ async def lifespan(app: FastAPI):
     
     # Close Redis
     logger.info("🔌 Closing Redis connection...")
-    await close_redis_client(redis_client)
-    logger.info("✅ Redis connection closed")
+    if redis_client:
+        try:
+            await redis_client.close()
+            logger.info("✅ Redis connection closed")
+        except Exception as e:
+            logger.warning(f"⚠️ Redis close error: {e}")
     
     logger.info("✅ STT Local microservice stopped")
 
@@ -146,8 +209,11 @@ app = FastAPI(
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Create FastRTC handler (stt_manager will be injected in lifespan)
-fastrtc_handler = FastRTCSTTLocalHandler(stt_manager=None)
+# Create FastRTC handler (stt_manager/redis will be injected in lifespan)
+fastrtc_handler = FastRTCSTTLocalHandler(
+    stt_manager=None,
+    redis_client=redis_client
+)
 
 # Create FastRTC stream
 fastrtc_stream = Stream(
@@ -156,8 +222,10 @@ fastrtc_stream = Stream(
     mode="send-receive",
     ui_args={
         "title": "Leibniz STT Local Transcription Service",
-        "description": "Speak into your browser microphone. Audio streams directly to the STT Local service for real-time transcription using Silero VAD and Faster Whisper. "
-                     "Check Docker console logs for pipeline progress, speech detection, and transcript fragments."
+        "description": "🎤 Speak into your browser microphone. Audio streams directly to the STT Local service for real-time transcription using Silero VAD and Faster Whisper. "
+                     "📝 Real-time transcripts appear in the terminal/console logs below. "
+                     "🔄 PARTIAL transcripts update every 500ms while speaking. "
+                     "✅ FINAL transcripts appear when speech ends."
     }
 )
 
@@ -611,4 +679,5 @@ if __name__ == "__main__":
         log_level="info",
         reload=False
     )
+
 

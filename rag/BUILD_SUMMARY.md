@@ -97,3 +97,6 @@ docker exec -it tara-rag-service python -c "import torch; print(f'✅ torch {tor
 
 **Benefit**: You can start using the container immediately, then install heavy packages when ready!
 
+
+
+

@@ -64,3 +64,6 @@ The containers ARE running and functional, even if Docker Desktop doesn't show t
 2. Access services directly via their ports (localhost:6382, localhost:8020, etc.)
 3. Use Docker CLI for management instead of GUI
 
+
+
+

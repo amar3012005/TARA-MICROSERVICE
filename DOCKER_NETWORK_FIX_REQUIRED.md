@@ -48,3 +48,6 @@ docker-compose -p tara-microservice -f docker-compose-tara.yml up -d --build
 
 This is a Docker daemon issue, not a problem with our configuration. The iptables chains get corrupted sometimes, especially after system updates or Docker Desktop updates. Restarting Docker Desktop usually fixes it.
 
+
+
+

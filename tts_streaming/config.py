@@ -28,12 +28,16 @@ class TTSStreamingConfig:
     
     # Queue settings
     queue_max_size: int = 10  # Maximum sentences in queue
+    inter_sentence_gap_ms: int = int(os.getenv("LEIBNIZ_TTS_INTER_SENTENCE_GAP_MS", "100"))
     
     # Cache settings
     enable_cache: bool = True
     cache_dir: str = "/app/audio_cache"
     max_cache_size: int = 500
     cache_ttl_days: int = 30
+    
+    # Streaming settings
+    fastrtc_chunk_duration_ms: int = int(os.getenv("LEIBNIZ_TTS_FASTRTC_CHUNK_MS", "40"))
     
     # Service settings
     timeout: float = 30.0
@@ -60,7 +64,9 @@ class TTSStreamingConfig:
             timeout=float(os.getenv("LEIBNIZ_TTS_TIMEOUT", "30.0")),
             retry_attempts=int(os.getenv("LEIBNIZ_TTS_RETRY_ATTEMPTS", "3")),
             retry_delay=float(os.getenv("LEIBNIZ_TTS_RETRY_DELAY", "1.0")),
-            port=int(os.getenv("TTS_STREAMING_PORT", "8005"))
+            port=int(os.getenv("TTS_STREAMING_PORT", "8005")),
+            inter_sentence_gap_ms=int(os.getenv("LEIBNIZ_TTS_INTER_SENTENCE_GAP_MS", "100")),
+            fastrtc_chunk_duration_ms=int(os.getenv("LEIBNIZ_TTS_FASTRTC_CHUNK_MS", "40"))
         )
     
     def __post_init__(self):
@@ -74,10 +80,20 @@ class TTSStreamingConfig:
         if self.queue_max_size <= 0:
             raise ValueError(f"Invalid queue_max_size: {self.queue_max_size}")
         
+        if self.inter_sentence_gap_ms < 0:
+            raise ValueError(f"Invalid inter_sentence_gap_ms: {self.inter_sentence_gap_ms}")
+        
+        if self.fastrtc_chunk_duration_ms <= 0:
+            raise ValueError(f"Invalid fastrtc_chunk_duration_ms: {self.fastrtc_chunk_duration_ms}")
+        
         logger.info(
             f"TTS Streaming Config: voice={self.lemonfox_voice}, "
             f"language={self.lemonfox_language}, sample_rate={self.sample_rate}Hz, "
-            f"queue_size={self.queue_max_size}, cache={self.enable_cache}"
+            f"queue_size={self.queue_max_size}, cache={self.enable_cache}, "
+            f"gap={self.inter_sentence_gap_ms}ms, chunk={self.fastrtc_chunk_duration_ms}ms"
         )
+
+
+
 
 

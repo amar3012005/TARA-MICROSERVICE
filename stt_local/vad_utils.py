@@ -174,9 +174,25 @@ class VADStateMachine:
             }
         """
         # Detect speech
-        is_speech, confidence = self.vad.detect_speech(audio_chunk, sample_rate)
+        is_speech, raw_confidence = self.vad.detect_speech(audio_chunk, sample_rate)
         
         current_time = time.time()
+        
+        # Confidence smoothing to reduce noise triggers
+        if not hasattr(self, 'recent_confidences'):
+            self.recent_confidences = []
+            self.confidence_window_size = 5
+        
+        self.recent_confidences.append(raw_confidence)
+        if len(self.recent_confidences) > self.confidence_window_size:
+            self.recent_confidences.pop(0)
+        
+        avg_confidence = float(np.mean(self.recent_confidences))
+        confidence = avg_confidence
+        
+        # Noise filtering - require higher confidence for speech detection
+        if is_speech and avg_confidence < 0.3:
+            is_speech = False
         
         if is_speech:
             # Speech detected
@@ -287,4 +303,5 @@ class VADStateMachine:
         self.speech_start_time = None
         self.silence_start_time = None
         self.speech_chunks = []
+
 

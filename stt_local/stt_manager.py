@@ -17,6 +17,7 @@ import numpy as np
 from config import STTLocalConfig
 from vad_utils import SileroVAD, VADStateMachine
 from whisper_service import WhisperService
+from whisper_streaming_context import WhisperStreamingContext
 from utils import normalize_english_transcript, TranscriptBuffer
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ class STTManager:
         
         # Per-session state
         self._active_sessions: Dict[str, Dict[str, Any]] = {}
+        self._streaming_contexts: Dict[str, WhisperStreamingContext] = {}
         
         # Metrics
         self.capture_count = 0
@@ -124,19 +126,26 @@ class STTManager:
                 session_data['chunks_processed'] += 1
                 current_time = time.time()
                 
+                # Debug: Log VAD events periodically
+                if session_data['chunks_processed'] % 50 == 0:
+                    logger.debug(f"[{session_id}] VAD: {vad_result['event']} conf={vad_result['confidence']:.2f} chunks={session_data['chunks_processed']}")
+                
                 # Handle VAD events
                 if vad_result['event'] == 'speech_start':
-                    # Speech started
+                    # Speech started - reset all buffers for fresh transcription
                     session_data['is_speaking'] = True
                     session_data['last_partial_time'] = current_time
                     speech_buffer.clear()
                     speech_buffer.append(chunk)
+                    # CRITICAL: Reset transcript buffer to prevent accumulation across speech segments
+                    transcript_buffer.reset()
                     
                     if self.config.log_vad_events:
-                        logger.info(f"🎤 [{session_id}] Speech started")
+                        logger.info(f"🎤 [{session_id}] Speech started (buffers reset)")
                 
-                elif vad_result['event'] == 'speaking':
-                    # Continue speaking - add to buffer
+                elif vad_result['event'] in ('speaking', 'silence'):
+                    # Continue speaking OR in silence period (still buffering)
+                    # CRITICAL: Buffer audio during silence too (within timeout)
                     speech_buffer.append(chunk)
                     
                     # Check if time for partial update
@@ -145,22 +154,37 @@ class STTManager:
                         # Generate partial transcript
                         if len(speech_buffer) > 0:
                             speech_audio = np.concatenate(speech_buffer)
+                            
+                            # Log before transcription for debugging
+                            audio_duration = len(speech_audio) / self.config.sample_rate
+                            logger.info(f"🔊 [{session_id}] Transcribing {audio_duration:.2f}s of audio...")
+                            
                             partial_text, confidence = self.whisper.transcribe_streaming(speech_audio)
                             
                             if partial_text:
                                 # Add to transcript buffer and emit
                                 complete_text = transcript_buffer.add_fragment(partial_text)
                                 
-                                if complete_text and streaming_callback:
-                                    try:
-                                        streaming_callback(complete_text, False)
-                                        
-                                        if self.config.log_vad_events:
-                                            logger.info(f"📝 [{session_id}] Partial: '{complete_text[:100]}'")
-                                    except Exception as e:
-                                        logger.error(f"Streaming callback error: {e}")
+                                if complete_text:
+                                    # Log directly to terminal for visibility
+                                    logger.info("=" * 70)
+                                    logger.info(f"📝 [🔄 PARTIAL] STT Transcript")
+                                    logger.info(f"   Text: '{complete_text[:200]}'")
+                                    if len(complete_text) > 200:
+                                        logger.info(f"   ... (truncated, full length: {len(complete_text)} chars)")
+                                    logger.info(f"   Session: {session_id}")
+                                    logger.info("=" * 70)
+                                    
+                                    # Call streaming callback
+                                    if streaming_callback:
+                                        try:
+                                            streaming_callback(complete_text, False)
+                                        except Exception as e:
+                                            logger.error(f"Streaming callback error: {e}")
+                            else:
+                                logger.debug(f"[{session_id}] Whisper returned empty for {audio_duration:.2f}s audio")
                                 
-                                session_data['last_partial_time'] = current_time
+                            session_data['last_partial_time'] = current_time
                 
                 elif vad_result['event'] == 'speech_end':
                     # Speech ended - generate final transcript
@@ -188,15 +212,20 @@ class STTManager:
                                 # Normalize and emit
                                 normalized = normalize_english_transcript(final_transcript)
                                 
+                                # Log directly to terminal for visibility (prominent display)
+                                logger.info("=" * 70)
+                                logger.info(f"📝 [✅ FINAL] STT Transcript")
+                                logger.info(f"   Text: '{normalized[:200]}'")
+                                if len(normalized) > 200:
+                                    logger.info(f"   ... (truncated, full length: {len(normalized)} chars)")
+                                logger.info(f"   Session: {session_id}")
+                                logger.info(f"   Chunks processed: {session_data['chunks_processed']}")
+                                logger.info("=" * 70)
+                                
+                                # Call streaming callback
                                 if streaming_callback:
                                     try:
                                         streaming_callback(normalized, True)
-                                        
-                                        logger.info("=" * 70)
-                                        logger.info(f"📝 [✅ FINAL] STT Fragment")
-                                        logger.info(f"   Text: '{normalized[:150]}'")
-                                        logger.info(f"   Session: {session_id}")
-                                        logger.info("=" * 70)
                                     except Exception as e:
                                         logger.error(f"Final callback error: {e}")
                     
@@ -236,4 +265,5 @@ class STTManager:
         if session_id in self._active_sessions:
             del self._active_sessions[session_id]
             logger.debug(f"Cleaned up session: {session_id}")
+
 

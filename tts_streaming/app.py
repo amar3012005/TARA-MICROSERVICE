@@ -43,6 +43,24 @@ logging.getLogger("uvicorn").setLevel(logging.INFO)
 
 logger = logging.getLogger(__name__)
 
+# Optional Redis support for orchestrator coordination
+try:
+    from leibniz_agent.services.shared.redis_client import get_redis_client, ping_redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    try:
+        from shared.redis_client import get_redis_client, ping_redis
+        REDIS_AVAILABLE = True
+    except ImportError:
+        REDIS_AVAILABLE = False
+        logger.warning("Redis client utilities unavailable - TTS connection events disabled")
+
+        async def get_redis_client():
+            return None
+
+        async def ping_redis(_client):
+            return False
+
 # Global state
 config: Optional[TTSStreamingConfig] = None
 provider: Optional[LemonFoxProvider] = None
@@ -51,6 +69,7 @@ active_sessions: Dict[str, Dict[str, Any]] = {}
 app_start_time: float = time.time()
 fastrtc_handler: Optional[FastRTCTTSHandler] = None
 fastrtc_stream: Optional[Stream] = None
+redis_client = None
 
 
 @asynccontextmanager
@@ -69,6 +88,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         raise
+    
+    # Update FastRTC defaults with configuration values
+    FastRTCTTSHandler.default_chunk_duration_ms = config.fastrtc_chunk_duration_ms
+    if fastrtc_handler:
+        fastrtc_handler.update_stream_settings(
+            chunk_duration_ms=config.fastrtc_chunk_duration_ms
+        )
     
     # Initialize LemonFox provider
     try:
@@ -117,6 +143,42 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
     logger.info("✅ TTS Streaming Microservice Ready")
     logger.info("=" * 70)
+
+    async def connect_redis_background():
+        """Background task to connect to Redis without blocking startup."""
+        global redis_client
+
+        if not REDIS_AVAILABLE:
+            logger.info("ℹ️ Redis utilities unavailable - skipping connection")
+            return
+
+        logger.info("🔌 Connecting to Redis (background)...")
+
+        if not os.getenv("LEIBNIZ_REDIS_HOST"):
+            os.environ["LEIBNIZ_REDIS_HOST"] = os.getenv("REDIS_HOST", "localhost")
+        if not os.getenv("LEIBNIZ_REDIS_PORT"):
+            os.environ["LEIBNIZ_REDIS_PORT"] = os.getenv("REDIS_PORT", "6379")
+
+        for attempt in range(5):
+            try:
+                redis_client = await asyncio.wait_for(get_redis_client(), timeout=5.0)
+                await ping_redis(redis_client)
+                logger.info(f"✅ Redis connected (attempt {attempt + 1})")
+                if fastrtc_handler:
+                    fastrtc_handler.redis_client = redis_client
+                    logger.info("✅ FastRTC handler updated with Redis client")
+                return
+            except asyncio.TimeoutError:
+                logger.warning(f"⏳ Redis connection timeout (attempt {attempt + 1}/5)")
+            except Exception as exc:
+                logger.warning(f"⚠️ Redis connection error (attempt {attempt + 1}/5): {exc}")
+
+            if attempt < 4:
+                await asyncio.sleep(2.0)
+
+        logger.warning("⚠️ Redis unavailable - TTS connection events will be disabled")
+
+    asyncio.create_task(connect_redis_background())
     
     yield
     
@@ -129,6 +191,14 @@ async def lifespan(app: FastAPI):
     if provider:
         await provider.close()
         logger.info("✅ LemonFox provider closed")
+
+    if redis_client:
+        logger.info("🔌 Closing Redis connection...")
+        try:
+            await redis_client.close()
+            logger.info("✅ Redis connection closed")
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to close Redis connection: {exc}")
     
     logger.info("✅ TTS Streaming microservice stopped")
 
@@ -153,7 +223,10 @@ app.add_middleware(
 # Initialize FastRTC handler and mount UI
 try:
     # Initialize with None queue, it will be provided per request/session
-    fastrtc_handler = FastRTCTTSHandler(tts_queue=None)
+    fastrtc_handler = FastRTCTTSHandler(
+        tts_queue=None,
+        redis_client=redis_client
+    )
     
     # CRITICAL FIX: Set the class-level queue attribute so new instances get it
     # FastRTC creates new handler instances for each connection
@@ -259,9 +332,20 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                     "cached": metadata.get('cached', False)
                 })
                 
+                # Send playback state message for orchestrator tracking
+                duration_ms = metadata.get('duration_ms', 0)
+                await websocket.send_json({
+                    "type": "sentence_playing",
+                    "index": metadata.get('sentence_index', 0),
+                    "duration_ms": duration_ms,
+                    "expected_complete_at": time.time() + (duration_ms / 1000.0)
+                })
+                
                 # Also send to FastRTC handler if available
-                if fastrtc_handler:
-                    await fastrtc_handler.add_audio_chunk(audio_bytes, sample_rate)
+                # CRITICAL FIX: Broadcast to ALL active FastRTC sessions
+                # (Previously this called fastrtc_handler.add_audio_chunk which only added to the global template instance)
+                await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
+                    
             except Exception as e:
                 logger.error(f"Error sending audio chunk: {e}")
         

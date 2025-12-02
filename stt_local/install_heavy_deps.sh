@@ -23,3 +23,6 @@ echo "You can now start the service with:"
 echo "  python3 -u -m uvicorn app:app --host 0.0.0.0 --port 8006 --workers 1"
 echo "=========================================="
 
+
+
+

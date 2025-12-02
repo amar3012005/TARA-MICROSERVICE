@@ -148,3 +148,6 @@ docker-compose logs -f intent-service
 
 
 
+
+
+

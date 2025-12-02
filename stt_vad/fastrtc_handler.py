@@ -10,6 +10,7 @@ which processes it with Gemini Live API for real-time transcription.
 """
 
 import asyncio
+import json
 import logging
 import time
 from typing import Optional
@@ -27,15 +28,17 @@ class FastRTCSTTHandler(AsyncStreamHandler):
     Provides direct audio streaming without network overhead for ultra-low latency.
     """
     
-    def __init__(self, vad_manager=None):
+    def __init__(self, vad_manager=None, redis_client=None):
         """
         Initialize FastRTC STT Handler.
         
         Args:
             vad_manager: VADManager instance (injected at runtime)
+            redis_client: Redis client for publishing connection events
         """
         super().__init__()
         self.vad_manager = vad_manager
+        self.redis_client = redis_client
         self.session_id = f"fastrtc_{int(time.time())}"
         self._chunk_count = 0
         self._started = False
@@ -67,7 +70,30 @@ class FastRTCSTTHandler(AsyncStreamHandler):
             logger.info("📊 Flow: Browser → FastRTC → VADManager → Gemini Live → STT")
             logger.info("🎤 Start speaking - audio will trigger automatic pipeline processing")
         
+        # Publish connection event to Redis for orchestrator
+        await self._publish_connection_event()
+        
         logger.info("=" * 70)
+    
+    async def _publish_connection_event(self):
+        """Publish FastRTC connection event to Redis for orchestrator coordination."""
+        if not self.redis_client:
+            logger.warning("⚠️ Redis client unavailable - cannot publish STT connection event")
+            return
+
+        payload = json.dumps({
+            "session_id": self.session_id,
+            "timestamp": time.time(),
+            "event": "stt_connected",
+            "source": "stt_vad_fastrtc"
+        })
+        channel = "leibniz:events:stt:connected"
+
+        try:
+            await self.redis_client.publish(channel, payload)
+            logger.info(f"📡 Published STT connection event → {channel}")
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to publish STT connection event: {exc}")
     
     async def receive(self, audio: tuple) -> None:
         """
@@ -111,11 +137,9 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                 logger.info(f"   - Shape: {audio_array.shape}")
                 logger.info(f"   - Max Value: {max_val}")
             
-            # Ensure float32 for processing
-            if audio_array.dtype != np.float32:
-                audio_array = audio_array.astype(np.float32)
-            
-            # CRITICAL: Resample to 16kHz for Gemini (FastRTC sends 48kHz or 24kHz)
+            # CRITICAL: Resample to 16kHz for Gemini Live API
+            # Gemini Live API requires 16-bit PCM at 16kHz mono
+            # Reference: https://ai.google.dev/gemini-api/docs/live
             target_rate = 16000
             if sample_rate != target_rate:
                 if sample_rate > target_rate and sample_rate % target_rate == 0:
@@ -125,47 +149,31 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                     sample_rate = target_rate
                 else:
                     # Fallback: Naive resampling for non-integer ratios
-                    # Calculate new length
                     new_length = int(len(audio_array) * target_rate / sample_rate)
                     indices = np.linspace(0, len(audio_array) - 1, new_length).astype(int)
                     audio_array = audio_array[indices]
                     sample_rate = target_rate
 
-            # CRITICAL: Amplification / Auto-Gain
-            # If audio is too quiet, boost it
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            target_peak = 20000.0 # Target ~60% full scale for int16
-            max_gain = 50.0 # Max amplification factor
-            
-            # Determine if we are in int16 scale (> 1.0) or float scale (<= 1.0)
-            is_int_scale = max_val > 1.0
-            
-            if is_int_scale:
-                # Int16 scale logic
-                if max_val > 0 and max_val < 5000: # Below ~15% volume
-                    gain = min(target_peak / max_val, max_gain)
-                    audio_array = audio_array * gain
-                    # Log occasionally
-                    if self._chunk_count % 50 == 0:
-                        logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val} -> {np.max(np.abs(audio_array))})")
-            elif max_val > 0 and max_val < 0.15: # Float scale logic (below 15%)
-                target_float = 0.6
-                gain = min(target_float / max_val, max_gain)
-                audio_array = audio_array * gain
-                if self._chunk_count % 50 == 0:
-                    logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val:.4f} -> {np.max(np.abs(audio_array)):.4f})")
-
-            # CRITICAL: Normalization and conversion to int16
-            # Re-calculate max after amplification
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            
-            if max_val > 1.0:
-                # Assume already scaled (e.g. int16 values in float container), just cast/clip
-                # This prevents amplifying noise if values are already large
-                audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+            # Convert to int16 PCM format for Gemini Live API
+            # No amplification - pass through audio as-is for accurate transcription
+            if audio_array.dtype == np.int16:
+                audio_int16 = audio_array
+            elif audio_array.dtype in (np.float32, np.float64):
+                max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
+                if max_val > 1.0:
+                    # Already in int16 scale, just clip and cast
+                    audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+                else:
+                    # Float [-1, 1] scale, convert to int16
+                    audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
             else:
-                # Assume float [-1, 1], scale to int16
-                audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
+                # Convert other dtypes to float32 first, then to int16
+                audio_array = audio_array.astype(np.float32)
+                max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
+                if max_val > 1.0:
+                    audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+                else:
+                    audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
             
             audio_bytes = audio_int16.tobytes()
             
@@ -221,7 +229,7 @@ class FastRTCSTTHandler(AsyncStreamHandler):
     
     def copy(self) -> 'FastRTCSTTHandler':
         """Create a copy of this handler for FastRTC."""
-        return FastRTCSTTHandler(vad_manager=self.vad_manager)
+        return FastRTCSTTHandler(vad_manager=self.vad_manager, redis_client=self.redis_client)
     
     async def shutdown(self) -> None:
         """Cleanup resources when stream closes."""

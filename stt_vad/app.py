@@ -106,6 +106,10 @@ async def lifespan(app: FastAPI):
                 logger.info(f"✅ Redis connected (attempt {retry_attempt + 1})")
                 # Update VAD manager with Redis client
                 vad_manager.redis_client = redis_client
+                # Update FastRTC handler with Redis client for connection events
+                if fastrtc_handler:
+                    fastrtc_handler.redis_client = redis_client
+                    logger.info("✅ FastRTC handler updated with Redis client")
                 break
             except asyncio.TimeoutError:
                 logger.warning(f"⏳ Redis connection timeout (attempt {retry_attempt + 1}/5)")

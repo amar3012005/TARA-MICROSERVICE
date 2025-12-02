@@ -84,3 +84,6 @@ docker ps | grep tara
 # Should show containers, and they'll be visible in Docker Desktop
 ```
 
+
+
+

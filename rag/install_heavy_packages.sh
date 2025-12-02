@@ -32,3 +32,6 @@ echo ""
 echo "You can now use the RAG service with full ML capabilities."
 echo "To verify, run: python -c 'import sentence_transformers; print(\"OK\")'"
 
+
+
+

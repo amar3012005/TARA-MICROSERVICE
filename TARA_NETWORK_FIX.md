@@ -43,3 +43,6 @@ docker context use desktop-linux
 docker-compose -p tara-microservice -f docker-compose-tara.yml up -d --build
 ```
 
+
+
+

@@ -77,8 +77,8 @@ class GeminiLiveSession:
         """
         # Ensure client exists
         if cls._client is None:
-            # Hardcode API key for testing
-            api_key = os.getenv("GEMINI_API_KEY", "AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg")
+            # Get API key from environment
+            api_key = os.getenv("GEMINI_API_KEY", "AIzaSyAPNe7vAaTeRtjCU13JEf-wbbabPhsk5Gw")
             if not api_key:
                 raise ValueError(
                     "GEMINI_API_KEY environment variable not set. "
@@ -101,7 +101,8 @@ class GeminiLiveSession:
             # Session configuration for English transcription with strict language lock
             session_config = {
                 "response_modalities": ["TEXT"],  # TEXT only for transcription
-                "input_audio_transcription": {}   # Enable user speech transcription
+                "input_audio_transcription": {},   # Enable user speech transcription
+                "system_instruction": "You are a speech-to-text transcription assistant. Transcribe all audio input in English only. Do not translate or transliterate to other languages. Provide accurate, verbatim transcription of the user's speech."
             }
             
             # CRITICAL: Strict language lock to prevent hallucinations

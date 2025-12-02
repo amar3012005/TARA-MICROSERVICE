@@ -9,9 +9,9 @@ Reference:
 """
 
 import asyncio
+import json
 import logging
 import time
-from typing import Optional
 
 import numpy as np
 from fastrtc import AsyncStreamHandler
@@ -26,7 +26,7 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
     Provides direct audio streaming without network overhead for ultra-low latency.
     """
     
-    def __init__(self, stt_manager=None):
+    def __init__(self, stt_manager=None, redis_client=None):
         """
         Initialize FastRTC STT Local Handler.
         
@@ -35,6 +35,7 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
         """
         super().__init__()
         self.stt_manager = stt_manager
+        self.redis_client = redis_client
         self.session_id = f"fastrtc_{int(time.time())}"
         self._chunk_count = 0
         self._started = False
@@ -66,6 +67,8 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
             logger.info("📊 Flow: Browser → FastRTC → STTManager → Silero VAD → Faster Whisper → STT")
             logger.info("🎤 Start speaking - audio will trigger automatic pipeline processing")
         
+        await self._publish_connection_event()
+
         logger.info("=" * 70)
     
     async def receive(self, audio: tuple) -> None:
@@ -101,14 +104,20 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
             elif audio_array.ndim > 2:
                 audio_array = audio_array.flatten()
             
-            # Log audio stats on first chunk for debugging
-            if self._chunk_count == 0:
+            # Log audio stats on first few chunks for debugging
+            if self._chunk_count < 3:
                 max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-                logger.info(f"🔍 Audio Input Stats:")
+                # Calculate RMS (Root Mean Square) for audio energy
+                if audio_array.dtype == np.int16:
+                    rms = np.sqrt(np.mean((audio_array.astype(np.float32) / 32768.0) ** 2))
+                else:
+                    rms = np.sqrt(np.mean(audio_array ** 2))
+                logger.info(f"🔍 Audio Input Stats (chunk {self._chunk_count}):")
                 logger.info(f"   - Sample Rate: {sample_rate}Hz")
                 logger.info(f"   - DType: {audio_array.dtype}")
                 logger.info(f"   - Shape: {audio_array.shape}")
                 logger.info(f"   - Max Value: {max_val}")
+                logger.info(f"   - RMS Energy: {rms:.4f} (need >0.01 for speech)")
             
             # Ensure float32 for processing
             if audio_array.dtype != np.float32:
@@ -129,38 +138,15 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
                     audio_array = audio_array[indices]
                     sample_rate = target_rate
 
-            # CRITICAL: Amplification / Auto-Gain
-            # If audio is too quiet, boost it
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            target_peak = 20000.0  # Target ~60% full scale for int16
-            max_gain = 50.0  # Max amplification factor
-            
-            # Determine if we are in int16 scale (> 1.0) or float scale (<= 1.0)
-            is_int_scale = max_val > 1.0
-            
-            if is_int_scale:
-                # Int16 scale logic
-                if max_val > 0 and max_val < 5000:  # Below ~15% volume
-                    gain = min(target_peak / max_val, max_gain)
-                    audio_array = audio_array * gain
-                    # Log occasionally
-                    if self._chunk_count % 50 == 0:
-                        logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val} -> {np.max(np.abs(audio_array))})")
-            elif max_val > 0 and max_val < 0.15:  # Float scale logic (below 15%)
-                target_float = 0.6
-                gain = min(target_float / max_val, max_gain)
-                audio_array = audio_array * gain
-                if self._chunk_count % 50 == 0:
-                    logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val:.4f} -> {np.max(np.abs(audio_array)):.4f})")
-
-            # CRITICAL: Normalization and conversion to int16
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            
-            if max_val > 1.0:
-                # Assume already scaled (e.g. int16 values in float container), just cast/clip
+            # Convert to int16 (NO amplification - preserve original audio)
+            # FastRTC sends int16 directly, so just ensure correct dtype
+            if audio_array.dtype == np.int16:
+                audio_int16 = audio_array
+            elif np.max(np.abs(audio_array)) > 1.0:
+                # Already in int16 scale but wrong dtype
                 audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
             else:
-                # Assume float [-1, 1], scale to int16
+                # Float32 in [-1.0, 1.0] range
                 audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
             
             audio_bytes = audio_int16.tobytes()
@@ -197,14 +183,24 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
         Callback for receiving transcripts from STTManager.
         
         This is called by STTManager when transcripts are available.
-        We log them for visibility.
+        Logs them prominently to terminal for real-time visibility.
         
         Args:
             text: Transcript text
             is_final: Whether this is a final transcript
         """
         status = "✅ FINAL" if is_final else "🔄 PARTIAL"
-        logger.info(f"📝 [{status}] Transcript: '{text[:150]}'")
+        
+        # Enhanced terminal logging similar to stt-vad
+        logger.info("=" * 70)
+        logger.info(f"📝 [{status}] STT Transcript")
+        logger.info(f"   Text: '{text[:200]}'")
+        if len(text) > 200:
+            logger.info(f"   ... (truncated, full length: {len(text)} chars)")
+        logger.info(f"   Session: {self.session_id}")
+        if is_final:
+            logger.info(f"   Chunks processed: {self._chunk_count}")
+        logger.info("=" * 70)
     
     async def emit(self):
         """
@@ -217,7 +213,10 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
     
     def copy(self) -> 'FastRTCSTTLocalHandler':
         """Create a copy of this handler for FastRTC."""
-        return FastRTCSTTLocalHandler(stt_manager=self.stt_manager)
+        return FastRTCSTTLocalHandler(
+            stt_manager=self.stt_manager,
+            redis_client=self.redis_client
+        )
     
     async def shutdown(self) -> None:
         """Cleanup resources when stream closes."""
@@ -230,4 +229,25 @@ class FastRTCSTTLocalHandler(AsyncStreamHandler):
         self._started = False
         self._audio_buffer.clear()
         logger.info("✅ FastRTC stream closed")
+
+    async def _publish_connection_event(self):
+        """Publish FastRTC connection event so orchestrator can react."""
+        if not self.redis_client:
+            logger.warning("⚠️ Redis client unavailable - cannot publish STT connection event")
+            return
+
+        payload = json.dumps({
+            "session_id": self.session_id,
+            "timestamp": time.time(),
+            "event": "stt_connected",
+            "source": "stt_local_fastrtc"
+        })
+        channel = "leibniz:events:stt:connected"
+
+        try:
+            await self.redis_client.publish(channel, payload)
+            logger.info(f"📡 Published STT connection event → {channel}")
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to publish STT connection event: {exc}")
+
 
