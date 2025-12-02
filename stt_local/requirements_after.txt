@@ -1,0 +1,14 @@
+# STT Local Microservice - Heavy Dependencies (Install manually in container)
+# Run this after container starts: pip install -r requirements_after.txt
+
+# Faster Whisper (optimized Whisper inference) - HEAVY
+faster-whisper>=1.0.0
+
+# PyTorch (CUDA-enabled for GPU support) - VERY HEAVY (~2GB)
+torch>=2.1.0
+torchaudio>=2.1.0
+
+# Audio processing (heavy)
+sounddevice==0.4.6
+soundfile==0.12.1
+

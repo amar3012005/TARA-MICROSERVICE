@@ -82,6 +82,7 @@ class TTSStreamingQueue:
         """
         for sentence in sentences:
             try:
+                logger.info(f"📥 Enqueuing sentence: '{sentence}' (emotion={emotion})")
                 self.queue.put_nowait((sentence, emotion, voice, language))
                 self.sentences_queued += 1
             except asyncio.QueueFull:
@@ -119,15 +120,10 @@ class TTSStreamingQueue:
     
     async def consume_queue(self) -> Dict[str, Any]:
         """
-        Consume queue with 2-slot pipeline.
-        
-        Returns:
-            Dict with statistics: sentences_played, sentences_failed, total_duration_ms
+        Consume queue sequentially to ensure low latency for the first sentence.
+        Synthesizes N, sends N (starts playing), then synthesizes N+1.
+        Since sending is non-blocking, N+1 is synthesized while N is playing.
         """
-        stage = deque()  # Staging buffer for non-destructive peek
-        current_result = None  # Audio result for current sentence
-        next_future = None  # Background synthesis task for N+1
-        
         sentences_played = 0
         total_duration_ms = 0.0
         
@@ -138,146 +134,74 @@ class TTSStreamingQueue:
                     logger.debug("TTS queue cancelled")
                     break
                 
-                # Fill staging buffer from queue (ensure at least 1 item)
-                while len(stage) < 2:
-                    try:
-                        item = await asyncio.wait_for(self.queue.get(), timeout=0.5)
-                        stage.append(item)
-                        
-                        if item is None:  # Sentinel
-                            break
-                    except asyncio.TimeoutError:
-                        break  # No more items yet
-                
-                if not stage:
-                    if self.cancelled.is_set():
-                        break
+                # Get next item
+                try:
+                    item = await asyncio.wait_for(self.queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
                     continue
                 
-                # Get current sentence from staging buffer
-                current_item = stage.popleft()
-                
-                if current_item is None:  # Sentinel - end of stream
+                if item is None:  # Sentinel
                     break
                 
-                sentence, emotion, voice, language = current_item
+                sentence, emotion, voice, language = item
                 
-                # If we have prefetched future from previous iteration, await it now
-                if next_future:
-                    try:
-                        current_result = await next_future
-                        logger.debug(f"Using prefetched audio for: '{sentence[:30]}...'")
-                    except Exception as synth_error:
-                        logger.error(f"Prefetch synthesis error: {synth_error}")
-                        current_result = None
-                    next_future = None
-                else:
-                    current_result = None
-                
-                # Peek next sentence from stage (non-destructive) and start synthesis
-                if stage:  # Has next sentence in staging buffer
-                    next_item = stage[0]  # Peek without removing
-                    
-                    if next_item is not None:  # Not sentinel
-                        next_sentence, next_emotion, next_voice, next_lang = next_item
-                        
-                        # Check cache for next sentence
-                        cached_path = None
-                        if self.cache:
-                            cached_path = self.cache.get_cached_audio(
-                                next_sentence,
-                                next_voice or self.provider.voice,
-                                next_lang or self.provider.language,
-                                "lemonfox",
-                                next_emotion or "helpful"
-                            )
-                        
-                        if cached_path:
-                            # Found cached file - create synthetic result
-                            async def _return_cached(path):
-                                return {'audio_bytes': None, 'audio_path': path, 'cached': True}
-                            next_future = asyncio.create_task(_return_cached(cached_path))
-                            logger.debug(f"Prefetching N+1 (cached): '{next_sentence[:30]}...'")
-                        else:
-                            # Check deduplication
-                            sentence_hash = self._normalize_and_hash(next_sentence)
-                            
-                            if sentence_hash not in self.synthesis_in_flight:
-                                self.synthesis_in_flight.add(sentence_hash)
-                                
-                                # Start N+1 synthesis in background (don't await)
-                                async def _synthesize_and_track(text, hash_key, emo, v, lang):
-                                    try:
-                                        logger.debug(f"Background synthesis STARTED for N+1: '{text[:30]}...'")
-                                        result = await self._synthesize_sentence(text, emo, v, lang)
-                                        logger.debug(f"Background synthesis COMPLETED for N+1: '{text[:30]}...'")
-                                        return result
-                                    finally:
-                                        self.synthesis_in_flight.discard(hash_key)
-                                
-                                next_future = asyncio.create_task(
-                                    _synthesize_and_track(next_sentence, sentence_hash, next_emotion, next_voice, next_lang)
-                                )
-                                logger.debug(f"Prefetching N+1: '{next_sentence[:30]}...'")
-                            else:
-                                logger.debug(f"Skipping duplicate in-flight synthesis: '{next_sentence[:30]}...'")
-                                next_future = None
-                    else:
-                        next_future = None  # Next is sentinel
-                
-                # Process current sentence
                 try:
-                    if current_result:
-                        result = current_result
-                        logger.debug(f"Playing prefetched audio: '{sentence[:30]}...'")
+                    logger.debug(f"Processing sentence {sentences_played + 1}: '{sentence[:30]}...'")
+                    
+                    # Check cache
+                    cached_path = None
+                    if self.cache:
+                        cached_path = self.cache.get_cached_audio(
+                            sentence,
+                            voice or self.provider.voice,
+                            language or self.provider.language,
+                            "lemonfox",
+                            emotion or "helpful"
+                        )
+                    
+                    result = None
+                    if cached_path:
+                        result = {'audio_bytes': None, 'audio_path': cached_path, 'cached': True}
+                        self.cache_hits += 1
                     else:
-                        # First sentence or prefetch failed - synthesize now
-                        logger.debug(f"Synthesizing current (no prefetch): '{sentence[:30]}...'")
-                        
-                        # Check cache
-                        cached_path = None
-                        if self.cache:
-                            cached_path = self.cache.get_cached_audio(
-                                sentence,
-                                voice or self.provider.voice,
-                                language or self.provider.language,
-                                "lemonfox",
-                                emotion or "helpful"
-                            )
-                        
-                        if cached_path:
-                            result = {'audio_bytes': None, 'audio_path': cached_path, 'cached': True}
-                            self.cache_hits += 1
-                        else:
-                            # Check deduplication
-                            sentence_hash = self._normalize_and_hash(sentence)
-                            
-                            if sentence_hash not in self.synthesis_in_flight:
-                                self.synthesis_in_flight.add(sentence_hash)
-                                try:
-                                    result = await self._synthesize_sentence(sentence, emotion, voice, language)
-                                finally:
-                                    self.synthesis_in_flight.discard(sentence_hash)
-                            else:
-                                logger.warning(f"Duplicate synthesis blocked: '{sentence[:30]}...'")
-                                result = None
-                            self.cache_misses += 1
+                        # Synthesize
+                        result = await self._synthesize_sentence(sentence, emotion, voice, language)
+                        self.cache_misses += 1
                     
                     if result:
-                        # Load audio data
-                        if result.get('audio_bytes'):
-                            audio_bytes = result['audio_bytes']
-                            sample_rate = self.config.sample_rate
-                        elif result.get('audio_path'):
+                        import io
+                        import numpy as np
+                        
+                        # Load and decode audio data to PCM
+                        if result.get('audio_path'):
                             audio_data, sample_rate = await asyncio.to_thread(sf.read, result['audio_path'])
-                            audio_bytes = audio_data.tobytes()
+                        elif result.get('audio_bytes'):
+                            # Decode raw WAV bytes
+                            audio_data, sample_rate = await asyncio.to_thread(sf.read, io.BytesIO(result['audio_bytes']))
                         else:
                             logger.error("No audio data in result")
                             self.sentences_failed += 1
                             continue
                         
+                        # Ensure mono
+                        if audio_data.ndim > 1:
+                            audio_data = audio_data.mean(axis=1)
+                            
+                        # Convert to int16 for FastRTC handler
+                        if audio_data.dtype != np.int16:
+                            # float to int16 (clip to avoid wrap-around)
+                            audio_data = np.clip(audio_data, -1.0, 1.0)
+                            audio_data = (audio_data * 32767).astype(np.int16)
+                        
+                        # Add silence padding (400ms) for naturalness
+                        silence_samples = int(sample_rate * 0.4)
+                        silence = np.zeros(silence_samples, dtype=np.int16)
+                        audio_data = np.concatenate((audio_data, silence))
+                            
+                        audio_bytes = audio_data.tobytes()
+                        
                         # Calculate duration
-                        duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000  # Approximate for int16
+                        duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000  # 2 bytes per sample
                         
                         # Call audio callback if provided
                         if self.audio_callback:
@@ -389,4 +313,5 @@ class TTSStreamingQueue:
             'cache_misses': self.cache_misses,
             'in_flight_synthesis': len(self.synthesis_in_flight)
         }
+
 

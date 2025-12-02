@@ -20,12 +20,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file
+# Copy requirements files
 COPY services/rag/requirements.txt .
+COPY services/rag/requirements_after.txt .
 
-# Install ALL dependencies including heavy ones (torch, sentence-transformers)
-RUN pip install --user --no-cache-dir -r requirements.txt && \
-    echo "✅ All dependencies installed (including torch and sentence-transformers)"
+# Install ONLY lightweight dependencies during build (fast build)
+RUN pip install --default-timeout=1000 --user --no-cache-dir -r requirements.txt && \
+    echo "✅ Lightweight dependencies installed (fast build)" && \
+    echo "⚠️  Heavy packages (sentence-transformers, torch) will be installed manually after container starts"
 
 # ============================================================================
 # Index Builder Stage - Build FAISS index
@@ -44,6 +46,10 @@ ENV PYTHONPATH=/app
 # Copy service code (needed for index builder)
 COPY services/rag /app/leibniz_agent/services/rag
 COPY services/shared /app/leibniz_agent/services/shared
+
+# Copy install script
+COPY services/rag/install_heavy_packages.sh /app/install_heavy_packages.sh
+RUN chmod +x /app/install_heavy_packages.sh
 
 # Create package structure
 RUN mkdir -p /app/leibniz_agent/services && \
@@ -94,6 +100,10 @@ ENV PYTHONPATH=/app
 COPY services/rag /app/leibniz_agent/services/rag
 COPY services/shared /app/leibniz_agent/services/shared
 
+# Copy install script for heavy packages (for manual installation)
+COPY services/rag/install_heavy_packages.sh /app/install_heavy_packages.sh
+RUN chmod +x /app/install_heavy_packages.sh
+
 # Create package structure
 RUN mkdir -p /app/leibniz_agent/services && \
     echo "" > /app/leibniz_agent/__init__.py && \
@@ -110,7 +120,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Environment variables (defaults, override in docker-compose)
-ENV GEMINI_API_KEY="AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg"
+ENV GEMINI_API_KEY="AIzaSyBiKXVYsQ0UcxRicctFI1U5dEpQct2ieOA"
 ENV GEMINI_MODEL="gemini-2.0-flash-lite"
 ENV LEIBNIZ_REDIS_HOST="redis"
 ENV LEIBNIZ_REDIS_PORT="6379"

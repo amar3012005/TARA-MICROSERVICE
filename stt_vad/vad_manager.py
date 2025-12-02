@@ -15,6 +15,7 @@ Reference:
 """
 
 import asyncio
+import json
 import time
 import logging
 from typing import Optional, Callable, Dict, Any
@@ -327,6 +328,23 @@ class VADManager:
                 logger.info(f"📝 Text: '{final_transcript}'")
                 logger.info("=" * 70)
                 
+                # Publish final transcript to Redis for orchestrator
+                if self.redis_client and final_transcript:
+                    try:
+                        event_data = {
+                            "text": final_transcript,
+                            "session_id": session_id,
+                            "timestamp": time.time(),
+                            "source": "stt-vad"
+                        }
+                        await self.redis_client.publish(
+                            "leibniz:events:stt",
+                            json.dumps(event_data)
+                        )
+                        logger.info(f"📢 Published transcript to Redis channel 'leibniz:events:stt'")
+                    except Exception as e:
+                        logger.warning(f"Failed to publish transcript to Redis: {e}")
+                
                 # Reset timeout counter on success
                 self.consecutive_timeouts = 0
             else:
@@ -571,6 +589,23 @@ class VADManager:
                                 logger.info(f"   Text: '{normalized_text[:150]}'")
                                 logger.info(f"   Session: {session_id}")
                                 logger.info("=" * 70)
+                                
+                                # Publish final transcript to Redis for orchestrator
+                                if self.redis_client and normalized_text:
+                                    try:
+                                        event_data = {
+                                            "text": normalized_text,
+                                            "session_id": session_id,
+                                            "timestamp": time.time(),
+                                            "source": "stt-vad"
+                                        }
+                                        await self.redis_client.publish(
+                                            "leibniz:events:stt",
+                                            json.dumps(event_data)
+                                        )
+                                        logger.info(f"📢 Published transcript to Redis channel 'leibniz:events:stt'")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to publish transcript to Redis: {e}")
 
                     # 2. Handle Model Turn (Gemini Response) - IGNORE or LOG
                     if response.server_content.model_turn:
@@ -599,6 +634,23 @@ class VADManager:
                             logger.info(f"   Text: '{normalized_transcript[:150]}'")
                             logger.info(f"   Session: {session_id}")
                             logger.info("=" * 70)
+                            
+                            # Publish final transcript to Redis for orchestrator
+                            if self.redis_client and normalized_transcript:
+                                try:
+                                    event_data = {
+                                        "text": normalized_transcript,
+                                        "session_id": session_id,
+                                        "timestamp": time.time(),
+                                        "source": "stt-vad"
+                                    }
+                                    await self.redis_client.publish(
+                                        "leibniz:events:stt",
+                                        json.dumps(event_data)
+                                    )
+                                    logger.info(f"📢 Published transcript to Redis channel 'leibniz:events:stt'")
+                                except Exception as e:
+                                    logger.warning(f"Failed to publish transcript to Redis: {e}")
 
         except StopAsyncIteration:
             # Session ended normally

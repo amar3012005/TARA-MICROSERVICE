@@ -30,9 +30,17 @@ from fastrtc import Stream
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# Suppress noisy libraries
+logging.getLogger("aiortc").setLevel(logging.WARNING)
+logging.getLogger("aioice").setLevel(logging.WARNING)
+logging.getLogger("fastrtc").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 
 # Global state
@@ -94,10 +102,18 @@ async def lifespan(app: FastAPI):
         cache = None
     
     # Initialize FastRTC handler (will be set up after app creation)
-    global fastrtc_handler, fastrtc_stream
-    fastrtc_handler = None
-    fastrtc_stream = None
-    
+    # Note: fastrtc_handler is initialized at module level to support gr.mount_gradio_app
+    # Do NOT reset it here!
+
+    # CRITICAL FIX: Inject the queue into the handler class so all instances can access it
+    # This must be done BEFORE FastRTC initializes any handlers
+    if fastrtc_handler:
+        # If we have a global instance
+        fastrtc_handler.tts_queue = None  # Will be set per-request or globally if needed
+        
+        # More importantly, set it on the CLASS so new instances get it
+        FastRTCTTSHandler.tts_queue = None # Placeholder, will be set below
+
     logger.info("=" * 70)
     logger.info("✅ TTS Streaming Microservice Ready")
     logger.info("=" * 70)
@@ -136,7 +152,13 @@ app.add_middleware(
 
 # Initialize FastRTC handler and mount UI
 try:
-    fastrtc_handler = FastRTCTTSHandler(tts_queue=None)  # Will be injected per session
+    # Initialize with None queue, it will be provided per request/session
+    fastrtc_handler = FastRTCTTSHandler(tts_queue=None)
+    
+    # CRITICAL FIX: Set the class-level queue attribute so new instances get it
+    # FastRTC creates new handler instances for each connection
+    FastRTCTTSHandler.tts_queue = None  # Will be populated dynamically
+    
     fastrtc_stream = Stream(
         handler=fastrtc_handler,
         modality="audio",
@@ -587,7 +609,8 @@ async def fastrtc_synthesize(request: SynthesizeRequest):
         # Create TTS queue with FastRTC callback
         async def fastrtc_audio_callback(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
             """Callback to send audio to FastRTC"""
-            await fastrtc_handler.add_audio_chunk(audio_bytes, sample_rate)
+            # Broadcast to ALL active FastRTC sessions
+            await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
         
         queue = TTSStreamingQueue(
             provider=provider,
@@ -596,6 +619,12 @@ async def fastrtc_synthesize(request: SynthesizeRequest):
             audio_callback=fastrtc_audio_callback
         )
         
+        # CRITICAL: Inject this queue into the FastRTC handler class
+        # This allows the active WebRTC connection to pull audio from this queue
+        FastRTCTTSHandler.tts_queue = queue
+        if fastrtc_handler:
+            fastrtc_handler.tts_queue = queue
+            
         # Enqueue sentences
         await queue.enqueue_sentences(sentences, request.emotion, request.voice, request.language)
         
@@ -642,4 +671,3 @@ if __name__ == "__main__":
         port=port,
         log_level="info"
     )
-

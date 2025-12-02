@@ -58,11 +58,11 @@ class RedisConfig:
     def from_env() -> 'RedisConfig':
         """Load configuration from environment variables"""
         # Check for REDIS_URL first (overrides individual settings)
-        redis_url = os.getenv("LEIBNIZ_REDIS_URL")
+        redis_url = os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
         if redis_url:
             # Parse URL manually for config display purposes
             # Actual connection will use the URL directly
-            logger.info(f"Loading Redis config from LEIBNIZ_REDIS_URL")
+            logger.info(f"Loading Redis config from REDIS_URL")
         
         return RedisConfig(
             host=os.getenv("LEIBNIZ_REDIS_HOST", "localhost"),
@@ -77,7 +77,7 @@ class RedisConfig:
     def get_redis_url(self) -> str:
         """Generate Redis connection URL"""
         # Check for explicit URL first
-        env_url = os.getenv("LEIBNIZ_REDIS_URL")
+        env_url = os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
         if env_url:
             return env_url
         

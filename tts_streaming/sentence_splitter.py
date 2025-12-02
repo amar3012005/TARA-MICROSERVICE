@@ -40,19 +40,41 @@ def split_into_sentences(text: str) -> List[str]:
     
     # Split on sentence delimiters - TARA pattern
     # Keep punctuation with sentences
-    sentences = re.split(r'(?<=[.?!])\s+', text.strip())
+    # Added comma (,) and semicolon (;) to split long sentences for lower latency
+    sentences = re.split(r'(?<=[.?!,;])\s+', text.strip())
     
     # Filter empty and very short fragments
     valid_sentences = []
+    current_fragment = ""
+    
     for sentence in sentences:
         sentence = sentence.strip()
         
         # Restore abbreviations
         for abbrev, placeholder in abbrev_map.items():
             sentence = sentence.replace(placeholder, abbrev)
+            
+        if not sentence:
+            continue
+            
+        # If fragment is too short (e.g. just a comma split like "However,"), buffer it
+        # Unless it ends with a strong terminator (.?!)
+        is_strong_end = sentence[-1] in '.?!'
         
-        if sentence and len(sentence) > 3:  # Minimum 3 chars to keep short meaningful sentences
-            valid_sentences.append(sentence)
+        if len(current_fragment) + len(sentence) < 20 and not is_strong_end:
+            current_fragment += " " + sentence
+        else:
+            if current_fragment:
+                full_sentence = (current_fragment + " " + sentence).strip()
+                current_fragment = ""
+            else:
+                full_sentence = sentence
+            
+            valid_sentences.append(full_sentence)
+            
+    # Add any remaining fragment
+    if current_fragment:
+        valid_sentences.append(current_fragment.strip())
     
     # If no valid sentences found (no punctuation), split on length
     if not valid_sentences and text.strip():
@@ -71,4 +93,5 @@ def split_into_sentences(text: str) -> List[str]:
             valid_sentences.append(' '.join(chunk))
     
     return valid_sentences
+
 

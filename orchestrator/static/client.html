@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leibniz Voice Agent - Unified Client</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            padding: 30px;
+        }
+        @media (max-width: 768px) {
+            .content {
+                grid-template-columns: 1fr;
+            }
+        }
+        .panel {
+            background: #f8f9fa;
+            border-radius: 12px;
+            padding: 20px;
+            border: 2px solid #e9ecef;
+        }
+        .panel h2 {
+            color: #667eea;
+            margin-bottom: 15px;
+            font-size: 1.5em;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .status {
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-weight: bold;
+            text-align: center;
+            transition: all 0.3s;
+        }
+        .status.disconnected { background: #f8d7da; color: #721c24; }
+        .status.connecting { background: #fff3cd; color: #856404; }
+        .status.connected { background: #d4edda; color: #155724; }
+        .status.listening { background: #cfe2ff; color: #084298; }
+        .status.speaking { background: #fff3cd; color: #856404; }
+        .status.thinking { background: #e7f3ff; color: #055160; }
+        button {
+            padding: 12px 24px;
+            font-size: 1em;
+            cursor: pointer;
+            border: none;
+            border-radius: 8px;
+            font-weight: bold;
+            transition: all 0.3s;
+            margin: 5px;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: #667eea;
+            color: white;
+        }
+        .btn-primary:hover:not(:disabled) {
+            background: #5568d3;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+        .btn-danger:hover:not(:disabled) {
+            background: #c0392b;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
+        }
+        .transcripts, .logs {
+            max-height: 400px;
+            overflow-y: auto;
+            background: white;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        .transcript-item, .log-item {
+            padding: 8px;
+            margin-bottom: 8px;
+            border-left: 3px solid #667eea;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+        .transcript-item.final {
+            border-left-color: #28a745;
+            background: #d4edda;
+            font-weight: bold;
+        }
+        .transcript-item.fragment {
+            border-left-color: #ffc107;
+            opacity: 0.7;
+        }
+        .log-item.info { border-left-color: #17a2b8; }
+        .log-item.warning { border-left-color: #ffc107; }
+        .log-item.error { border-left-color: #dc3545; }
+        .log-item.success { border-left-color: #28a745; }
+        .audio-visualizer {
+            height: 100px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            margin: 15px 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 2px dashed #dee2e6;
+        }
+        .audio-visualizer.active {
+            border-color: #667eea;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 20px;
+        }
+        .session-info {
+            background: #e7f3ff;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.9em;
+        }
+        .session-info strong {
+            color: #667eea;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎙️ Leibniz Voice Agent</h1>
+            <p>Unified Client - STT Input & TTS Output</p>
+        </header>
+        
+        <div class="content">
+            <!-- Left Panel: Audio Input (STT-VAD) -->
+            <div class="panel">
+                <h2>🎤 Audio Input (STT-VAD)</h2>
+                <div id="sttStatus" class="status disconnected">Disconnected</div>
+                <div class="session-info">
+                    <strong>STT Service:</strong> <span id="sttServiceUrl">ws://localhost:8009</span><br>
+                    <strong>Session ID:</strong> <span id="sttSessionId">-</span>
+                </div>
+                <div class="audio-visualizer" id="sttVisualizer">
+                    <span style="color: #999;">Microphone Input</span>
+                </div>
+                <div class="controls">
+                    <button id="startSTT" class="btn-primary">Start Microphone</button>
+                    <button id="stopSTT" class="btn-danger" disabled>Stop</button>
+                </div>
+                <h3>Transcripts</h3>
+                <div id="transcripts" class="transcripts"></div>
+            </div>
+            
+            <!-- Right Panel: Audio Output (Orchestrator) -->
+            <div class="panel">
+                <h2>🔊 Audio Output (Orchestrator)</h2>
+                <div id="orchStatus" class="status disconnected">Disconnected</div>
+                <div class="session-info">
+                    <strong>Orchestrator:</strong> <span id="orchServiceUrl">ws://localhost:8011</span><br>
+                    <strong>Session ID:</strong> <span id="orchSessionId">-</span><br>
+                    <strong>State:</strong> <span id="currentState">-</span>
+                </div>
+                <div class="audio-visualizer" id="ttsVisualizer">
+                    <span style="color: #999;">Audio Output</span>
+                </div>
+                <div class="controls">
+                    <button id="connectOrch" class="btn-primary">Connect</button>
+                    <button id="disconnectOrch" class="btn-danger" disabled>Disconnect</button>
+                </div>
+                <h3>System Logs</h3>
+                <div id="logs" class="logs"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration - TARA Microservices
+        // Update these URLs based on your deployment
+        const STT_SERVICE_URL = window.location.hostname === 'localhost' ? 'ws://localhost:8020' : `ws://${window.location.hostname}:8020`;
+        const ORCH_SERVICE_URL = window.location.hostname === 'localhost' ? 'ws://localhost:8023' : `ws://${window.location.hostname}:8023`;
+        const SAMPLE_RATE = 16000;
+        
+        // State
+        let sttSocket = null;
+        let orchSocket = null;
+        let mediaStream = null;
+        let audioContext = null;
+        let processor = null;
+        let audioOutputContext = null;
+        let audioOutputSource = null;
+        let currentAudioChunks = [];
+        let sessionId = `session_${Date.now()}`;
+        let isPlayingAudio = false;
+        let isListening = false;
+        
+        // DOM Elements
+        const sttStatus = document.getElementById('sttStatus');
+        const orchStatus = document.getElementById('orchStatus');
+        const startSTT = document.getElementById('startSTT');
+        const stopSTT = document.getElementById('stopSTT');
+        const connectOrch = document.getElementById('connectOrch');
+        const disconnectOrch = document.getElementById('disconnectOrch');
+        const transcripts = document.getElementById('transcripts');
+        const logs = document.getElementById('logs');
+        const sttVisualizer = document.getElementById('sttVisualizer');
+        const ttsVisualizer = document.getElementById('ttsVisualizer');
+        const sttSessionId = document.getElementById('sttSessionId');
+        const orchSessionId = document.getElementById('orchSessionId');
+        const currentState = document.getElementById('currentState');
+        
+        // Update session IDs
+        sttSessionId.textContent = sessionId;
+        orchSessionId.textContent = sessionId;
+        
+        // Logging helper
+        function addLog(message, type = 'info') {
+            const logItem = document.createElement('div');
+            logItem.className = `log-item ${type}`;
+            logItem.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logs.appendChild(logItem);
+            logs.scrollTop = logs.scrollHeight;
+        }
+        
+        // Transcript helper
+        function addTranscript(text, isFinal = false) {
+            const item = document.createElement('div');
+            item.className = `transcript-item ${isFinal ? 'final' : 'fragment'}`;
+            item.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+            transcripts.appendChild(item);
+            transcripts.scrollTop = transcripts.scrollHeight;
+        }
+        
+        // Update status
+        function updateStatus(element, status, message) {
+            element.className = `status ${status}`;
+            element.textContent = message;
+        }
+        
+        // Connect to Orchestrator
+        async function connectOrchestrator() {
+            if (orchSocket && orchSocket.readyState === WebSocket.OPEN) {
+                addLog('Already connected to orchestrator', 'warning');
+                return;
+            }
+            
+            updateStatus(orchStatus, 'connecting', 'Connecting to orchestrator...');
+            addLog('Connecting to orchestrator...', 'info');
+            
+            try {
+                orchSocket = new WebSocket(`${ORCH_SERVICE_URL}/orchestrate?session_id=${sessionId}`);
+                
+                orchSocket.onopen = () => {
+                    updateStatus(orchStatus, 'connected', 'Connected to orchestrator');
+                    addLog('✅ Connected to orchestrator', 'success');
+                    connectOrch.disabled = true;
+                    disconnectOrch.disabled = false;
+                };
+                
+                orchSocket.onmessage = async (event) => {
+                    try {
+                        if (event.data instanceof Blob) {
+                            // Binary audio data
+                            await handleAudioChunk(event.data);
+                        } else {
+                            // JSON message
+                            const data = JSON.parse(event.data);
+                            await handleOrchestratorMessage(data);
+                        }
+                    } catch (e) {
+                        console.error('Error handling orchestrator message:', e);
+                    }
+                };
+                
+                orchSocket.onerror = (error) => {
+                    addLog(`❌ Orchestrator error: ${error}`, 'error');
+                    updateStatus(orchStatus, 'disconnected', 'Connection error');
+                };
+                
+                orchSocket.onclose = () => {
+                    updateStatus(orchStatus, 'disconnected', 'Disconnected from orchestrator');
+                    addLog('Disconnected from orchestrator', 'warning');
+                    connectOrch.disabled = false;
+                    disconnectOrch.disabled = true;
+                    orchSocket = null;
+                };
+            } catch (error) {
+                addLog(`❌ Failed to connect: ${error.message}`, 'error');
+                updateStatus(orchStatus, 'disconnected', 'Connection failed');
+            }
+        }
+        
+        // Handle orchestrator messages
+        async function handleOrchestratorMessage(data) {
+            const type = data.type;
+            
+            switch (type) {
+                case 'connected':
+                    addLog(`✅ Session connected: ${data.session_id}`, 'success');
+                    currentState.textContent = data.state || 'idle';
+                    break;
+                
+                case 'state_update':
+                    currentState.textContent = data.state;
+                    if (data.state === 'listening') {
+                        updateStatus(orchStatus, 'listening', 'Listening...');
+                        isListening = true;
+                    } else if (data.state === 'thinking') {
+                        updateStatus(orchStatus, 'thinking', 'Thinking...');
+                    } else if (data.state === 'speaking') {
+                        updateStatus(orchStatus, 'speaking', 'Speaking...');
+                        ttsVisualizer.classList.add('active');
+                    } else {
+                        updateStatus(orchStatus, 'connected', 'Ready');
+                        ttsVisualizer.classList.remove('active');
+                    }
+                    break;
+                
+                case 'response_ready':
+                    addLog(`✅ Response ready (${data.thinking_ms}ms): ${data.text.substring(0, 50)}...`, 'success');
+                    break;
+                
+                case 'turn_complete':
+                    addLog(`✅ Turn ${data.turn_number} complete`, 'success');
+                    currentState.textContent = data.state;
+                    updateStatus(orchStatus, 'connected', 'Ready for next turn');
+                    ttsVisualizer.classList.remove('active');
+                    isPlayingAudio = false;
+                    break;
+                
+                case 'interrupted':
+                    addLog(`⚡ ${data.message}`, 'warning');
+                    isPlayingAudio = false;
+                    ttsVisualizer.classList.remove('active');
+                    break;
+                
+                case 'tts_error':
+                    addLog(`❌ TTS error: ${data.message}`, 'error');
+                    break;
+                
+                default:
+                    addLog(`📨 ${type}: ${JSON.stringify(data)}`, 'info');
+            }
+        }
+        
+        // Handle audio chunks from orchestrator
+        async function handleAudioChunk(audioBlob) {
+            if (!audioOutputContext) {
+                audioOutputContext = new AudioContext({ sampleRate: 24000 });
+            }
+            
+            try {
+                const arrayBuffer = await audioBlob.arrayBuffer();
+                const audioBuffer = await audioOutputContext.decodeAudioData(arrayBuffer);
+                
+                if (!isPlayingAudio) {
+                    isPlayingAudio = true;
+                    ttsVisualizer.classList.add('active');
+                }
+                
+                // Play audio
+                const source = audioOutputContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioOutputContext.destination);
+                source.start();
+                
+                // Detect barge-in: if user starts speaking, stop audio
+                if (isListening && sttSocket && sttSocket.readyState === WebSocket.OPEN) {
+                    // Send interrupt signal
+                    if (orchSocket && orchSocket.readyState === WebSocket.OPEN) {
+                        orchSocket.send(JSON.stringify({ type: 'user_speaking' }));
+                        addLog('⚡ Barge-in detected - stopping audio', 'warning');
+                        source.stop();
+                        ttsVisualizer.classList.remove('active');
+                        isPlayingAudio = false;
+                    }
+                }
+            } catch (error) {
+                console.error('Error playing audio:', error);
+            }
+        }
+        
+        // Connect to STT-VAD
+        function connectSTT() {
+            if (sttSocket && sttSocket.readyState === WebSocket.OPEN) {
+                addLog('Already connected to STT', 'warning');
+                return;
+            }
+            
+            updateStatus(sttStatus, 'connecting', 'Connecting to STT service...');
+            addLog('Connecting to STT service...', 'info');
+            
+            sttSocket = new WebSocket(`${STT_SERVICE_URL}/api/v1/transcribe/stream?session_id=${sessionId}`);
+            
+            sttSocket.onopen = () => {
+                updateStatus(sttStatus, 'connected', 'Connected to STT service');
+                addLog('✅ Connected to STT service', 'success');
+            };
+            
+            sttSocket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'fragment') {
+                        addTranscript(data.text, data.is_final);
+                        if (data.is_final) {
+                            addLog(`📝 Final transcript: ${data.text}`, 'info');
+                        }
+                    }
+                } catch (e) {
+                    console.error('Error parsing STT message:', e);
+                }
+            };
+            
+            sttSocket.onerror = (error) => {
+                addLog(`❌ STT error: ${error}`, 'error');
+                updateStatus(sttStatus, 'disconnected', 'Connection error');
+            };
+            
+            sttSocket.onclose = () => {
+                updateStatus(sttStatus, 'disconnected', 'Disconnected from STT service');
+                addLog('Disconnected from STT service', 'warning');
+                sttSocket = null;
+            };
+        }
+        
+        // Start microphone
+        startSTT.onclick = async () => {
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+                const source = audioContext.createMediaStreamSource(mediaStream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                processor.onaudioprocess = (e) => {
+                    if (sttSocket && sttSocket.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const pcmData = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                        }
+                        sttSocket.send(pcmData.buffer);
+                        
+                        // Visual feedback
+                        sttVisualizer.classList.add('active');
+                        isListening = true;
+                    }
+                };
+                
+                startSTT.disabled = true;
+                stopSTT.disabled = false;
+                updateStatus(sttStatus, 'listening', 'Recording...');
+                addLog('🎤 Microphone started', 'success');
+                
+                if (!sttSocket || sttSocket.readyState !== WebSocket.OPEN) {
+                    connectSTT();
+                }
+            } catch (err) {
+                addLog(`❌ Error accessing microphone: ${err.message}`, 'error');
+                updateStatus(sttStatus, 'disconnected', 'Microphone error');
+            }
+        };
+        
+        // Stop microphone
+        stopSTT.onclick = () => {
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            if (sttSocket) {
+                sttSocket.close();
+            }
+            
+            startSTT.disabled = false;
+            stopSTT.disabled = true;
+            updateStatus(sttStatus, 'disconnected', 'Stopped');
+            sttVisualizer.classList.remove('active');
+            isListening = false;
+            addLog('🛑 Microphone stopped', 'info');
+        };
+        
+        // Connect/disconnect orchestrator
+        connectOrch.onclick = connectOrchestrator;
+        disconnectOrch.onclick = () => {
+            if (orchSocket) {
+                orchSocket.close();
+            }
+        };
+        
+        // Auto-connect orchestrator on load
+        window.addEventListener('load', () => {
+            addLog('🚀 Page loaded - ready to connect', 'info');
+            setTimeout(() => {
+                connectOrchestrator();
+            }, 500);
+        });
+    </script>
+</body>
+</html>
+

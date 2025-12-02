@@ -87,7 +87,7 @@ services:
       - "8003:8003"
     environment:
       - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBiKXVYsQ0UcxRicctFI1U5dEpQct2ieOA}
       - GEMINI_MODEL=gemini-2.0-flash-lite
       - LEIBNIZ_REDIS_HOST=redis
       - LEIBNIZ_REDIS_PORT=6379
@@ -143,6 +143,8 @@ services:
         condition: service_started
       stt-vad-service:
         condition: service_started
+      tts-streaming-service-new:
+        condition: service_started
     networks:
       - leibniz-network
     restart: unless-stopped
@@ -158,7 +160,7 @@ services:
       dockerfile: tts_streaming/Dockerfile
     container_name: tts-streaming-service-v3
     ports:
-      - "8012:8005"
+      - "8013:8005"
     environment:
       - PYTHONUNBUFFERED=1
       - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-6KtIDvYHZAlfKcBpjwqlb1g1XdUksVM2}
@@ -178,6 +180,55 @@ services:
       options:
         max-size: "50m"
         max-file: "2"
+
+  stt-local-service:
+    build:
+      context: .
+      dockerfile: stt_local/Dockerfile
+    container_name: stt-local-service
+    ports:
+      - "8014:8006"
+      - "7863:7861"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STT_LOCAL_HOST=0.0.0.0
+      - STT_LOCAL_PORT=8006
+      - FAST_RTC_PORT=7861
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LEIBNIZ_REDIS_HOST=redis
+      - LEIBNIZ_REDIS_PORT=6379
+      - LEIBNIZ_REDIS_DB=0
+      - LEIBNIZ_STT_LOCAL_WHISPER_MODEL_SIZE=base
+      - LEIBNIZ_STT_LOCAL_WHISPER_DEVICE=cuda
+      - LEIBNIZ_STT_LOCAL_WHISPER_COMPUTE_TYPE=float16
+      - LEIBNIZ_STT_LOCAL_WHISPER_LANGUAGE=en
+      - LEIBNIZ_STT_LOCAL_USE_GPU=true
+      - LEIBNIZ_STT_LOCAL_VAD_THRESHOLD=0.5
+      - LEIBNIZ_STT_LOCAL_VAD_MIN_SPEECH_MS=250
+      - LEIBNIZ_STT_LOCAL_VAD_SILENCE_TIMEOUT_MS=800
+      - LEIBNIZ_STT_LOCAL_PARTIAL_UPDATE_INTERVAL_MS=500
+      - DOCKER_ENVIRONMENT=true
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - leibniz-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
 
 volumes:
   redis_data:

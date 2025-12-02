@@ -26,7 +26,7 @@ class OrchestratorConfig:
     intent_service_url: str = os.getenv("INTENT_SERVICE_URL", "http://intent-service:8002")
     rag_service_url: Optional[str] = os.getenv("RAG_SERVICE_URL", None)  # Optional - can be None
     stt_service_url: str = os.getenv("STT_SERVICE_URL", "http://stt-vad-service:8001")
-    tts_service_url: str = os.getenv("TTS_SERVICE_URL", "http://tts-service:8005")
+    tts_service_url: str = os.getenv("TTS_SERVICE_URL", "http://tts-streaming-service-new:8005")
     
     # LLM (for future use)
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini")

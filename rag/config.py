@@ -175,7 +175,7 @@ class RAGConfig:
         # Get API key - use default if not set or empty
         gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not gemini_api_key:
-            gemini_api_key = "AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg"
+            gemini_api_key = "AIzaSyBiKXVYsQ0UcxRicctFI1U5dEpQct2ieOA"
         
         return RAGConfig(
             # Required settings
