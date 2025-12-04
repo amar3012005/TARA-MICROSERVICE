@@ -2,6 +2,11 @@
 FastRTC Handler for TTS Streaming Service
 
 Provides audio output streaming via FastRTC for browser playback.
+
+Optimizations:
+- Immediate playback (min_buffer_chunks=1)
+- Reduced sleep intervals for faster response
+- Latency metrics logging
 """
 
 import asyncio
@@ -25,7 +30,7 @@ class FastRTCTTSHandler(AsyncStreamHandler):
     
     # Registry of active handler instances
     active_instances: Set['FastRTCTTSHandler'] = set()
-    default_chunk_duration_ms: int = 40
+    default_chunk_duration_ms: int = 20  # Reduced from 40ms for faster streaming
     default_min_buffer_chunks: int = 1  # Start playing immediately when audio arrives
     
     def __init__(
@@ -59,6 +64,12 @@ class FastRTCTTSHandler(AsyncStreamHandler):
         self._current_audio_chunk = None
         self._chunk_position = 0
         self._playback_end_time = 0.0  # Track when current audio finishes
+        self._prewarm_chunks_remaining = 0  # Set in start_up()
+        
+        # Latency metrics
+        self._first_chunk_received_at = 0.0
+        self._first_chunk_emitted_at = 0.0
+        self._total_chunks_emitted = 0
         
         logger.info("🔊 FastRTC TTS Handler initialized")
         logger.info(f"   Handler instance: {id(self)}")
@@ -93,12 +104,15 @@ class FastRTCTTSHandler(AsyncStreamHandler):
         self._current_audio_chunk = None
         self._chunk_position = 0
         self._buffer_warmed = False
+        # Pre-warm: send ~500ms of silence to establish browser audio context
+        # This reduces perceived latency when real audio arrives
+        self._prewarm_chunks_remaining = 25  # 25 chunks * 20ms = 500ms
         
         # Register this instance
         FastRTCTTSHandler.active_instances.add(self)
         
         logger.info("=" * 70)
-        logger.info("🚀 FastRTC TTS stream started")
+        logger.info("🚀 FastRTC TTS stream started (with audio pre-warming)")
         logger.info(f"   Handler instance: {id(self)} | Session: {self.session_id}")
         logger.info(f"   Active instances: {len(FastRTCTTSHandler.active_instances)}")
         logger.info(
@@ -136,6 +150,17 @@ class FastRTCTTSHandler(AsyncStreamHandler):
         """
         silence_chunk = np.zeros(self._chunk_size_samples, dtype=np.int16)
         sleep_interval = self._chunk_duration_ms / 1000.0
+        
+        # Pre-warm phase: Send silent audio to establish browser audio context
+        # This reduces perceived latency when real TTS audio arrives
+        if self._prewarm_chunks_remaining > 0:
+            self._prewarm_chunks_remaining -= 1
+            if self._prewarm_chunks_remaining == 24:  # First chunk
+                logger.info("🔊 Pre-warming audio context (sending 500ms silence)...")
+            elif self._prewarm_chunks_remaining == 0:
+                logger.info("✅ Audio context pre-warmed - ready for TTS")
+            # No sleep during prewarm - send chunks as fast as possible
+            return (self._sample_rate, silence_chunk)
         
         if self._audio_output_queue.empty() and self._current_audio_chunk is None:
             await asyncio.sleep(sleep_interval)
@@ -192,6 +217,16 @@ class FastRTCTTSHandler(AsyncStreamHandler):
                 # Ensure int16
                 if chunk.dtype != np.int16:
                     chunk = chunk.astype(np.int16)
+                
+                # Track first emit for latency metrics
+                self._total_chunks_emitted += 1
+                if self._first_chunk_emitted_at == 0.0:
+                    self._first_chunk_emitted_at = time.time()
+                    latency_ms = (self._first_chunk_emitted_at - self._first_chunk_received_at) * 1000
+                    logger.info(
+                        f"🔊 First audio chunk emitted! "
+                        f"Latency: {latency_ms:.1f}ms (receive→emit)"
+                    )
 
                 return (sample_rate, chunk)
             else:
@@ -211,24 +246,27 @@ class FastRTCTTSHandler(AsyncStreamHandler):
             sample_rate: Sample rate of audio
         """
         try:
+            now = time.time()
+            
+            # Track first chunk for latency metrics
+            if self._first_chunk_received_at == 0.0:
+                self._first_chunk_received_at = now
+                logger.info(f"📥 First audio chunk received at {now:.3f}")
+            
             # Convert bytes to numpy array (int16)
             audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
             
             # Track when this audio chunk will finish playing
             duration_s = len(audio_bytes) / (sample_rate * 2)  # int16 = 2 bytes/sample
-            self._playback_end_time = time.time() + duration_s
+            self._playback_end_time = now + duration_s
             
             # Add to queue as int16 (do not convert to float32)
             await self._audio_output_queue.put((audio_int16, sample_rate))
             
             queue_size = self._audio_output_queue.qsize()
-            logger.debug(
-                "Added audio chunk to FastRTC queue: %s samples @ %sHz (int16), "
-                "playback ends at %.2f, queue_size=%s",
-                len(audio_int16),
-                sample_rate,
-                self._playback_end_time,
-                queue_size
+            logger.info(
+                f"📥 Audio chunk queued: {len(audio_int16)} samples, "
+                f"{duration_s*1000:.0f}ms duration, queue_size={queue_size}"
             )
         except Exception as e:
             logger.error(f"Error adding audio chunk: {e}")
@@ -289,6 +327,9 @@ class FastRTCTTSHandler(AsyncStreamHandler):
         logger.info("🛑 FastRTC TTS stream shutting down...")
         logger.info(f"   Handler instance: {id(self)} | Started: {self._started}")
         
+        # Publish disconnect event to Redis for orchestrator
+        await self._publish_disconnect_event()
+        
         # Deregister this instance
         if self in FastRTCTTSHandler.active_instances:
             FastRTCTTSHandler.active_instances.remove(self)
@@ -309,6 +350,26 @@ class FastRTCTTSHandler(AsyncStreamHandler):
                 break
         
         logger.info("✅ FastRTC TTS stream closed")
+    
+    async def _publish_disconnect_event(self):
+        """Publish FastRTC disconnect event to Redis for orchestrator coordination."""
+        if not self.redis_client:
+            logger.warning("⚠️ Redis client unavailable - cannot publish TTS disconnect event")
+            return
+
+        payload = json.dumps({
+            "session_id": self.session_id,
+            "timestamp": time.time(),
+            "event": "tts_disconnected",
+            "source": "tts_streaming_fastrtc"
+        })
+        channel = "leibniz:events:tts:disconnected"
+
+        try:
+            await self.redis_client.publish(channel, payload)
+            logger.info(f"📡 Published TTS disconnect event → {channel}")
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to publish TTS disconnect event: {exc}")
 
     async def _publish_connection_event(self):
         """Publish FastRTC connection event to Redis for orchestrator coordination."""

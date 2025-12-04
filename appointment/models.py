@@ -254,3 +254,10 @@ class AdminClearSessionsResponse(BaseModel):
     """Response model for clearing sessions"""
     sessions_deleted: int = Field(..., description="Number of sessions deleted")
     message: str = Field(..., description="Operation result message")
+
+
+class CurrentPromptResponse(BaseModel):
+    """Response model for current prompt endpoint"""
+    session_id: str = Field(..., description="Session identifier")
+    state: str = Field(..., description="Current FSM state")
+    prompt: str = Field(..., description="Current prompt to speak")
