@@ -31,6 +31,7 @@ graph TD
 | **STT/VAD** | `8001` (API)<br>`7860` (UI) | Real-time Speech-to-Text and Voice Activity Detection. Provides a FastRTC/Gradio UI for browser interaction. | Gemini Live API, FastRTC, Silero VAD |
 | **Intent** | `8002` | Three-layer intent classification:<br>1. **Regex (L1)**: Fast pattern matching (<5ms)<br>2. **SLM (L2)**: DistilBERT semantic matching (~50ms)<br>3. **LLM (L3)**: Gemini fallback for complex queries | Spacy, Transformers (DistilBERT), Gemini 2.5 |
 | **RAG** | `8003` | Retrieval-Augmented Generation. Indexes knowledge base and answers queries using semantic search. | FAISS, Sentence-Transformers, Gemini 2.0 |
+| **XTTS-v2 (TTS)** | `8005` (container)<br>`8015` (host) | Native Coqui XTTS-v2 CUDA streaming that mirrors the legacy `/api/v1/stream` schema for low-latency audio. | PyTorch 2.3 CUDA 12.1, Coqui TTS, FastAPI, FastRTC |
 | **Redis** | `6379` | Shared state management, caching, and potentially message brokering. | Redis 7 |
 
 ---
@@ -60,6 +61,7 @@ This script performs the following:
 *   Builds `leibniz-stt-vad:latest`
 *   Builds `leibniz-intent:latest` (including the local DistilBERT model)
 *   Builds `leibniz-rag:latest` (including pre-building the FAISS index)
+*   Builds `leibniz-tts-xtts-v2:latest` (CUDA runtime with the native XTTS streaming service)
 
 ### 2. Configuration
 
@@ -91,6 +93,43 @@ docker-compose logs -f
 To view logs for a specific service (e.g., Intent):
 ```bash
 docker-compose logs -f intent-service
+```
+
+### XTTS Hot-Reload Profile
+For day-to-day TTS development you can skip full rebuilds:
+
+```bash
+cd services
+docker compose --profile dev up -d tts-xtts-v2-dev
+```
+
+The `tts-xtts-v2-dev` service reuses the prebuilt `base-deps` stage and bind-mounts `./tts_xtts_v2` + `./shared`, so Python edits are immediately reflected without reinstalling the heavy Coqui stack. Rebuild the full `tts-xtts-v2-service` image only when dependencies change or you need an immutable artifact.
+
+### XTTS-v2 Service with Compose
+
+The XTTS stack now ships inside `services/docker-compose.yml` as `tts-xtts-v2-service`. Key notes:
+
+1. **GPU access**: ensure the host has the NVIDIA Container Toolkit installed. The compose service advertises GPU requirements via `device_cgroup_rules` + `deploy.reservations`. When using Docker Compose V2, simply run `docker compose up tts-xtts-v2-service` on a host with GPUs exposed (or set `DOCKER_DEFAULT_RUNTIME=nvidia`).
+2. **Model + cache mounts**:
+  - Set `XTTS_MODEL_HOST_DIR` (defaults to `/opt/xtts/models`) to point at your XTTS checkpoint directory.
+  - The default speaker wav mounts from `./ElevenLabs_enigma.wav`; override with `LEIBNIZ_XTTS_SPEAKER_WAV` if needed.
+  - Audio cache persists through the named volume `tts_xtts_cache`.
+3. **Port mapping**: Host port `8015` maps to container `8005`. Override with `TTS_XTTS_HOST_PORT`.
+4. **Orchestrator switch**: By default the orchestrator now points to `http://tts-xtts-v2-service:8005` (configurable via `TTS_SERVICE_URL`). Leave the legacy `tts-streaming-service-new` running for rollback; flip between the two by exporting `TTS_SERVICE_URL` before `docker compose up`.
+
+Bring the GPU service up on its own for quick validation:
+
+```bash
+cd services
+docker compose up -d tts-xtts-v2-service
+curl http://localhost:8015/health
+```
+
+Then start (or restart) the orchestrator so it connects to XTTS:
+
+```bash
+export TTS_SERVICE_URL=http://tts-xtts-v2-service:8005  # optional override
+docker compose up -d orchestrator
 ```
 
 ---
@@ -144,6 +183,9 @@ docker-compose logs -f intent-service
 *   **"Connection refused"**: Ensure the `redis` container is healthy (`docker ps`).
 *   **"Model not found"**: Re-run the build script to ensure local models are copied into the images.
 *   **Permissions**: If you get Docker permission errors, ensure your user is in the `docker` group or use `sudo`.
+
+
+
 
 
 

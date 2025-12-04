@@ -1,0 +1,12 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+aiohttp>=3.8.0
+httpx>=0.26.0
+numpy>=1.24.0
+soundfile>=0.12.0
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+fastrtc>=0.0.34
+gradio>=4.0.0
+redis>=5.0.0
+
