@@ -3,10 +3,16 @@ LemonFox TTS Provider
 
 Hardcoded LemonFox API client with emotion-to-speed mapping.
 Simplified from services/tts/providers/lemonfox.py and leibniz_tts.py.
+
+Optimizations:
+- Connection pooling with persistent session
+- Reduced timeout (10s instead of 30s)
+- TCP connector with keepalive
 """
 
 import asyncio
 import logging
+import time
 import unicodedata
 from typing import Optional, Tuple
 
@@ -26,11 +32,16 @@ class LemonFoxProvider:
     Features:
     - Hardcoded API endpoint: https://api.lemonfox.ai/v1/audio/speech
     - Emotion-to-speed mapping
-    - Async aiohttp client
+    - Async aiohttp client with connection pooling
     - WAV output format (24kHz mono)
+    - Optimized for low latency
     """
     
     API_ENDPOINT = "https://api.lemonfox.ai/v1/audio/speech"  # Hardcoded
+    
+    # Shared session for connection pooling across instances
+    _shared_session: Optional[aiohttp.ClientSession] = None
+    _shared_connector: Optional[aiohttp.TCPConnector] = None
     
     def __init__(self, api_key: str, voice: str = "sarah", language: str = "en-us"):
         """
@@ -60,14 +71,36 @@ class LemonFoxProvider:
         self.language = language
         self.session: Optional[aiohttp.ClientSession] = None
         
+        # Metrics for latency tracking
+        self._request_count = 0
+        self._total_latency_ms = 0.0
+        
         logger.info(
             f"LemonFox TTS initialized (voice: {voice}, language: {language})"
         )
     
     async def _ensure_session(self):
-        """Create aiohttp session if not exists"""
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+        """Create aiohttp session with connection pooling if not exists"""
+        # Use shared session for connection reuse across requests
+        if LemonFoxProvider._shared_session is None or LemonFoxProvider._shared_session.closed:
+            # Create TCP connector with connection pooling
+            LemonFoxProvider._shared_connector = aiohttp.TCPConnector(
+                limit=10,  # Max 10 concurrent connections
+                limit_per_host=5,  # Max 5 connections per host
+                keepalive_timeout=30,  # Keep connections alive for 30s
+                enable_cleanup_closed=True
+            )
+            LemonFoxProvider._shared_session = aiohttp.ClientSession(
+                connector=LemonFoxProvider._shared_connector,
+                timeout=aiohttp.ClientTimeout(
+                    total=10,  # Reduced from 30s to 10s
+                    connect=3,  # 3s connection timeout
+                    sock_read=8  # 8s read timeout
+                )
+            )
+            logger.info("LemonFox: Created shared session with connection pooling")
+        
+        self.session = LemonFoxProvider._shared_session
     
     async def synthesize(
         self,
@@ -117,12 +150,14 @@ class LemonFoxProvider:
             f"language={payload['language']}, speed={speed:.2f}"
         )
         
+        start_time = time.time()
+        
         try:
             async with self.session.post(
                 self.API_ENDPOINT,
                 json=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
+                headers=headers
+                # Timeout already set on session (10s total)
             ) as response:
                 
                 if response.status != 200:
@@ -133,15 +168,22 @@ class LemonFoxProvider:
                 
                 wav_audio = await response.read()
                 
-                logger.debug(
-                    f"LemonFox TTS synthesized {len(text)} chars → "
-                    f"{len(wav_audio)} bytes ({len(wav_audio)/1024:.1f} KB)"
+                # Track latency metrics
+                latency_ms = (time.time() - start_time) * 1000
+                self._request_count += 1
+                self._total_latency_ms += latency_ms
+                avg_latency = self._total_latency_ms / self._request_count
+                
+                logger.info(
+                    f"🔊 LemonFox TTS: {len(text)} chars → "
+                    f"{len(wav_audio)/1024:.1f} KB in {latency_ms:.0f}ms "
+                    f"(avg: {avg_latency:.0f}ms)"
                 )
                 
                 return wav_audio
                 
         except asyncio.TimeoutError:
-            logger.error("LemonFox API timeout (30s)")
+            logger.error("LemonFox API timeout (10s)")
             raise
         except aiohttp.ClientError as e:
             logger.error(f"LemonFox API error: {e}")
@@ -213,10 +255,19 @@ class LemonFoxProvider:
         return text
     
     async def close(self):
-        """Close aiohttp session"""
-        if self.session and not self.session.closed:
-            await self.session.close()
-            logger.debug("LemonFox session closed")
+        """Close aiohttp session (only closes if no other instances are using it)"""
+        # Don't close shared session - it's reused across requests
+        # Only log that we're done with this instance
+        logger.debug(f"LemonFox instance closed (requests: {self._request_count})")
+    
+    @classmethod
+    async def close_shared_session(cls):
+        """Close the shared session - call this on application shutdown"""
+        if cls._shared_session and not cls._shared_session.closed:
+            await cls._shared_session.close()
+            cls._shared_session = None
+            cls._shared_connector = None
+            logger.info("LemonFox: Shared session closed")
     
     def validate_config(self) -> Tuple[bool, Optional[str]]:
         """

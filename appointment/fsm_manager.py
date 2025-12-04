@@ -957,3 +957,78 @@ class AppointmentFSMManager:
         self.last_error = None
         if self.config.log_state_transitions:
             logger.info(" AppointmentFSMManager reset")
+
+    def get_current_prompt(self) -> str:
+        """
+        Get the current prompt to speak based on FSM state.
+        
+        Useful for resuming after a RAG detour or other interruptions.
+        
+        Returns:
+            The prompt that should be spoken for the current state.
+        """
+        if self.state == AppointmentState.INIT:
+            return "Let's continue with your appointment booking. What's your full name?"
+        
+        elif self.state == AppointmentState.COLLECT_NAME:
+            return "What's your full name?"
+        
+        elif self.state == AppointmentState.CONFIRM_NAME:
+            spelled_name = spell_out_name(self.data.name) if self.data.name else "your name"
+            return f"So your name is {spelled_name}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_EMAIL:
+            return "What's your email address?"
+        
+        elif self.state == AppointmentState.CONFIRM_EMAIL:
+            return f"So your email is {self.data.email}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_PHONE:
+            return "What's your phone number? Include the country code if calling from outside Germany."
+        
+        elif self.state == AppointmentState.CONFIRM_PHONE:
+            formatted_phone = format_phone_for_readback(self.data.phone) if self.data.phone else "your phone number"
+            return f"So your phone number is {formatted_phone}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_DEPARTMENT:
+            dept_list = ", ".join(DEPARTMENTS.values())
+            return f"Which department would you like to meet with? Options include: {dept_list}"
+        
+        elif self.state == AppointmentState.CONFIRM_DEPARTMENT:
+            dept_name = DEPARTMENTS.get(self.data.department, self.data.department)
+            return f"So you want to meet with {dept_name}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_APPOINTMENT_TYPE:
+            if self.data.department and self.data.department in APPOINTMENT_TYPES:
+                types = APPOINTMENT_TYPES[self.data.department]
+                types_list = ", ".join(types[:3])  # Show first 3
+                return f"What type of appointment do you need? Options include: {types_list}"
+            return "What type of appointment do you need?"
+        
+        elif self.state == AppointmentState.CONFIRM_APPOINTMENT_TYPE:
+            return f"So you need {self.data.appointment_type}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_DATETIME:
+            return "When would you like to schedule this appointment? You can say something like 'next Tuesday at 2pm'."
+        
+        elif self.state == AppointmentState.CONFIRM_DATETIME:
+            return f"So the appointment is for {self.data.preferred_datetime}, am I right?"
+        
+        elif self.state == AppointmentState.COLLECT_PURPOSE:
+            return "What's the main reason for this appointment? Just a brief description is fine."
+        
+        elif self.state == AppointmentState.CONFIRM_PURPOSE:
+            purpose_preview = self.data.purpose[:50] + "..." if self.data.purpose and len(self.data.purpose) > 50 else self.data.purpose
+            return f"So the reason is '{purpose_preview}', am I right?"
+        
+        elif self.state == AppointmentState.CONFIRM:
+            return "Does everything look correct? Say 'yes' to confirm or 'no' to make changes."
+        
+        elif self.state == AppointmentState.COMPLETE:
+            return "Your appointment is already booked!"
+        
+        elif self.state == AppointmentState.CANCELLED:
+            return "The booking was cancelled. Would you like to start over?"
+        
+        else:
+            return "Let's continue with your appointment booking."

@@ -7,16 +7,19 @@ True parallel synthesis pipeline:
 - Ultra-fast first sentence playback
 
 Reference: Designed for human-like TTS streaming with minimal latency.
+
+Optimizations:
+- Direct memory streaming (no temp file I/O)
+- Increased prefetch count for longer texts
+- Detailed synthesis timing logs
 """
 
 import asyncio
 import hashlib
+import io
 import logging
-import tempfile
 import time
-from collections import deque
 from typing import Optional, Dict, Any, Callable, Awaitable, List
-from pathlib import Path
 
 import soundfile as sf
 import numpy as np
@@ -45,8 +48,8 @@ class TTSStreamingQueue:
     This gives ultra-fast first-sentence playback and zero-gap between sentences.
     """
     
-    # Number of sentences to pre-synthesize in parallel
-    PREFETCH_COUNT = 3
+    # Number of sentences to pre-synthesize in parallel (increased for longer texts)
+    PREFETCH_COUNT = 5
     
     def __init__(
         self,
@@ -136,7 +139,11 @@ class TTSStreamingQueue:
         language: Optional[str],
         index: int
     ):
-        """Synthesize a sentence and store the result."""
+        """
+        Synthesize a sentence and store the result in memory.
+        
+        Optimized: No temp file I/O - audio bytes stay in memory.
+        """
         start_time = time.time()
         
         try:
@@ -152,57 +159,74 @@ class TTSStreamingQueue:
                 )
             
             if cached_path:
-                logger.debug(f"✅ Cache HIT for sentence {index+1}")
+                logger.info(f"✅ Cache HIT for sentence {index+1}: '{sentence[:30]}...'")
                 self.cache_hits += 1
+                
+                # Load cached audio into memory
+                audio_data, sample_rate = await asyncio.to_thread(sf.read, cached_path)
+                
+                # Convert to int16 bytes
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
+                if audio_data.dtype != np.int16:
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                
                 result = {
-                    'audio_path': cached_path,
+                    'audio_bytes': audio_data.tobytes(),
+                    'sample_rate': sample_rate,
                     'cached': True,
                     'sentence': sentence,
                     'index': index,
                     'emotion': emotion
                 }
             else:
-                logger.debug(f"🔄 Synthesizing sentence {index+1}: '{sentence[:30]}...'")
+                logger.info(f"🔄 Synthesizing sentence {index+1}: '{sentence[:30]}...'")
                 self.cache_misses += 1
                 
-                # Synthesize with LemonFox
-                audio_bytes = await self.provider.synthesize(
+                synth_start = time.time()
+                
+                # Synthesize with LemonFox - returns WAV bytes directly
+                wav_bytes = await self.provider.synthesize(
                     text=sentence,
                     voice=voice,
                     language=language,
                     emotion=emotion
                 )
                 
-                # Save to temp file
-                temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-                temp_path = temp_file.name
-                temp_file.write(audio_bytes)
-                temp_file.close()
+                synth_time = (time.time() - synth_start) * 1000
+                logger.info(f"📡 LemonFox API returned {len(wav_bytes)/1024:.1f}KB in {synth_time:.0f}ms")
                 
-                # Cache if enabled
-                final_path = temp_path
+                # Parse WAV from memory (no temp file!)
+                parse_start = time.time()
+                wav_buffer = io.BytesIO(wav_bytes)
+                audio_data, sample_rate = sf.read(wav_buffer)
+                parse_time = (time.time() - parse_start) * 1000
+                
+                # Convert to int16 bytes
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
+                if audio_data.dtype != np.int16:
+                    audio_data = np.clip(audio_data, -1.0, 1.0)
+                    audio_data = (audio_data * 32767).astype(np.int16)
+                
+                audio_bytes_final = audio_data.tobytes()
+                
+                # Cache in background (non-blocking) if enabled
                 if self.cache:
-                    try:
-                        cached_path = self.cache.cache_audio(
-                            sentence,
-                            voice or self.provider.voice,
-                            language or self.provider.language,
-                            "lemonfox",
-                            emotion,
-                            temp_path
-                        )
-                        import os
-                        os.unlink(temp_path)
-                        final_path = cached_path
-                    except Exception as cache_error:
-                        logger.warning(f"Cache error: {cache_error}")
+                    asyncio.create_task(self._cache_audio_async(
+                        sentence, voice, language, emotion, wav_bytes
+                    ))
                 
                 result = {
-                    'audio_path': final_path,
+                    'audio_bytes': audio_bytes_final,
+                    'sample_rate': sample_rate,
                     'cached': False,
                     'sentence': sentence,
                     'index': index,
-                    'emotion': emotion
+                    'emotion': emotion,
+                    'api_time_ms': synth_time,
+                    'parse_time_ms': parse_time
                 }
             
             synthesis_time = (time.time() - start_time) * 1000
@@ -210,7 +234,15 @@ class TTSStreamingQueue:
             self.sentences_synthesized += 1
             
             result['synthesis_time_ms'] = synthesis_time
-            logger.info(f"✅ Sentence {index+1} ready in {synthesis_time:.0f}ms (cached={result['cached']})")
+            
+            # Calculate audio duration
+            audio_duration_ms = len(result['audio_bytes']) / (result['sample_rate'] * 2) * 1000
+            result['duration_ms'] = audio_duration_ms
+            
+            logger.info(
+                f"✅ Sentence {index+1} ready: {synthesis_time:.0f}ms total, "
+                f"{audio_duration_ms:.0f}ms audio (cached={result['cached']})"
+            )
             
             # Store result
             self.synthesis_results[sentence_hash] = result
@@ -219,10 +251,42 @@ class TTSStreamingQueue:
             await self.audio_ready_queue.put(sentence_hash)
             
         except Exception as e:
-            logger.error(f"❌ Synthesis error for sentence {index+1}: {e}")
+            logger.error(f"❌ Synthesis error for sentence {index+1}: {e}", exc_info=True)
             self.sentences_failed += 1
             self.synthesis_results[sentence_hash] = {'error': str(e), 'index': index}
             await self.audio_ready_queue.put(sentence_hash)
+    
+    async def _cache_audio_async(
+        self,
+        sentence: str,
+        voice: Optional[str],
+        language: Optional[str],
+        emotion: str,
+        wav_bytes: bytes
+    ):
+        """Cache audio in background without blocking playback."""
+        try:
+            import tempfile
+            import os
+            
+            # Write to temp file for caching
+            temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+            temp_path = temp_file.name
+            temp_file.write(wav_bytes)
+            temp_file.close()
+            
+            self.cache.cache_audio(
+                sentence,
+                voice or self.provider.voice,
+                language or self.provider.language,
+                "lemonfox",
+                emotion,
+                temp_path
+            )
+            os.unlink(temp_path)
+            logger.debug(f"📦 Cached audio for: '{sentence[:20]}...'")
+        except Exception as e:
+            logger.warning(f"Background cache error: {e}")
     
     async def _prefetch_worker(self):
         """
@@ -300,25 +364,20 @@ class TTSStreamingQueue:
                     logger.warning(f"⚠️ Skipping failed sentence {result.get('index', '?')}")
                     continue
                 
-                # Load and play audio
+                # Play audio directly from memory (no file I/O!)
                 try:
                     play_start = time.time()
                     
-                    audio_path = result.get('audio_path')
-                    if not audio_path:
+                    # Get pre-processed audio bytes from memory
+                    audio_bytes = result.get('audio_bytes')
+                    sample_rate = result.get('sample_rate', 24000)
+                    
+                    if not audio_bytes:
+                        logger.warning(f"⚠️ No audio bytes for sentence {result.get('index', '?')}")
                         continue
                     
-                    # Load audio
-                    audio_data, sample_rate = await asyncio.to_thread(sf.read, audio_path)
-                    
-                    # Ensure mono
-                    if audio_data.ndim > 1:
-                        audio_data = audio_data.mean(axis=1)
-                    
-                    # Convert to int16
-                    if audio_data.dtype != np.int16:
-                        audio_data = np.clip(audio_data, -1.0, 1.0)
-                        audio_data = (audio_data * 32767).astype(np.int16)
+                    # Convert back to numpy for gap addition
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
                     
                     # Add natural pause between sentences (configurable, default 100ms)
                     gap_ms = getattr(self.config, "inter_sentence_gap_ms", 100)
@@ -328,10 +387,10 @@ class TTSStreamingQueue:
                             silence = np.zeros(pause_samples, dtype=np.int16)
                             audio_data = np.concatenate((audio_data, silence))
                     
-                    audio_bytes = audio_data.tobytes()
+                    audio_bytes_final = audio_data.tobytes()
                     
                     # Calculate duration
-                    duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
+                    duration_ms = len(audio_bytes_final) / (sample_rate * 2) * 1000
                     
                     # Send audio via callback
                     if self.audio_callback:
@@ -341,13 +400,19 @@ class TTSStreamingQueue:
                             'emotion': result.get('emotion', 'helpful'),
                             'cached': result.get('cached', False),
                             'duration_ms': duration_ms,
-                            'synthesis_time_ms': result.get('synthesis_time_ms', 0)
+                            'synthesis_time_ms': result.get('synthesis_time_ms', 0),
+                            'api_time_ms': result.get('api_time_ms', 0),
+                            'parse_time_ms': result.get('parse_time_ms', 0)
                         }
                         
-                        logger.info(f"🔊 Playing sentence {result.get('index', 0)+1}: '{result.get('sentence', '')[:40]}...' ({duration_ms:.0f}ms)")
+                        logger.info(
+                            f"🔊 Playing sentence {result.get('index', 0)+1}: "
+                            f"'{result.get('sentence', '')[:40]}...' "
+                            f"({duration_ms:.0f}ms, synth={result.get('synthesis_time_ms', 0):.0f}ms)"
+                        )
                         
                         # Send audio - this streams to the client
-                        await self.audio_callback(audio_bytes, sample_rate, metadata)
+                        await self.audio_callback(audio_bytes_final, sample_rate, metadata)
                     
                     play_time = (time.time() - play_start) * 1000
                     self.total_play_time_ms += play_time
@@ -356,10 +421,13 @@ class TTSStreamingQueue:
                     total_duration_ms += duration_ms
                     self.sentences_played += 1
                     
-                    logger.debug(f"✅ Sentence {result.get('index', 0)+1} played ({duration_ms:.0f}ms audio, {play_time:.0f}ms processing)")
+                    logger.debug(
+                        f"✅ Sentence {result.get('index', 0)+1} sent to client "
+                        f"({duration_ms:.0f}ms audio, {play_time:.0f}ms processing)"
+                    )
                     
                 except Exception as e:
-                    logger.error(f"❌ Playback error: {e}")
+                    logger.error(f"❌ Playback error: {e}", exc_info=True)
                     self.sentences_failed += 1
             
             self.stream_complete.set()

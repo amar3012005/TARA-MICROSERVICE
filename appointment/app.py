@@ -26,7 +26,7 @@ from leibniz_agent.services.appointment.models import (
     SessionCreateRequest, SessionCreateResponse,
     ProcessInputRequest, ProcessInputResponse,
     SessionStatusResponse, HealthResponse, MetricsResponse,
-    AdminClearSessionsResponse
+    AdminClearSessionsResponse, CurrentPromptResponse
 )
 from leibniz_agent.services.appointment.fsm_manager import AppointmentFSMManager
 
@@ -298,6 +298,52 @@ async def get_session_status(session_id: str):
     )
 
 
+@app.get("/api/v1/session/{session_id}/current_prompt", response_model=CurrentPromptResponse)
+async def get_current_prompt(session_id: str):
+    """
+    Get the current prompt for a session.
+    
+    Useful for resuming after a RAG detour or other interruptions.
+    Returns the prompt that should be spoken for the current FSM state.
+    """
+    if not config:
+        raise HTTPException(status_code=503, detail="Service not configured")
+    
+    # Retrieve session from Redis
+    session_key = f"{SESSION_PREFIX}{session_id}"
+    session_data = None
+    
+    if redis_client:
+        try:
+            session_data_str = await redis_client.get(session_key)
+            if session_data_str:
+                session_data = json.loads(session_data_str)
+            else:
+                raise HTTPException(status_code=404, detail="Session not found or expired")
+        except Exception as e:
+            logger.error(f" Failed to retrieve session {session_id}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to retrieve session")
+    
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    
+    # Deserialize FSM
+    try:
+        fsm = AppointmentFSMManager.from_dict(session_data, config)
+    except Exception as e:
+        logger.error(f" Failed to deserialize session {session_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load session")
+    
+    # Get current prompt
+    prompt = fsm.get_current_prompt()
+    
+    return CurrentPromptResponse(
+        session_id=session_id,
+        state=fsm.state.value,
+        prompt=prompt
+    )
+
+
 @app.delete("/api/v1/session/{session_id}")
 async def delete_session(session_id: str):
     """
@@ -474,6 +520,7 @@ async def root():
             "create_session": "POST /api/v1/session/create",
             "process_input": "POST /api/v1/session/{session_id}/process",
             "get_status": "GET /api/v1/session/{session_id}/status",
+            "get_current_prompt": "GET /api/v1/session/{session_id}/current_prompt",
             "delete_session": "DELETE /api/v1/session/{session_id}",
             "health": "GET /health",
             "metrics": "GET /metrics",
