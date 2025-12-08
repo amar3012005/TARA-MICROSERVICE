@@ -2,6 +2,7 @@
 RAG Service Configuration
 
 Extracted from leibniz_rag.py for microservice deployment.
+Supports TARA mode for Telugu TASK organization customer service.
 
 Reference:
     - leibniz_rag.py (lines 65-160) - Original configuration logic
@@ -15,6 +16,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Supported languages for TARA mode
+SUPPORTED_LANGUAGES = {
+    "en": "English",
+    "te": "Telugu (pure)",
+    "te-mixed": "Telugu mixed with English (Tenglish)",
+    "hi": "Hindi",
+    "hi-mixed": "Hindi mixed with English (Hinglish)"
+}
 
 
 @dataclass
@@ -53,7 +63,7 @@ class RAGConfig:
     embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     # Gemini settings
-    gemini_model: str = "gemini-2.0-flash-lite"
+    gemini_model: str = "models/gemini-2.5-flash-lite"
     
     # Retrieval settings
     top_k: int = 8
@@ -76,8 +86,24 @@ class RAGConfig:
     # Cache settings
     cache_ttl: int = 3600
     
+    # Prewarming settings
+    enable_prewarming: bool = field(default_factory=lambda: os.getenv("ENABLE_PREWARMING", "true").lower() == "true")
+    warmup_queries_count: int = field(default_factory=lambda: int(os.getenv("WARMUP_QUERIES_COUNT", "10")))
+    enable_model_persistence: bool = field(default_factory=lambda: os.getenv("ENABLE_MODEL_PERSISTENCE", "true").lower() == "true")
+    prepopulate_cache: bool = field(default_factory=lambda: os.getenv("PREPOPULATE_CACHE", "true").lower() == "true")
+
+    # Performance tuning
+    gemini_timeout_ms: int = field(default_factory=lambda: int(os.getenv("GEMINI_TIMEOUT_MS", "5000")))
+    embedding_batch_size: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_BATCH_SIZE", "32")))
+    
     # Hybrid search settings
     enable_hybrid_search: bool = True
+    
+    # TARA Mode Configuration (Telugu TASK Customer Service)
+    tara_mode: bool = True  # Default: TARA enabled for TASK
+    response_language: str = "te-mixed"  # Default: Telugu mixed with English
+    organization_name: str = "T.A.S.K"  # Default: Telangana Academy for Skill and Knowledge
+    agent_name: str = "TARA"  # Default: TARA agent (T.A.S.K AI Response Assistant)
     
     # Logging
     log_queries: bool = False
@@ -132,6 +158,22 @@ class RAGConfig:
                 "️ GEMINI_API_KEY not set. Response generation will fail."
             )
         
+        # Validate response language
+        if self.response_language not in SUPPORTED_LANGUAGES:
+            logger.warning(
+                f"⚠️ Unsupported response_language '{self.response_language}'. "
+                f"Supported: {list(SUPPORTED_LANGUAGES.keys())}"
+            )
+        
+        # Log TARA mode configuration
+        if self.tara_mode:
+            logger.info("=" * 70)
+            logger.info("🇮🇳 TARA MODE ENABLED - RAG Service")
+            logger.info(f"   Agent: {self.agent_name}")
+            logger.info(f"   Organization: {self.organization_name}")
+            logger.info(f"   Language: {self.response_language} ({SUPPORTED_LANGUAGES.get(self.response_language, 'Unknown')})")
+            logger.info("=" * 70)
+        
         # Log configuration if verbose
         if self.verbose:
             logger.info(
@@ -181,22 +223,22 @@ class RAGConfig:
             # Required settings
             gemini_api_key=gemini_api_key,
             knowledge_base_path=os.getenv(
-                "LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH",
-                "leibniz_knowledge_base"
+                "TARA_RAG_KNOWLEDGE_BASE_PATH",
+                os.getenv("LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH", "/app/task_knowledge_base")
             ),
             
             # Vector store settings
             vector_store_path=os.getenv(
-                "LEIBNIZ_RAG_VECTOR_STORE_PATH",
-                "/app/index"
+                "TARA_RAG_VECTOR_STORE_PATH",
+                os.getenv("LEIBNIZ_RAG_VECTOR_STORE_PATH", "/app/index")
             ),
             embedding_model_name=os.getenv(
-                "LEIBNIZ_RAG_EMBEDDING_MODEL",
-                "sentence-transformers/all-MiniLM-L6-v2"
+                "TARA_RAG_EMBEDDING_MODEL",
+                os.getenv("LEIBNIZ_RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
             ),
             
             # Gemini settings
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite"),
+            gemini_model=os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash-lite"),
             
             # Retrieval settings
             top_k=int(os.getenv("LEIBNIZ_RAG_TOP_K", "8")),
@@ -221,6 +263,12 @@ class RAGConfig:
             
             # Hybrid search settings
             enable_hybrid_search=os.getenv("LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH", "true").lower() == "true",
+            
+            # TARA Mode Configuration (Telugu TASK Customer Service)
+            tara_mode=os.getenv("TARA_MODE", "true").lower() == "true",  # Default: TARA enabled
+            response_language=os.getenv("TARA_RAG_RESPONSE_LANGUAGE", os.getenv("LEIBNIZ_RAG_RESPONSE_LANGUAGE", "te-mixed")),  # Default: Telugu mixed
+            organization_name=os.getenv("TARA_RAG_ORGANIZATION", os.getenv("LEIBNIZ_RAG_ORGANIZATION", "TASK")),  # Default: TASK
+            agent_name=os.getenv("TARA_RAG_AGENT_NAME", os.getenv("LEIBNIZ_RAG_AGENT_NAME", "TARA")),  # Default: TARA
             
             # Logging
             log_queries=os.getenv("LOG_LEVEL", "INFO").upper() == "DEBUG",

@@ -1,9 +1,20 @@
+# TARA - Telugu TASK Customer Service Agent
+# Ports:
+#   5200 - Redis (Existing container uses this)
+#   5210 - Redis (New service fallback, changed to avoid conflict)
+#   5211 - STT-Sarvam API (Changed to avoid conflict)
+#   5212 - STT-Sarvam FastRTC (Changed to avoid conflict)
+#   5203 - RAG Service
+#   5204 - Orchestrator
+#   5205 - TTS Sarvam
+
 services:
+  # Step 1: Redis (Changed port to avoid conflict with existing tara-redis)
   redis-tara:
     image: redis:7-alpine
     container_name: tara-redis
     ports:
-      - "6382:6379"
+      - "5200:6379"
     volumes:
       - redis_tara_data:/data
     command: redis-server --appendonly yes
@@ -13,181 +24,143 @@ services:
       timeout: 3s
       retries: 5
     networks:
-      - leibniz-network
+      - tara-network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
 
-  stt-vad-service-tara:
-    build:
-      context: .
-      dockerfile: stt_vad/Dockerfile
-    container_name: tara-stt-vad-service
-    ports:
-      - "8020:8001"
-      - "7870:7860"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - STT_VAD_HOST=0.0.0.0
-      - STT_VAD_PORT=8001
-      - FAST_RTC_PORT=7860
-      - REDIS_HOST=redis-tara
-      - REDIS_PORT=6379
-      - LEIBNIZ_REDIS_HOST=redis-tara
-      - LEIBNIZ_REDIS_PORT=6379
-      - LEIBNIZ_REDIS_DB=0
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
-      - DOCKER_ENVIRONMENT=true
-    depends_on:
-      redis-tara:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    stdin_open: true
-    tty: true
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-
-  intent-service-tara:
-    build:
-      context: ..
-      dockerfile: services/intent/Dockerfile
-    container_name: tara-intent-service
-    ports:
-      - "8021:8002"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg}
-      - GEMINI_MODEL=gemini-2.5-flash-lite
-      - REDIS_URL=redis://redis-tara:6379
-      - INTENT_CACHE_TTL=1800
-    depends_on:
-      redis-tara:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
-
-  rag-service-tara:
-    build:
-      context: ..
-      dockerfile: services/rag/Dockerfile
-    container_name: tara-rag-service
-    ports:
-      - "8022:8003"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBiKXVYsQ0UcxRicctFI1U5dEpQct2ieOA}
-      - GEMINI_MODEL=gemini-2.0-flash-lite
-      - LEIBNIZ_REDIS_HOST=redis-tara
-      - LEIBNIZ_REDIS_PORT=6379
-      - LEIBNIZ_REDIS_DB=0
-      - LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH=/app/leibniz_knowledge_base
-      - LEIBNIZ_RAG_VECTOR_STORE_PATH=/app/index
-      - LEIBNIZ_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-      - LEIBNIZ_RAG_TOP_K=8
-      - LEIBNIZ_RAG_TOP_N=5
-      - LEIBNIZ_RAG_SIMILARITY_THRESHOLD=0.3
-      - LEIBNIZ_RAG_CACHE_TTL=3600
-      - LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH=true
-      - PORT=8003
-      - LOG_LEVEL=INFO
-    depends_on:
-      redis-tara:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-
+  # Step 2: Orchestrator (Master Controller)
   orchestrator-tara:
     build:
       context: .
       dockerfile: orchestrator/Dockerfile
-    container_name: tara-orchestrator-service
+    container_name: tara-orchestrator
     ports:
-      - "8023:8004"
+      - "5204:8004"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./docker-compose-tara.yml:/app/docker-compose-tara.yml:ro
     environment:
       - PYTHONUNBUFFERED=1
-      - REDIS_URL=redis://redis-tara:6379/0
-      - LEIBNIZ_REDIS_HOST=redis-tara
+      - REDIS_URL=redis://tara-redis:6379/0
+      - LEIBNIZ_REDIS_HOST=tara-redis
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
-      - INTENT_SERVICE_URL=http://intent-service-tara:8002
-      - RAG_SERVICE_URL=http://rag-service-tara:8003
-      - STT_SERVICE_URL=http://stt-vad-service-tara:8001
-      - TTS_SERVICE_URL=http://tts-streaming-service-tara:8005
-      - INTRO_GREETING=${INTRO_GREETING:-Hello! I'm your assistant at Leibniz University. How can I help you today?}
+      - INTENT_SERVICE_URL=http://localhost:8002
+      - RAG_SERVICE_URL=http://tara-rag:8003
+      - STT_SERVICE_URL=http://tara-stt-vad:8001
+      - TTS_SERVICE_URL=http://tara-tts-sarvam:8025
+      - TARA_MODE=true
+      - SKIP_INTENT_SERVICE=true
+      - SKIP_APPOINTMENT_SERVICE=true
+      - RESPONSE_LANGUAGE=te-mixed
+      - ORGANIZATION_NAME=TASK
+      - IGNORE_STT_WHILE_SPEAKING=true
+      - INTRO_GREETING=నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?
+      - AUTO_START_SERVICES=true
+      - DOCKER_COMPOSE_FILE=/app/docker-compose-tara.yml
+      - DOCKER_CONTEXT=desktop-linux
+      - STT_GRADIO_URL=http://localhost:5212
+      - TTS_GRADIO_URL=http://localhost:5205/fastrtc
       - LOG_LEVEL=INFO
       - SESSION_TTL_SECONDS=3600
       - MAX_CONCURRENT_SESSIONS=1000
     depends_on:
       redis-tara:
         condition: service_healthy
-      intent-service-tara:
-        condition: service_started
-      rag-service-tara:
-        condition: service_started
-      stt-vad-service-tara:
-        condition: service_started
-      tts-streaming-service-tara:
-        condition: service_started
     networks:
-      - leibniz-network
+      - tara-network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
 
-  tts-streaming-service-tara:
+  # Step 3: STT-VAD Service (Replaces STT-Sarvam)
+  stt-vad-service-tara:
     build:
       context: .
-      dockerfile: tts_streaming/Dockerfile
-    container_name: tara-tts-streaming-service
+      dockerfile: stt_vad/Dockerfile
+    container_name: tara-stt-vad
     ports:
-      - "8024:8005"
+      - "5202:8001"
+      - "5212:7860"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-6KtIDvYHZAlfKcBpjwqlb1g1XdUksVM2}
-      - LEIBNIZ_LEMONFOX_VOICE=${LEIBNIZ_LEMONFOX_VOICE:-sarah}
-      - LEIBNIZ_LEMONFOX_LANGUAGE=${LEIBNIZ_LEMONFOX_LANGUAGE:-en-us}
-      - TTS_STREAMING_PORT=8005
-      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
-      - LEIBNIZ_TTS_CACHE_ENABLED=true
-      - LEIBNIZ_TTS_CACHE_MAX_SIZE=500
-      - LEIBNIZ_TTS_SAMPLE_RATE=24000
-      - TTS_QUEUE_MAX_SIZE=10
+      - STT_VAD_HOST=0.0.0.0
+      - STT_VAD_PORT=8001
+      - FAST_RTC_PORT=7860
+      - REDIS_HOST=tara-redis
+      - REDIS_PORT=6379
+      - LEIBNIZ_REDIS_HOST=tara-redis
+      - LEIBNIZ_REDIS_PORT=6379
+      - LEIBNIZ_REDIS_DB=0
+      - DOCKER_ENVIRONMENT=true
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
     networks:
-      - leibniz-network
+      - tara-network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
+    stdin_open: true
+    tty: true
+
+  # Step 4: RAG Service
+  rag-service-tara:
+    build:
+      context: .
+      dockerfile: rag/Dockerfile.tara
+    container_name: tara-rag
+    ports:
+      - "5203:8003"
+    volumes:
+      - rag_tara_index:/app/index
+    environment:
+      - PYTHONUNBUFFERED=1
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBuwr-lH-KIPGa99plp7MZ1rFrRBmLHpps}
+      - GEMINI_MODEL=gemini-2.0-flash-lite
+      - LEIBNIZ_REDIS_HOST=tara-redis
+      - LEIBNIZ_REDIS_PORT=6379
+      - LEIBNIZ_REDIS_DB=0
+      - LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH=/app/leibniz_knowledge_base
+      - LEIBNIZ_RAG_VECTOR_STORE_PATH=/app/index
+      - TARA_MODE=true
+      - LEIBNIZ_RAG_RESPONSE_LANGUAGE=te-mixed
+      - LEIBNIZ_RAG_ORGANIZATION=TASK
+      - LEIBNIZ_RAG_AGENT_NAME=TARA
+      - PORT=8003
+      - LOG_LEVEL=INFO
+    depends_on:
+      redis-tara:
+        condition: service_healthy
+    networks:
+      - tara-network
+    restart: unless-stopped
+
+  # Step 5: TTS Sarvam Service
+  tts-sarvam-service-tara:
+    build:
+      context: .
+      dockerfile: tts_sarvam/Dockerfile
+    container_name: tara-tts-sarvam
+    ports:
+      - "5205:8025"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SARVAM_API_KEY=${SARVAM_API_KEY:-sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr}
+      - LEIBNIZ_SARVAM_SPEAKER=anushka
+      - LEIBNIZ_SARVAM_LANGUAGE=te-IN
+      - LEIBNIZ_SARVAM_MODEL=bulbul:v2
+      - TTS_STREAMING_PORT=8025
+      - LEIBNIZ_TTS_CACHE_ENABLED=true
+      - LEIBNIZ_TTS_SAMPLE_RATE=22050
+      - REDIS_HOST=tara-redis
+      - REDIS_PORT=6379
+      - LEIBNIZ_REDIS_HOST=tara-redis
+      - LEIBNIZ_REDIS_PORT=6379
+    networks:
+      - tara-network
+    restart: unless-stopped
 
 volumes:
   redis_tara_data:
+  rag_tara_index:
 
 networks:
-  leibniz-network:
-    name: services_leibniz-network
+  tara-network:
+    name: tara-network
     driver: bridge

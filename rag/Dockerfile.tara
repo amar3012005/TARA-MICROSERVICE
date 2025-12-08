@@ -1,0 +1,150 @@
+# ============================================================================
+# TARA RAG Service Dockerfile - Optimized for Layer Caching
+# ============================================================================
+# Heavy packages (torch, transformers, faiss) are installed in builder stage
+# and cached. Source code changes DON'T trigger reinstall.
+#
+# Build: docker build -t tara-rag -f rag/Dockerfile.tara .
+# ============================================================================
+
+# ============================================================================
+# Stage 1: BUILDER - Install ALL heavy packages (CACHED)
+# ============================================================================
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+# Install system build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    g++ \
+    make \
+    python3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# ========== CRITICAL: Copy ONLY requirements first for caching ==========
+# This layer is cached unless requirements.txt changes
+COPY rag/requirements.txt /build/requirements.txt
+
+# Install ALL heavy packages (torch, transformers, faiss, etc.)
+# This is the expensive step - gets cached after first build
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1000 --user -r requirements.txt && \
+    echo "✅ All heavy packages installed (cached for future builds)"
+
+# Verify key packages
+RUN python -c "import torch; import sentence_transformers; import faiss; print('✅ torch, transformers, faiss verified')"
+
+# ============================================================================
+# Stage 2: INDEXER - Build FAISS index from knowledge base
+# ============================================================================
+FROM python:3.11-slim AS indexer
+
+WORKDIR /app
+
+# Copy pre-installed packages from builder (CACHED)
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
+
+# Create package structure FIRST (small layer, fast)
+RUN mkdir -p /app/leibniz_agent/services && \
+    echo "" > /app/leibniz_agent/__init__.py && \
+    echo "" > /app/leibniz_agent/services/__init__.py
+
+# Copy source code (changes here invalidate this layer but NOT the packages layer)
+COPY rag /app/leibniz_agent/services/rag
+COPY shared /app/leibniz_agent/services/shared
+
+# Copy TASK knowledge base for indexing
+COPY task_knowledge_base /app/leibniz_knowledge_base
+
+# Set build-time environment
+ENV LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH=/app/leibniz_knowledge_base
+ENV LEIBNIZ_RAG_VECTOR_STORE_PATH=/app/index
+ENV LEIBNIZ_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+ENV GEMINI_API_KEY=dummy_for_build
+
+# Build FAISS index (runs only if knowledge base or code changes)
+RUN echo "📦 Building FAISS index from TASK knowledge base..." && \
+    python -m leibniz_agent.services.rag.index_builder \
+        --knowledge-base /app/leibniz_knowledge_base \
+        --output /app/index \
+        --rebuild 2>/dev/null && \
+    ls -la /app/index/ && \
+    echo "✅ FAISS index built successfully!" || \
+    (echo "⚠️ Index build skipped - will build at runtime" && mkdir -p /app/index)
+
+# ============================================================================
+# Stage 3: RUNTIME - Final lightweight image
+# ============================================================================
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+# Install minimal runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-installed Python packages (LARGE but CACHED)
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
+
+# Create package structure
+RUN mkdir -p /app/leibniz_agent/services && \
+    echo "" > /app/leibniz_agent/__init__.py && \
+    echo "" > /app/leibniz_agent/services/__init__.py
+
+# ========== Source code - changes here are FAST rebuilds ==========
+COPY rag /app/leibniz_agent/services/rag
+COPY shared /app/leibniz_agent/services/shared
+
+# Copy knowledge base
+COPY task_knowledge_base /app/leibniz_knowledge_base
+
+# Copy pre-built FAISS index
+COPY --from=indexer /app/index /app/index
+
+# Python settings
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# TARA Mode defaults
+ENV GEMINI_API_KEY="AIzaSyC-Dq_oF3H-qdG7ZxXcLLO9dTscl1dWjdE"
+ENV GEMINI_MODEL="gemini-2.0-flash-lite"
+ENV LEIBNIZ_REDIS_HOST="tara-redis"
+ENV LEIBNIZ_REDIS_PORT="6379"
+ENV LEIBNIZ_REDIS_DB="0"
+ENV LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH="/app/leibniz_knowledge_base"
+ENV LEIBNIZ_RAG_VECTOR_STORE_PATH="/app/index"
+ENV LEIBNIZ_RAG_EMBEDDING_MODEL="sentence-transformers/all-MiniLM-L6-v2"
+ENV LEIBNIZ_RAG_TOP_K="8"
+ENV LEIBNIZ_RAG_TOP_N="5"
+ENV LEIBNIZ_RAG_SIMILARITY_THRESHOLD="0.3"
+ENV LEIBNIZ_RAG_CACHE_TTL="3600"
+ENV LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH="true"
+ENV TARA_MODE="true"
+ENV LEIBNIZ_RAG_RESPONSE_LANGUAGE="te-mixed"
+ENV LEIBNIZ_RAG_ORGANIZATION="TASK"
+ENV LEIBNIZ_RAG_AGENT_NAME="TARA"
+ENV PORT="8003"
+ENV LOG_LEVEL="INFO"
+
+# Prewarming settings
+ENV ENABLE_PREWARMING="true"
+ENV WARMUP_QUERIES_COUNT="10"
+ENV ENABLE_MODEL_PERSISTENCE="true"
+ENV PREPOPULATE_CACHE="true"
+ENV GEMINI_TIMEOUT_MS="5000"
+ENV EMBEDDING_BATCH_SIZE="32"
+
+EXPOSE 8003
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8003/health', timeout=5).read()" || exit 1
+
+CMD ["python", "-m", "uvicorn", "leibniz_agent.services.rag.app:app", "--host", "0.0.0.0", "--port", "8003", "--workers", "1"]

@@ -50,6 +50,10 @@ class VADConfig:
     sarvam_api_key: str = os.getenv("SARVAM_API_SUBSCRIPTION_KEY", "")
     sarvam_endpoint: Optional[str] = os.getenv("SARVAM_API_ENDPOINT")
     
+    # Streaming Settings
+    sarvam_high_vad_sensitivity: bool = True
+    sarvam_vad_signals: bool = True
+    
     # Timeout settings (seconds)
     initial_timeout_s: float = 20.0      # First attempt timeout
     retry_timeout_s: float = 10.0        # Retry attempt timeout
@@ -62,7 +66,7 @@ class VADConfig:
     complex_query_timeout_s: float = 35.0   # Complex RAG queries
     post_service_timeout_s: float = 20.0    # Post-service continuation
     
-    # VAD and silence detection
+    # VAD and silence detection (Legacy - energy based parameters mostly unused now)
     silence_timeout: float = 1.5          # Silence detection timeout
     min_speech_ms: int = 350              # Minimum speech duration (ms)
     max_buffer_ms: int = 6000             # Force-flush buffer window
@@ -115,6 +119,10 @@ class VADConfig:
             sarvam_api_key=os.getenv("SARVAM_API_SUBSCRIPTION_KEY", ""),
             sarvam_endpoint=os.getenv("SARVAM_API_ENDPOINT"),
             
+            # Streaming settings
+            sarvam_high_vad_sensitivity=os.getenv("SARVAM_HIGH_VAD_SENSITIVITY", "true").lower() == "true",
+            sarvam_vad_signals=os.getenv("SARVAM_VAD_SIGNALS", "true").lower() == "true",
+            
             # Timeout settings
             initial_timeout_s=float(os.getenv("LEIBNIZ_VAD_TIMEOUT_INITIAL", "20.0")),
             retry_timeout_s=float(os.getenv("LEIBNIZ_VAD_TIMEOUT_RETRY", "10.0")),
@@ -161,9 +169,6 @@ class VADConfig:
     def __post_init__(self):
         """
         Validate and normalize configuration.
-        
-        Ensures English-only language code and valid timeout values.
-        Ported from LeibnizVADConfig.__post_init__() (lines 85-96).
         """
         # Normalize Sarvam language configuration
         normalized_code = (self.language_code or "unknown").strip()
@@ -182,35 +187,11 @@ class VADConfig:
         if self.max_buffer_ms < 1000:
             logger.warning("max_buffer_ms too low (%s). Using 3000ms.", self.max_buffer_ms)
             self.max_buffer_ms = 3000
-        if self.partial_flush_ms >= self.max_buffer_ms:
-            logger.warning(
-                "partial_flush_ms (%s) must be lower than max_buffer_ms (%s). Adjusting to 75%% of max.",
-                self.partial_flush_ms,
-                self.max_buffer_ms,
-            )
-            self.partial_flush_ms = int(self.max_buffer_ms * 0.75)
-        if self.energy_release >= self.energy_activation:
-            logger.warning(
-                "energy_release (%s) should be below energy_activation (%s). "
-                "Reducing release threshold.",
-                self.energy_release,
-                self.energy_activation,
-            )
-            self.energy_release = max(self.energy_activation - 100.0, 50.0)
-        
-        # Validate timeout values
-        if self.initial_timeout_s <= 0:
-            logger.warning(f"Invalid initial_timeout_s={self.initial_timeout_s}, using default 20.0")
-            self.initial_timeout_s = 20.0
-        
-        if self.session_timeout <= 0:
-            logger.warning(f"Invalid session_timeout={self.session_timeout}, using default 600.0")
-            self.session_timeout = 600.0
         
         # Log configuration if verbose
         if self.verbose:
             logger.info(
                 f" VADConfig loaded: model={self.model_name}, "
                 f"sample_rate={self.sample_rate}Hz, timeout={self.initial_timeout_s}s, "
-                f"language={self.language_code}"
+                f"language={self.language_code}, streaming_vad={self.sarvam_high_vad_sensitivity}"
             )

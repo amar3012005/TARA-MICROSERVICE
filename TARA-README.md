@@ -1,115 +1,215 @@
-# TARA Microservices Cluster
+# 🇮🇳 TARA - Telugu TASK Customer Service Agent
 
-This is a separate Docker Compose setup for the TARA microservices cluster, isolated from the main Leibniz services.
+**TARA (Telangana Automated Response Assistant)** is a Telugu-speaking AI customer service agent for the TASK (Telangana Academy for Skill and Knowledge) organization.
+
+## Overview
+
+```
+User (Telugu) → STT_VAD (Gemini Live) → RAG (TASK KB) → TTS_Sarvam (Telugu)
+                                         ↑
+                               Skip Intent Service
+```
+
+### Key Features
+- **Telugu Language Support**: Native Telugu speech recognition and synthesis
+- **Mixed Telugu-English Responses**: Tenglish style for natural customer service
+- **TASK Knowledge Base**: Dedicated to TASK organization information
+- **No Barge-in Interference**: Ignores STT while agent is speaking
 
 ## Quick Start
 
-### 1. Build and Start All Services
+### 1. Start TARA Services
 
 ```bash
-cd /home/prometheus/leibniz_agent/services
-docker context use desktop-linux
-docker-compose -p tara-microservice -f docker-compose-tara.yml up -d --build
+cd TARA-MICROSERVICE
+docker-compose -f docker-compose-tara.yml up -d
 ```
 
-### 2. Check Service Status
+### 2. Check Service Health
 
 ```bash
-docker-compose -p tara-microservice -f docker-compose-tara.yml ps
+# Check all services
+docker-compose -f docker-compose-tara.yml ps
+
+# Check orchestrator health
+curl http://localhost:8023/health
+
+# Check RAG service
+curl http://localhost:8022/health
 ```
 
-### 3. View Logs
+### 3. Access Services
 
-```bash
-# All services
-docker-compose -p tara-microservice -f docker-compose-tara.yml logs -f
+| Service | Port | URL |
+|---------|------|-----|
+| Orchestrator | 8023 | http://localhost:8023 |
+| STT/VAD FastRTC | 7870 | http://localhost:7870 |
+| RAG Service | 8022 | http://localhost:8022 |
+| TTS Sarvam | 8024 | http://localhost:8024 |
+| Redis | 6382 | localhost:6382 |
 
-# Specific service
-docker-compose -p tara-microservice -f docker-compose-tara.yml logs -f orchestrator-tara
+## Architecture
+
+### Service Flow
+
+1. **User speaks in Telugu** → Browser microphone captures audio
+2. **STT_VAD Service** → Gemini Live transcribes Telugu speech
+3. **Orchestrator** → Routes transcript directly to RAG (skips Intent)
+4. **RAG Service** → Retrieves from TASK KB, generates Telugu response via Gemini
+5. **TTS_Sarvam** → Synthesizes Telugu audio using Sarvam API
+6. **User hears Telugu response** → Audio plays in browser
+
+### Key Configuration
+
+```yaml
+# TARA Mode Settings
+TARA_MODE: true
+SKIP_INTENT_SERVICE: true
+RESPONSE_LANGUAGE: te-mixed
+ORGANIZATION_NAME: TASK
+IGNORE_STT_WHILE_SPEAKING: true
+
+# Telugu TTS (Sarvam)
+LEIBNIZ_SARVAM_SPEAKER: anushka
+LEIBNIZ_SARVAM_LANGUAGE: te-IN
+LEIBNIZ_SARVAM_MODEL: bulbul:v2
 ```
 
-### 4. Access the Unified Client
+## Telugu Intro Greeting
 
-Open your browser and navigate to:
-```
-http://localhost:8023
-```
+When TARA starts, it greets users with:
 
-Or directly:
 ```
-http://localhost:8023/static/client.html
+నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?
 ```
 
-## Service Ports (TARA Cluster)
+Translation: "Hello! I am TARA, TASK's customer service agent. How can I help you?"
 
-| Service | Container Name | External Port | Internal Port |
-|---------|---------------|---------------|---------------|
-| Redis | tara-redis | 6382 | 6379 |
-| STT-VAD | tara-stt-vad-service | 8020 | 8001 |
-| Intent | tara-intent-service | 8021 | 8002 |
-| RAG | tara-rag-service | 8022 | 8003 |
-| Orchestrator | tara-orchestrator-service | 8023 | 8004 |
-| TTS Streaming | tara-tts-streaming-service | 8024 | 8005 |
-| FastRTC (STT) | tara-stt-vad-service | 7870 | 7860 |
+## Knowledge Base
 
-## Network
+The TASK knowledge base is located at `./task_knowledge_base/` with:
 
-All services run on the `tara-network` Docker network, isolated from the main `leibniz-network`.
+```
+task_knowledge_base/
+├── services/          # TASK services information
+├── contact/           # Contact details & locations
+├── faq/               # Frequently asked questions
+└── procedures/        # Registration & enrollment processes
+```
+
+### Adding Content
+1. Add markdown files to appropriate folders
+2. Rebuild the RAG index:
+   ```bash
+   curl -X POST http://localhost:8022/api/v1/admin/rebuild_index
+   ```
 
 ## Environment Variables
 
-You can customize the intro greeting by setting:
+Create a `.env` file:
+
 ```bash
-export INTRO_GREETING="Your custom greeting here"
-docker-compose -p tara-microservice -f docker-compose-tara.yml up -d
+# API Keys
+GEMINI_API_KEY=your_gemini_api_key
+SARVAM_API_KEY=your_sarvam_api_key
+
+# Optional: Custom knowledge base path
+TASK_KNOWLEDGE_BASE=./task_knowledge_base
 ```
+
+## API Endpoints
+
+### Orchestrator (Port 8023)
+
+```bash
+# Start workflow
+POST /start
+
+# Check status
+GET /status
+
+# Reset workflow
+POST /reset
+
+# Health check
+GET /health
+```
+
+### RAG Service (Port 8022)
+
+```bash
+# Query knowledge base
+POST /api/v1/query
+{
+  "query": "TASK లో ఎలా register చేయాలి?",
+  "context": {"language": "te", "organization": "TASK"}
+}
+
+# Rebuild index
+POST /api/v1/admin/rebuild_index
+```
+
+## Testing
+
+### Test Telugu Query
+
+```bash
+curl -X POST http://localhost:8022/api/v1/query \
+  -H "Content-Type: application/json" \
+  -d '{"query": "TASK సేవలు ఏమిటి?"}'
+```
+
+### Expected Response (Mixed Telugu-English)
+
+```
+TASK అనేక skill development programs అందిస్తుంది. IT training, communication skills, 
+certifications అన్నీ available. Registration free గా చేసుకోవచ్చు. 
+More details కోసం 040-2345-6789 కు call చేయండి.
+```
+
+## Troubleshooting
+
+### Services Not Starting
+```bash
+# Check logs
+docker-compose -f docker-compose-tara.yml logs orchestrator-tara
+docker-compose -f docker-compose-tara.yml logs rag-service-tara
+
+# Restart services
+docker-compose -f docker-compose-tara.yml restart
+```
+
+### STT Not Working
+- Ensure Gemini API key is valid
+- Check browser microphone permissions
+- Verify STT service is running on port 7870
+
+### TTS Not Speaking Telugu
+- Verify Sarvam API key is valid
+- Check TTS service logs for errors
+- Ensure `LEIBNIZ_SARVAM_LANGUAGE=te-IN`
+
+### RAG Not Finding Answers
+- Verify knowledge base files exist
+- Rebuild index after adding content
+- Check similarity threshold settings
 
 ## Stopping Services
 
 ```bash
-docker-compose -p tara-microservice -f docker-compose-tara.yml down
+docker-compose -f docker-compose-tara.yml down
+
+# Remove volumes (clears data)
+docker-compose -f docker-compose-tara.yml down -v
 ```
 
-## Removing Everything (Including Volumes)
+## Support
 
-```bash
-docker-compose -p tara-microservice -f docker-compose-tara.yml down -v
-```
+For issues or questions:
+- Check service logs: `docker-compose logs <service-name>`
+- Verify environment variables
+- Ensure all API keys are valid
 
-## Architecture Flow
+---
 
-1. **User connects** → Orchestrator plays intro greeting via TTS
-2. **User speaks** → STT-VAD processes audio → Publishes to Redis (`leibniz:events:stt`)
-3. **Orchestrator receives event** → Triggers Intent+RAG pipeline
-4. **Response generated** → Orchestrator streams TTS audio to client
-5. **Client plays audio** → Barge-in detection stops audio if user speaks
-
-## Troubleshooting
-
-### Check if services are running:
-```bash
-docker ps | grep tara
-```
-
-### Check Redis connectivity:
-```bash
-docker exec tara-redis redis-cli ping
-```
-
-### Check service health:
-```bash
-curl http://localhost:8023/health
-curl http://localhost:8020/health
-curl http://localhost:8024/health
-```
-
-### View specific service logs:
-```bash
-docker logs tara-orchestrator-service -f
-docker logs tara-stt-vad-service -f
-docker logs tara-tts-streaming-service -f
-```
-
-
-
-
+**TARA** - Bringing Telugu customer service to TASK organization 🇮🇳

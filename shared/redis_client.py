@@ -57,27 +57,27 @@ class RedisConfig:
     @staticmethod
     def from_env() -> 'RedisConfig':
         """Load configuration from environment variables"""
-        # Check for REDIS_URL first (overrides individual settings)
-        redis_url = os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
+        # Check for REDIS_URL first (TARA_ prefix takes precedence, overrides individual settings)
+        redis_url = os.getenv("TARA_REDIS_URL") or os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
         if redis_url:
             # Parse URL manually for config display purposes
             # Actual connection will use the URL directly
             logger.info(f"Loading Redis config from REDIS_URL")
         
         return RedisConfig(
-            host=os.getenv("LEIBNIZ_REDIS_HOST", "localhost"),
-            port=int(os.getenv("LEIBNIZ_REDIS_PORT", "6379")),
-            db=int(os.getenv("LEIBNIZ_REDIS_DB", "0")),
-            password=os.getenv("LEIBNIZ_REDIS_PASSWORD") or None,
-            max_connections=int(os.getenv("LEIBNIZ_REDIS_MAX_CONNECTIONS", "50")),
-            socket_timeout=float(os.getenv("LEIBNIZ_REDIS_SOCKET_TIMEOUT", "10.0")),
-            socket_connect_timeout=float(os.getenv("LEIBNIZ_REDIS_SOCKET_CONNECT_TIMEOUT", "10.0")),
+            host=os.getenv("TARA_REDIS_HOST", os.getenv("LEIBNIZ_REDIS_HOST", "tara-task-redis")),
+            port=int(os.getenv("TARA_REDIS_PORT", os.getenv("LEIBNIZ_REDIS_PORT", "6381"))),
+            db=int(os.getenv("TARA_REDIS_DB", os.getenv("LEIBNIZ_REDIS_DB", "0"))),
+            password=os.getenv("TARA_REDIS_PASSWORD", os.getenv("LEIBNIZ_REDIS_PASSWORD")) or None,
+            max_connections=int(os.getenv("TARA_REDIS_MAX_CONNECTIONS", os.getenv("LEIBNIZ_REDIS_MAX_CONNECTIONS", "50"))),
+            socket_timeout=float(os.getenv("TARA_REDIS_SOCKET_TIMEOUT", os.getenv("LEIBNIZ_REDIS_SOCKET_TIMEOUT", "10.0"))),
+            socket_connect_timeout=float(os.getenv("TARA_REDIS_SOCKET_CONNECT_TIMEOUT", os.getenv("LEIBNIZ_REDIS_SOCKET_CONNECT_TIMEOUT", "10.0"))),
         )
     
     def get_redis_url(self) -> str:
         """Generate Redis connection URL"""
-        # Check for explicit URL first
-        env_url = os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
+        # Check for explicit URL first (TARA_ prefix takes precedence)
+        env_url = os.getenv("TARA_REDIS_URL") or os.getenv("LEIBNIZ_REDIS_URL") or os.getenv("REDIS_URL")
         if env_url:
             return env_url
         

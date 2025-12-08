@@ -13,7 +13,8 @@ fastrtc>=0.0.15
 # Pydantic for data validation
 pydantic>=2.5.0
 
-# Sarvam AI (HTTP client for REST API)
+# Sarvam AI SDK
+sarvamai>=0.1.22
 httpx>=0.24.0
 
 # Audio processing

@@ -98,6 +98,9 @@ class FastRTCTTSHandler(AsyncStreamHandler):
         FastRTCTTSHandler.active_instances.add(self)
         
         logger.info("=" * 70)
+        logger.info(f"🔌 FastRTC Stream STARTED | Session: {self.session_id}")
+        logger.info(f"   Active instances: {len(FastRTCTTSHandler.active_instances)}")
+        logger.info("=" * 70)
         logger.info("🚀 FastRTC TTS stream started")
         logger.info(f"   Handler instance: {id(self)} | Session: {self.session_id}")
         logger.info(f"   Active instances: {len(FastRTCTTSHandler.active_instances)}")
@@ -147,20 +150,10 @@ class FastRTCTTSHandler(AsyncStreamHandler):
                 buffered_chunks += 1
             
             if buffered_chunks < self._min_buffer_chunks:
-                logger.debug(
-                    "⏳ FastRTC buffer warming: queue_size=%s/%s",
-                    buffered_chunks,
-                    self._min_buffer_chunks
-                )
                 await asyncio.sleep(sleep_interval)
                 return (self._sample_rate, silence_chunk)
             
             self._buffer_warmed = True
-            logger.debug(
-                "✅ FastRTC buffer warmed: queue_size=%s (min=%s)",
-                buffered_chunks,
-                self._min_buffer_chunks
-            )
         
         # Process current chunk or get next one
         if self._current_audio_chunk is None:
@@ -220,16 +213,6 @@ class FastRTCTTSHandler(AsyncStreamHandler):
             
             # Add to queue as int16 (do not convert to float32)
             await self._audio_output_queue.put((audio_int16, sample_rate))
-            
-            queue_size = self._audio_output_queue.qsize()
-            logger.debug(
-                "Added audio chunk to FastRTC queue: %s samples @ %sHz (int16), "
-                "playback ends at %.2f, queue_size=%s",
-                len(audio_int16),
-                sample_rate,
-                self._playback_end_time,
-                queue_size
-            )
         except Exception as e:
             logger.error(f"Error adding audio chunk: {e}")
     
@@ -242,6 +225,7 @@ class FastRTCTTSHandler(AsyncStreamHandler):
             audio_bytes: Raw audio bytes
             sample_rate: Sample rate
         """
+        logger.info(f"DEBUG: broadcast_audio called. Active instances: {len(cls.active_instances)}")
         if not cls.active_instances:
             logger.warning("No active FastRTC instances to broadcast to")
             return

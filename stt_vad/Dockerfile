@@ -1,24 +1,45 @@
-# Stage 1: Builder
+# Stage 1: Builder - Install ALL dependencies (CACHED)
 FROM python:3.11-slim AS builder
 WORKDIR /build
-COPY stt_vad/requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# ========== CRITICAL: Copy ONLY requirements first for caching ==========
+# This layer is cached unless requirements.txt changes
+COPY stt_vad/requirements.txt /build/requirements.txt
+
+# Install ALL Python packages (CACHED - only rebuilds if requirements.txt changes)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1000 --user -r requirements.txt && \
+    echo "✅ All packages installed (cached for future builds)"
 
 # Stage 2: Runtime
 FROM python:3.11-slim AS runtime
 
-# Install OS packages
+# Install OS runtime packages (CACHED - rarely changes)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     portaudio19-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy artifacts and code
+# Copy pre-installed Python packages from builder (LARGE but CACHED)
 WORKDIR /app
 COPY --from=builder /root/.local /root/.local
-COPY . .
-WORKDIR /app/stt_vad
 ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
+
+# ========== Source code - changes here are FAST rebuilds ==========
+# Copy ONLY the service code (not entire directory)
+COPY stt_vad /app/stt_vad
+COPY shared /app/shared
+
+# Set working directory to service code
+WORKDIR /app/stt_vad
 ENV PYTHONPATH=/app:/app/shared:$PYTHONPATH
 
 # CRITICAL: Unbuffered Python output for real-time logs

@@ -63,8 +63,10 @@ class FastRTCSTTHandler(AsyncStreamHandler):
             logger.warning("⚠️ VADManager not injected - transcription will not work")
             logger.warning("   Ensure vad_manager is set before starting stream")
         else:
+            # Register session with VAD manager for callbacks
+            await self.vad_manager.register_session(self.session_id, self._transcript_callback)
             logger.info("✅ VADManager ready | Pipeline initialized")
-            logger.info("📊 Flow: Browser → FastRTC → VADManager → Sarvam Saarika → STT")
+            logger.info("📊 Flow: Browser → FastRTC → VADManager → SarvamStreamingClient → Sarvam WebSocket")
             logger.info("🎤 Start speaking - audio will trigger automatic pipeline processing")
         
         logger.info("=" * 70)
@@ -111,10 +113,6 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                 logger.info(f"   - Shape: {audio_array.shape}")
                 logger.info(f"   - Max Value: {max_val}")
             
-            # Ensure float32 for processing
-            if audio_array.dtype != np.float32:
-                audio_array = audio_array.astype(np.float32)
-            
             # CRITICAL: Resample to 16kHz for Sarvam (FastRTC sends 48kHz or 24kHz)
             target_rate = 16000
             if sample_rate != target_rate:
@@ -125,47 +123,31 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                     sample_rate = target_rate
                 else:
                     # Fallback: Naive resampling for non-integer ratios
-                    # Calculate new length
                     new_length = int(len(audio_array) * target_rate / sample_rate)
                     indices = np.linspace(0, len(audio_array) - 1, new_length).astype(int)
                     audio_array = audio_array[indices]
                     sample_rate = target_rate
 
-            # CRITICAL: Amplification / Auto-Gain
-            # If audio is too quiet, boost it
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            target_peak = 20000.0 # Target ~60% full scale for int16
-            max_gain = 50.0 # Max amplification factor
-            
-            # Determine if we are in int16 scale (> 1.0) or float scale (<= 1.0)
-            is_int_scale = max_val > 1.0
-            
-            if is_int_scale:
-                # Int16 scale logic
-                if max_val > 0 and max_val < 5000: # Below ~15% volume
-                    gain = min(target_peak / max_val, max_gain)
-                    audio_array = audio_array * gain
-                    # Log occasionally
-                    if self._chunk_count % 50 == 0:
-                        logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val} -> {np.max(np.abs(audio_array))})")
-            elif max_val > 0 and max_val < 0.15: # Float scale logic (below 15%)
-                target_float = 0.6
-                gain = min(target_float / max_val, max_gain)
-                audio_array = audio_array * gain
-                if self._chunk_count % 50 == 0:
-                    logger.info(f"🔊 Amplifying audio by {gain:.1f}x (Peak: {max_val:.4f} -> {np.max(np.abs(audio_array)):.4f})")
-
-            # CRITICAL: Normalization and conversion to int16
-            # Re-calculate max after amplification
-            max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
-            
-            if max_val > 1.0:
-                # Assume already scaled (e.g. int16 values in float container), just cast/clip
-                # This prevents amplifying noise if values are already large
-                audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+            # Convert to int16 PCM format for Sarvam API
+            # No amplification - pass through audio as-is for accurate transcription
+            if audio_array.dtype == np.int16:
+                audio_int16 = audio_array
+            elif audio_array.dtype in (np.float32, np.float64):
+                max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
+                if max_val > 1.0:
+                    # Already in int16 scale, just clip and cast
+                    audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+                else:
+                    # Float [-1, 1] scale, convert to int16
+                    audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
             else:
-                # Assume float [-1, 1], scale to int16
-                audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
+                # Convert other dtypes to float32 first, then to int16
+                audio_array = audio_array.astype(np.float32)
+                max_val = np.max(np.abs(audio_array)) if audio_array.size > 0 else 0
+                if max_val > 1.0:
+                    audio_int16 = np.clip(audio_array, -32768, 32767).astype(np.int16)
+                else:
+                    audio_int16 = (np.clip(audio_array, -1.0, 1.0) * 32767).astype(np.int16)
             
             audio_bytes = audio_int16.tobytes()
             
@@ -177,19 +159,22 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                 chunk_to_send = bytes(self._audio_buffer) # Create copy
                 self._audio_buffer.clear() # Reset buffer
                 
+                # Ensure session is registered before sending audio
+                if self.session_id not in self.vad_manager.sessions:
+                    # Auto-register if not already registered
+                    await self.vad_manager.register_session(self.session_id, self._transcript_callback)
+                
                 # Send directly to VADManager (non-blocking)
-                await self.vad_manager.process_audio_chunk_streaming(
+                await self.vad_manager.stream_audio(
                     session_id=self.session_id,
-                    audio_chunk=chunk_to_send,
-                    streaming_callback=self._transcript_callback
+                    audio_chunk=chunk_to_send
                 )
                 
                 self._chunk_count += 1
                 
                 if self._chunk_count == 1:
                     logger.info(f"✅ First buffered chunk sent | Size: {len(chunk_to_send)} bytes | 16000Hz")
-                elif self._chunk_count % 10 == 0: # Log less frequently (every 1s)
-                    logger.info(f"📤 Audio chunk #{self._chunk_count} | {len(chunk_to_send)} bytes")
+                # Removed frequent chunk logging - only log transcripts now
                 
         except Exception as e:
             logger.error(f"❌ Audio processing error: {e}")
@@ -201,14 +186,21 @@ class FastRTCSTTHandler(AsyncStreamHandler):
         Callback for receiving transcripts from VADManager.
         
         This is called by VADManager's background receive loop when
-        transcripts are available. We log them for visibility.
+        transcripts are available. We log them for real-time visibility.
         
         Args:
             text: Transcript text
             is_final: Whether this is a final transcript
         """
+        if not text or not text.strip():
+            return
+            
         status = "✅ FINAL" if is_final else "🔄 PARTIAL"
-        logger.info(f"📝 [{status}] Transcript: '{text[:150]}'")
+        logger.info(f"📝 [{status}] Transcript: '{text}'")
+        
+        # For final transcripts, also log with session info
+        if is_final:
+            logger.info(f"   Session: {self.session_id}")
     
     async def emit(self):
         """
@@ -230,6 +222,9 @@ class FastRTCSTTHandler(AsyncStreamHandler):
         logger.info(f"   Handler instance: {id(self)} | Started: {self._started}")
         logger.info(f"   Total chunks processed: {self._chunk_count}")
         logger.info("=" * 70)
+        
+        if self.vad_manager:
+            await self.vad_manager.unregister_session(self.session_id)
         
         self._started = False
         self._audio_buffer.clear()

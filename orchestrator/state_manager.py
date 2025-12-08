@@ -2,6 +2,7 @@
 Core Finite State Machine (FSM) engine with Redis persistence
 
 Manages conversation state transitions: IDLE → LISTENING → THINKING → SPEAKING → INTERRUPT
+Includes RAG Pre-LLM Accumulation tracking for optimized response times.
 """
 
 import asyncio
@@ -35,12 +36,36 @@ class ConversationContext:
     llm_response: Optional[str] = None
     turn_number: int = 0
     timestamps: Dict[str, float] = None
+    # RAG Pre-LLM Accumulation tracking
+    chunk_sequence: int = 0
+    rag_accumulation_active: bool = False
+    last_partial_text: str = ""
+    accumulation_start_time: Optional[float] = None
     
     def __post_init__(self):
         if self.timestamps is None:
             self.timestamps = {}
         if self.text_buffer is None:
             self.text_buffer = []
+    
+    def reset_accumulation(self):
+        """Reset RAG accumulation state for new utterance"""
+        self.chunk_sequence = 0
+        self.rag_accumulation_active = False
+        self.last_partial_text = ""
+        self.accumulation_start_time = None
+    
+    def start_accumulation(self):
+        """Mark start of RAG accumulation"""
+        self.rag_accumulation_active = True
+        self.accumulation_start_time = time.time()
+    
+    def increment_chunk(self, text: str):
+        """Increment chunk sequence and track partial text"""
+        self.chunk_sequence += 1
+        self.last_partial_text = text
+        if not self.rag_accumulation_active:
+            self.start_accumulation()
 
 
 class StateManager:

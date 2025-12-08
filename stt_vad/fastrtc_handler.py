@@ -68,7 +68,7 @@ class FastRTCSTTHandler(AsyncStreamHandler):
         else:
             logger.info("✅ VADManager ready | Pipeline initialized")
             logger.info("📊 Flow: Browser → FastRTC → VADManager → Gemini Live → STT")
-            logger.info("🎤 Start speaking - audio will trigger automatic pipeline processing")
+            logger.info("� Start speaking - audio will trigger automatic pipeline processing")
         
         # Publish connection event to Redis for orchestrator
         await self._publish_connection_event()

@@ -8,15 +8,23 @@ FROM python:3.11-slim as builder
 
 WORKDIR /build
 
-# Install build dependencies (if needed)
+# Install build dependencies and Docker CLI
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    curl \
+    ca-certificates \
+    && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-24.0.7.tgz | tar -xz -C /usr/local/bin --strip-components=1 docker/docker \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
-# Context is services/ directory (matching docker-compose.yml context: .)
-COPY orchestrator/requirements.txt .
-RUN pip install --user --no-cache-dir -r requirements.txt
+# ========== CRITICAL: Copy ONLY requirements first for caching ==========
+# This layer is cached unless requirements.txt changes
+# Context is TARA-MICROSERVICE/ directory (matching docker-compose-tara.yml context: .)
+COPY orchestrator/requirements.txt /build/requirements.txt
+
+# Install ALL Python packages (CACHED - only rebuilds if requirements.txt changes)
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --default-timeout=1000 --user -r requirements.txt && \
+    echo "✅ All packages installed (cached for future builds)"
 
 # ============================================================================
 # Runtime Stage

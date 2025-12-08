@@ -19,8 +19,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as redis
 
-from leibniz_agent.services.intent.config import IntentConfig
-from leibniz_agent.services.intent.intent_classifier import IntentClassifier
+from config import IntentConfig
+from intent_classifier import IntentClassifier
 
 # Configure logging
 logging.basicConfig(

@@ -66,7 +66,8 @@ async def lifespan(app: FastAPI):
     config = VADConfig.from_env()
     logger.info(f"📋 Configuration loaded | Model: {config.model_name} | Language hint: {config.language_code}")
     
-    # Initialize Sarvam client
+    # Initialize Sarvam client (Legacy/Fallback)
+    # Note: Streaming uses SarvamStreamingClient inside VADManager
     logger.info("🌐 Initializing Sarvam STT client...")
     sarvam_client = SarvamSTTClient(
         api_key=config.sarvam_api_key,
@@ -525,6 +526,10 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                     pass
 
             del active_sessions[session_id]
+        
+        # Unregister from Sarvam Streaming (Cleanup)
+        if vad_manager:
+            await vad_manager.unregister_session(session_id)
 
 
 async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, websocket: WebSocket):
@@ -592,14 +597,11 @@ async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, w
                     
                     # For continuous mode, we process each chunk individually
                     # This provides real-time streaming without waiting for turn completion
-                    transcript = await vad_manager.process_audio_chunk_streaming(
+                    await vad_manager.process_audio_chunk_streaming(
                         session_id,
                         audio_chunk,
                         streaming_callback
                     )
-
-                    if transcript:
-                        logger.debug(f"✅ Processed chunk transcript: {transcript[:50]}...")
 
             except Exception as e:
                 logger.error(f"❌ Error processing audio chunk for session {session_id}: {e}")
@@ -622,8 +624,8 @@ async def health_check():
     """
     uptime_seconds = time.time() - app_start_time
     
-    # Get Sarvam stats
-    sarvam_stats = sarvam_client.get_stats() if sarvam_client else {}
+    # Get Sarvam stats (VADManager handles active sessions)
+    sarvam_stats = {}
     
     # Check Redis
     redis_connected = False
@@ -634,33 +636,23 @@ async def health_check():
         except Exception:
             redis_connected = False
     
-    # Get VAD metrics (if method exists)
+    # Get VAD metrics
     vad_metrics = {}
     if vad_manager:
-        try:
-            vad_metrics = vad_manager.get_performance_metrics()
-        except AttributeError:
-            # Fallback if method doesn't exist
-            vad_metrics = {
-                "total_captures": getattr(vad_manager, 'capture_count', 0),
-                "avg_capture_time_ms": 0
-            }
+        vad_metrics = vad_manager.get_performance_metrics()
     
     # Determine status
     status = "healthy"
-    sarvam_ready = sarvam_stats.get("last_status") != "error" if sarvam_stats else True
-    if not redis_connected or not sarvam_ready:
+    if not redis_connected:
         status = "degraded"
     
     return {
         "status": status,
-        "service": "stt-vad",
+        "service": "stt-sarvam",
         "uptime_seconds": uptime_seconds,
         "active_sessions": len(active_sessions),
-        "sarvam_client": sarvam_stats,
-        "redis_connected": redis_connected,
-        "total_captures": vad_metrics.get("total_captures", 0),
-        "avg_capture_time_ms": vad_metrics.get("avg_capture_time_ms", 0)
+        "sarvam_metrics": vad_metrics,
+        "redis_connected": redis_connected
     }
 
 
@@ -676,8 +668,7 @@ async def get_metrics():
         return {"error": "VAD manager not initialized"}
     
     metrics = vad_manager.get_performance_metrics()
-    metrics["active_sessions"] = len(active_sessions)
-    metrics["sarvam_stats"] = sarvam_client.get_stats() if sarvam_client else {}
+    metrics["active_ws_sessions"] = len(active_sessions)
     
     return metrics
 
@@ -693,7 +684,7 @@ async def reset_session():
     if vad_manager:
         vad_manager.reset_streaming_state()
     
-    return {"status": "success", "message": "Sarvam streaming buffers flushed"}
+    return {"status": "success", "message": "Sarvam streaming sessions cleared"}
 
 
 if __name__ == "__main__":

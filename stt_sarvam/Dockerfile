@@ -16,7 +16,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy artifacts and code
 WORKDIR /app
 COPY --from=builder /root/.local /root/.local
-COPY . .
+
+# Copy only necessary source code to preserve cache when other services change
+COPY shared /app/shared
+COPY stt_sarvam /app/stt_sarvam
+
 WORKDIR /app/stt_sarvam
 ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONPATH=/app:/app/shared:$PYTHONPATH

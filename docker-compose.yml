@@ -1,19 +1,19 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: leibniz-redis
+    container_name: tara-task-redis
     ports:
       - "6381:6381"
     volumes:
-      - redis_data:/data
+      - tara_task_redis_data:/data
     command: redis-server --appendonly yes --port 6381 --bind 0.0.0.0
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "6381", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
-    # networks:
-    #   - leibniz-network
+    networks:
+      - tara-task-network
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -21,14 +21,14 @@ services:
         max-size: "50m"
         max-file: "2"
 
-  stt-vad-service:
+  tara-stt-vad-service:
     build:
       context: .
       dockerfile: stt_vad/Dockerfile
-    container_name: stt-vad-service
+    container_name: tara-stt-vad
     ports:
-      - "8001:8001"
-      - "7860:7860"
+      - "8026:8001"
+      - "7861:7860"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -36,17 +36,17 @@ services:
       - STT_VAD_HOST=0.0.0.0
       - STT_VAD_PORT=8001
       - FAST_RTC_PORT=7860
-      - REDIS_HOST=host.docker.internal
+      - REDIS_HOST=tara-task-redis
       - REDIS_PORT=6381
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
+      - TARA_REDIS_HOST=tara-task-redis
+      - TARA_REDIS_PORT=6381
       - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
       - DOCKER_ENVIRONMENT=true
     depends_on:
       redis:
         condition: service_healthy
     networks:
-      - leibniz-network
+      - tara-task-network
     restart: unless-stopped
     stdin_open: true
     tty: true
@@ -56,74 +56,110 @@ services:
         max-size: "100m"
         max-file: "3"
 
-  intent-service:
-    build:
-      context: ..
-      dockerfile: services/intent/Dockerfile
-    container_name: intent-service
-    ports:
-      - "8002:8002"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
-      - GEMINI_MODEL=gemini-2.5-flash-lite
-      - REDIS_URL=redis://host.docker.internal:6381
-      - INTENT_CACHE_TTL=1800
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
+  # stt-vad-service:  # COMMENTED OUT - Using tara-stt-vad-service instead
+  #   build:
+  #     context: .
+  #     dockerfile: stt_vad/Dockerfile
+  #   container_name: stt-vad-service
+  #   ports:
+  #     - "8001:8001"
+  #     - "7860:7860"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - STT_VAD_HOST=0.0.0.0
+  #     - STT_VAD_PORT=8001
+  #     - FAST_RTC_PORT=7860
+  #     - REDIS_HOST=host.docker.internal
+  #     - REDIS_PORT=6381
+  #     - LEIBNIZ_REDIS_HOST=host.docker.internal
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #     - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
+  #     - DOCKER_ENVIRONMENT=true
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   stdin_open: true
+  #   tty: true
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "100m"
+  #       max-file: "3"
+
+  # intent-service:  # COMMENTED OUT - Skipped in TARA mode (SKIP_INTENT_SERVICE=true)
+  #   build:
+  #     context: ..
+  #     dockerfile: services/intent/Dockerfile
+  #   container_name: intent-service
+  #   ports:
+  #     - "8002:8002"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
+  #     - GEMINI_MODEL=gemini-2.5-flash-lite
+  #     - REDIS_URL=redis://host.docker.internal:6381
+  #     - INTENT_CACHE_TTL=1800
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "50m"
+  #       max-file: "2"
 
   rag-service:
-    image: leibniz-rag:latest
+    image: tara-task-rag:latest
     build:
-      context: ..
-      dockerfile: services/rag/Dockerfile
-      target: runtime
-    container_name: rag-service
+      context: .
+      dockerfile: rag/Dockerfile.tara
+    container_name: tara-task-rag
     ports:
       - "8023:8003"
     volumes:
-      # Mount knowledge base for hot-reloading (requires manual index rebuild or app restart)
-      - ../leibniz_knowledge_base:/app/leibniz_knowledge_base
-      # Mount source code for live development
-      - ./rag:/app/leibniz_agent/services/rag
-      - ./shared:/app/leibniz_agent/services/shared
+      # Mount TASK knowledge base
+      - ./task_knowledge_base:/app/task_knowledge_base
       # Persist vector index so it survives restarts
-      - rag_index:/app/index
+      - tara_task_rag_index:/app/index
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBuwr-lH-KIPGa99plp7MZ1rFrRBmLHpps}
       - GEMINI_MODEL=gemini-2.0-flash-lite
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
-      - LEIBNIZ_REDIS_DB=0
-      - LEIBNIZ_RAG_KNOWLEDGE_BASE_PATH=/app/leibniz_knowledge_base
-      - LEIBNIZ_RAG_VECTOR_STORE_PATH=/app/index
-      - LEIBNIZ_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-      - LEIBNIZ_RAG_TOP_K=8
-      - LEIBNIZ_RAG_TOP_N=5
-      - LEIBNIZ_RAG_SIMILARITY_THRESHOLD=0.3
-      - LEIBNIZ_RAG_CACHE_TTL=3600
-      - LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH=true
+      - TARA_REDIS_HOST=tara-task-redis
+      - TARA_REDIS_PORT=6381
+      - TARA_REDIS_DB=0
+      - TARA_RAG_KNOWLEDGE_BASE_PATH=/app/task_knowledge_base
+      - TARA_RAG_VECTOR_STORE_PATH=/app/index
+      - TARA_RAG_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - TARA_RAG_TOP_K=8
+      - TARA_RAG_TOP_N=5
+      - TARA_RAG_SIMILARITY_THRESHOLD=0.3
+      - TARA_RAG_CACHE_TTL=3600
+      - TARA_RAG_ENABLE_HYBRID_SEARCH=true
       - PORT=8003
       - LOG_LEVEL=INFO
+      # TARA Mode Configuration (Telugu TASK Customer Service) - DEFAULT ENABLED
+      - TARA_MODE=${TARA_MODE:-true}
+      - TARA_RAG_RESPONSE_LANGUAGE=${TARA_RAG_RESPONSE_LANGUAGE:-te-mixed}
+      - TARA_RAG_ORGANIZATION=${TARA_RAG_ORGANIZATION:-TASK}
+      - TARA_RAG_AGENT_NAME=${TARA_RAG_AGENT_NAME:-TARA}
     depends_on:
       redis:
         condition: service_healthy
     networks:
-      - leibniz-network
+      - tara-task-network
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -135,45 +171,60 @@ services:
     build:
       context: .
       dockerfile: orchestrator/Dockerfile
-    container_name: orchestrator-service
+    container_name: tara-task-orchestrator
     ports:
       - "8004:8004"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - REDIS_URL=redis://host.docker.internal:6381/0
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
-      - LEIBNIZ_REDIS_DB=0
+      - REDIS_URL=redis://tara-task-redis:6381/0
+      - TARA_REDIS_HOST=tara-task-redis
+      - TARA_REDIS_PORT=6381
+      - TARA_REDIS_DB=0
       - INTENT_SERVICE_URL=http://host.docker.internal:8002
-      - RAG_SERVICE_URL=http://host.docker.internal:8023
-      - STT_SERVICE_URL=http://host.docker.internal:8001
-      - TTS_SERVICE_URL=${TTS_SERVICE_URL:-http://host.docker.internal:8015}
+      - RAG_SERVICE_URL=http://tara-task-rag:8003
+      - STT_SERVICE_URL=http://tara-stt-vad:8001
+      - TTS_SERVICE_URL=${TTS_SERVICE_URL:-http://tara-tts-sarvam:8025}
       - APPOINTMENT_SERVICE_URL=http://host.docker.internal:8006
-      - INTRO_GREETING=${INTRO_GREETING:-Hello! I'm your assistant at Leibniz University. How can I help you today?}
-      - APPOINTMENT_ROUTE_BACK_DIALOGUE=${APPOINTMENT_ROUTE_BACK_DIALOGUE:-Got it! Now, back to your appointment booking...}
-      - APPOINTMENT_ROUTE_BACK_SHORT=${APPOINTMENT_ROUTE_BACK_SHORT:-Sure thing! Continuing with your appointment...}
+      - INTRO_GREETING=${INTRO_GREETING:-నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?}
       - LOG_LEVEL=INFO
       - SESSION_TTL_SECONDS=3600
       - MAX_CONCURRENT_SESSIONS=1000
+      # TARA Mode Configuration (Telugu TASK Customer Service Agent) - DEFAULT ENABLED
+      - TARA_MODE=${TARA_MODE:-true}
+      - SKIP_INTENT_SERVICE=${SKIP_INTENT_SERVICE:-true}
+      - SKIP_APPOINTMENT_SERVICE=${SKIP_APPOINTMENT_SERVICE:-true}
+      - RESPONSE_LANGUAGE=${RESPONSE_LANGUAGE:-te-mixed}
+      - ORGANIZATION_NAME=${ORGANIZATION_NAME:-TASK}
+      - IGNORE_STT_WHILE_SPEAKING=${IGNORE_STT_WHILE_SPEAKING:-true}
+      - AUTO_START_SERVICES=${AUTO_START_SERVICES:-true}
+      - DOCKER_CONTEXT=${DOCKER_CONTEXT:-desktop-linux}
+      - STT_GRADIO_URL=${STT_GRADIO_URL:-http://localhost:7861}
+      - TTS_GRADIO_URL=${TTS_GRADIO_URL:-http://localhost:8025/fastrtc}
     depends_on:
       redis:
         condition: service_healthy
-      intent-service:
-        condition: service_started
+      # intent-service:  # COMMENTED OUT - Skipped in TARA mode
+      #   condition: service_started
       rag-service:
         condition: service_started
-      stt-vad-service:
+      tara-stt-vad-service:
         condition: service_started
-      tts-streaming-service-new:
+      # stt-vad-service:  # COMMENTED OUT - Using tara-stt-vad-service instead
+      #   condition: service_started
+      # tts-streaming-service-new:  # COMMENTED OUT - Using tts-sarvam-service instead
+      #   condition: service_started
+      # tts-xtts-v2-service:  # COMMENTED OUT - Not needed for TARA
+      #   condition: service_started
+      tts-sarvam-service:
         condition: service_started
-      tts-xtts-v2-service:
-        condition: service_started
-      appointment-service:
-        condition: service_healthy
-    # networks:
-    #   - leibniz-network
+      # appointment-service:  # COMMENTED OUT - Skipped in TARA mode
+      #   condition: service_healthy
+    networks:
+      - tara-task-network
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -181,32 +232,68 @@ services:
         max-size: "50m"
         max-file: "2"
 
-  tts-streaming-service-new:
+  # tts-streaming-service-new:  # COMMENTED OUT - Using tts-sarvam-service for TARA (Telugu TTS)
+  #   build:
+  #     context: .
+  #     dockerfile: tts_streaming/Dockerfile
+  #   container_name: tts-streaming-service-v3
+  #   ports:
+  #     - "8005:8005"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-6KtIDvYHZAlfKcBpjwqlb1g1XdUksVM2}
+  #     - LEIBNIZ_LEMONFOX_VOICE=${LEIBNIZ_LEMONFOX_VOICE:-sarah}
+  #     - LEIBNIZ_LEMONFOX_LANGUAGE=${LEIBNIZ_LEMONFOX_LANGUAGE:-en-us}
+  #     - TTS_STREAMING_PORT=8005
+  #     - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+  #     - LEIBNIZ_TTS_CACHE_ENABLED=true
+  #     - LEIBNIZ_TTS_CACHE_MAX_SIZE=500
+  #     - LEIBNIZ_TTS_SAMPLE_RATE=24000
+  #     - TTS_QUEUE_MAX_SIZE=10
+  #     - REDIS_HOST=host.docker.internal
+  #     - REDIS_PORT=6381
+  #     - LEIBNIZ_REDIS_HOST=host.docker.internal
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "50m"
+  #       max-file: "2"
+
+  tts-sarvam-service:
     build:
       context: .
-      dockerfile: tts_streaming/Dockerfile
-    container_name: tts-streaming-service-v3
+      dockerfile: tts_sarvam/Dockerfile
+    container_name: tara-tts-sarvam
     ports:
-      - "8005:8005"
+      - "8025:8025"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - LEMONFOX_API_KEY=${LEMONFOX_API_KEY:-6KtIDvYHZAlfKcBpjwqlb1g1XdUksVM2}
-      - LEIBNIZ_LEMONFOX_VOICE=${LEIBNIZ_LEMONFOX_VOICE:-sarah}
-      - LEIBNIZ_LEMONFOX_LANGUAGE=${LEIBNIZ_LEMONFOX_LANGUAGE:-en-us}
-      - TTS_STREAMING_PORT=8005
-      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
-      - LEIBNIZ_TTS_CACHE_ENABLED=true
-      - LEIBNIZ_TTS_CACHE_MAX_SIZE=500
-      - LEIBNIZ_TTS_SAMPLE_RATE=24000
+      - SARVAM_API_KEY=${SARVAM_API_KEY:-sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr}
+      - TARA_SARVAM_SPEAKER=${TARA_SARVAM_SPEAKER:-anushka}
+      - TARA_SARVAM_LANGUAGE=${TARA_SARVAM_LANGUAGE:-te-IN}
+      - TARA_SARVAM_MODEL=${TARA_SARVAM_MODEL:-bulbul:v2}
+      - STREAMING_MIN_BUFFER_SIZE=50
+      - STREAMING_AUDIO_CODEC=linear16
+      - TTS_STREAMING_PORT=8025
+      - TARA_TTS_CACHE_DIR=/app/audio_cache
+      - TARA_TTS_CACHE_ENABLED=true
+      - TARA_TTS_CACHE_MAX_SIZE=500
+      - TARA_TTS_SAMPLE_RATE=22050
       - TTS_QUEUE_MAX_SIZE=10
-      - REDIS_HOST=host.docker.internal
+      - REDIS_HOST=tara-task-redis
       - REDIS_PORT=6381
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
+      - TARA_REDIS_HOST=tara-task-redis
+      - TARA_REDIS_PORT=6381
     networks:
-      - leibniz-network
+      - tara-task-network
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -214,210 +301,211 @@ services:
         max-size: "50m"
         max-file: "2"
 
-  tts-xtts-v2-service:
-    build:
-      context: .
-      dockerfile: tts_xtts_v2/Dockerfile
-    container_name: tts-xtts-v2-service
-    runtime: nvidia
-    ports:
-      - "${TTS_XTTS_HOST_PORT:-8015}:8005"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - XTTS_MODEL_DIR=/models/xtts_v2
-      - XTTS_DEVICE=${XTTS_DEVICE:-cuda}
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
-      - REDIS_URL=redis://host.docker.internal:6381/0
-      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
-      - LEIBNIZ_TTS_CACHE_ENABLED=${LEIBNIZ_TTS_CACHE_ENABLED:-true}
-      - LEIBNIZ_TTS_CACHE_MAX_SIZE=${LEIBNIZ_TTS_CACHE_MAX_SIZE:-500}
-      - LEIBNIZ_XTTS_LANGUAGE=${LEIBNIZ_XTTS_LANGUAGE:-en}
-      - LEIBNIZ_XTTS_SPEAKER_WAV=/voices/enigma.wav
-      - LEIBNIZ_XTTS_VOICE_ID=${LEIBNIZ_XTTS_VOICE_ID:-xtts_voice_default}
-      - LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS=${LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS:-20}
-      - LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS=${LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS:-8}
-      - LEIBNIZ_TTS_FASTRTC_CHUNK_MS=${LEIBNIZ_TTS_FASTRTC_CHUNK_MS:-40}
-      - LEIBNIZ_XTTS_SAMPLE_RATE=${LEIBNIZ_XTTS_SAMPLE_RATE:-24000}
-      - TTS_STREAMING_PORT=8005
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    volumes:
-      - ./tts_xtts_v2:/app/leibniz_agent/services/tts_xtts_v2
-      - ./shared:/app/leibniz_agent/services/shared
-      - ${XTTS_MODEL_HOST_DIR:-/opt/xtts/models}:/models/xtts_v2:ro
-      - ./ElevenLabs_enigma.wav:/voices/enigma.wav:ro
-      - tts_xtts_cache:/app/audio_cache
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    device_cgroup_rules:
-      - "c 195:* rmw"
-      - "c 508:* rmw"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  # tts-xtts-v2-service:  # COMMENTED OUT - Not needed for TARA (using tts-sarvam-service for Telugu)
+  #   build:
+  #     context: .
+  #     dockerfile: tts_xtts_v2/Dockerfile
+  #   container_name: tts-xtts-v2-service
+  #   runtime: nvidia
+  #   ports:
+  #     - "${TTS_XTTS_HOST_PORT:-8015}:8005"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - XTTS_MODEL_DIR=/models/xtts_v2
+  #     - XTTS_DEVICE=${XTTS_DEVICE:-cuda}
+  #     - LEIBNIZ_REDIS_HOST=host.docker.internal
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #     - REDIS_URL=redis://host.docker.internal:6381/0
+  #     - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+  #     - LEIBNIZ_TTS_CACHE_ENABLED=${LEIBNIZ_TTS_CACHE_ENABLED:-true}
+  #     - LEIBNIZ_TTS_CACHE_MAX_SIZE=${LEIBNIZ_TTS_CACHE_MAX_SIZE:-500}
+  #     - LEIBNIZ_XTTS_LANGUAGE=${LEIBNIZ_XTTS_LANGUAGE:-en}
+  #     - LEIBNIZ_XTTS_SPEAKER_WAV=/voices/enigma.wav
+  #     - LEIBNIZ_XTTS_VOICE_ID=${LEIBNIZ_XTTS_VOICE_ID:-xtts_voice_default}
+  #     - LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS=${LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS:-20}
+  #     - LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS=${LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS:-8}
+  #     - LEIBNIZ_TTS_FASTRTC_CHUNK_MS=${LEIBNIZ_TTS_FASTRTC_CHUNK_MS:-40}
+  #     - LEIBNIZ_XTTS_SAMPLE_RATE=${LEIBNIZ_XTTS_SAMPLE_RATE:-24000}
+  #     - TTS_STREAMING_PORT=8005
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  #   volumes:
+  #     - ./tts_xtts_v2:/app/leibniz_agent/services/tts_xtts_v2
+  #     - ./shared:/app/leibniz_agent/services/shared
+  #     - ${XTTS_MODEL_HOST_DIR:-/opt/xtts/models}:/models/xtts_v2:ro
+  #     - ./ElevenLabs_enigma.wav:/voices/enigma.wav:ro
+  #     - tts_xtts_cache:/app/audio_cache
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   device_cgroup_rules:
+  #     - "c 195:* rmw"
+  #     - "c 508:* rmw"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
     
-  tts-xtts-v2-dev:
-    profiles: ["dev"]
-    build:
-      context: .
-      dockerfile: tts_xtts_v2/Dockerfile
-      target: base-deps
-    container_name: tts-xtts-v2-dev
-    ports:
-      - "${TTS_XTTS_DEV_HOST_PORT:-8016}:8005"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - XTTS_MODEL_DIR=/models/xtts_v2
-      - XTTS_DEVICE=${XTTS_DEVICE:-cuda}
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
-      - REDIS_URL=redis://host.docker.internal:6381/0
-      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
-      - LEIBNIZ_TTS_CACHE_ENABLED=${LEIBNIZ_TTS_CACHE_ENABLED:-true}
-      - LEIBNIZ_TTS_CACHE_MAX_SIZE=${LEIBNIZ_TTS_CACHE_MAX_SIZE:-500}
-      - LEIBNIZ_XTTS_LANGUAGE=${LEIBNIZ_XTTS_LANGUAGE:-en}
-      - LEIBNIZ_XTTS_SPEAKER_WAV=/voices/enigma.wav
-      - LEIBNIZ_XTTS_VOICE_ID=${LEIBNIZ_XTTS_VOICE_ID:-xtts_voice_default}
-      - LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS=${LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS:-20}
-      - LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS=${LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS:-8}
-      - LEIBNIZ_TTS_FASTRTC_CHUNK_MS=${LEIBNIZ_TTS_FASTRTC_CHUNK_MS:-40}
-      - LEIBNIZ_XTTS_SAMPLE_RATE=${LEIBNIZ_XTTS_SAMPLE_RATE:-24000}
-      - TTS_STREAMING_PORT=8005
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    volumes:
-      - ./tts_xtts_v2:/app/leibniz_agent/services/tts_xtts_v2
-      - ./shared:/app/leibniz_agent/services/shared
-      - ${XTTS_MODEL_HOST_DIR:-/opt/xtts/models}:/models/xtts_v2:ro
-      - ./ElevenLabs_enigma.wav:/voices/enigma.wav:ro
-      - tts_xtts_cache:/app/audio_cache
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    device_cgroup_rules:
-      - "c 195:* rmw"
-      - "c 508:* rmw"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    command: ["python", "-u", "-m", "uvicorn", "leibniz_agent.services.tts_xtts_v2.app:app", "--host", "0.0.0.0", "--port", "8005"]
+  # tts-xtts-v2-dev:  # COMMENTED OUT - Not needed for TARA
+  #   profiles: ["dev"]
+  #   build:
+  #     context: .
+  #     dockerfile: tts_xtts_v2/Dockerfile
+  #     target: base-deps
+  #   container_name: tts-xtts-v2-dev
+  #   ports:
+  #     - "${TTS_XTTS_DEV_HOST_PORT:-8016}:8005"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - XTTS_MODEL_DIR=/models/xtts_v2
+  #     - XTTS_DEVICE=${XTTS_DEVICE:-cuda}
+  #     - LEIBNIZ_REDIS_HOST=host.docker.internal
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #     - REDIS_URL=redis://host.docker.internal:6381/0
+  #     - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+  #     - LEIBNIZ_TTS_CACHE_ENABLED=${LEIBNIZ_TTS_CACHE_ENABLED:-true}
+  #     - LEIBNIZ_TTS_CACHE_MAX_SIZE=${LEIBNIZ_TTS_CACHE_MAX_SIZE:-500}
+  #     - LEIBNIZ_XTTS_LANGUAGE=${LEIBNIZ_XTTS_LANGUAGE:-en}
+  #     - LEIBNIZ_XTTS_SPEAKER_WAV=/voices/enigma.wav
+  #     - LEIBNIZ_XTTS_VOICE_ID=${LEIBNIZ_XTTS_VOICE_ID:-xtts_voice_default}
+  #     - LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS=${LEIBNIZ_XTTS_STREAM_CHUNK_TOKENS:-20}
+  #     - LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS=${LEIBNIZ_XTTS_MAX_BUFFER_CHUNKS:-8}
+  #     - LEIBNIZ_TTS_FASTRTC_CHUNK_MS=${LEIBNIZ_TTS_FASTRTC_CHUNK_MS:-40}
+  #     - LEIBNIZ_XTTS_SAMPLE_RATE=${LEIBNIZ_XTTS_SAMPLE_RATE:-24000}
+  #     - TTS_STREAMING_PORT=8005
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  #   volumes:
+  #     - ./tts_xtts_v2:/app/leibniz_agent/services/tts_xtts_v2
+  #     - ./shared:/app/leibniz_agent/services/shared
+  #     - ${XTTS_MODEL_HOST_DIR:-/opt/xtts/models}:/models/xtts_v2:ro
+  #     - ./ElevenLabs_enigma.wav:/voices/enigma.wav:ro
+  #     - tts_xtts_cache:/app/audio_cache
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   device_cgroup_rules:
+  #     - "c 195:* rmw"
+  #     - "c 508:* rmw"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   command: ["python", "-u", "-m", "uvicorn", "leibniz_agent.services.tts_xtts_v2.app:app", "--host", "0.0.0.0", "--port", "8005"]
 
-  appointment-service:
-    build:
-      context: ..
-      dockerfile: services/appointment/Dockerfile
-    container_name: appointment-service
-    ports:
-      - "8006:8006"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - PORT=8006
-      - REDIS_URL=redis://host.docker.internal:6381
-      - LEIBNIZ_REDIS_HOST=host.docker.internal
-      - LEIBNIZ_REDIS_PORT=6381
-      - SESSION_TTL=1800
-      - MAX_RETRIES=3
-      - MAX_CONFIRMATION_ATTEMPTS=2
-      - LOG_STATE_TRANSITIONS=true
-      - LOG_LEVEL=INFO
-    depends_on:
-      redis:
-        condition: service_healthy
-    networks:
-      - leibniz-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=5)"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "2"
+  # appointment-service:  # COMMENTED OUT - Skipped in TARA mode (SKIP_APPOINTMENT_SERVICE=true)
+  #   build:
+  #     context: ..
+  #     dockerfile: services/appointment/Dockerfile
+  #   container_name: appointment-service
+  #   ports:
+  #     - "8006:8006"
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - PORT=8006
+  #     - REDIS_URL=redis://host.docker.internal:6381
+  #     - LEIBNIZ_REDIS_HOST=host.docker.internal
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #     - SESSION_TTL=1800
+  #     - MAX_RETRIES=3
+  #     - MAX_CONFIRMATION_ATTEMPTS=2
+  #     - LOG_STATE_TRANSITIONS=true
+  #     - LOG_LEVEL=INFO
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   networks:
+  #     - leibniz-network
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=5)"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 10s
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "50m"
+  #       max-file: "2"
 
-  stt-local-service:
-    build:
-      context: .
-      dockerfile: stt_local/Dockerfile
-    container_name: stt-local-service
-    runtime: nvidia
-    # ports:
-    #   - "8014:8006"
-    #   - "7863:7861"
-    network_mode: "host"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - STT_LOCAL_HOST=0.0.0.0
-      - STT_LOCAL_PORT=8006
-      - FAST_RTC_PORT=7861
-      - REDIS_HOST=localhost
-      - REDIS_PORT=6381
-      - LEIBNIZ_REDIS_HOST=localhost
-      - LEIBNIZ_REDIS_PORT=6381
-      - LEIBNIZ_REDIS_DB=0
-      - LEIBNIZ_STT_LOCAL_WHISPER_MODEL_SIZE=base
-      - LEIBNIZ_STT_LOCAL_WHISPER_DEVICE=cuda
-      - LEIBNIZ_STT_LOCAL_WHISPER_COMPUTE_TYPE=float16
-      - LEIBNIZ_STT_LOCAL_WHISPER_LANGUAGE=en
-      - LEIBNIZ_STT_LOCAL_USE_GPU=true
-      - LEIBNIZ_STT_LOCAL_VAD_THRESHOLD=0.5
-      - LEIBNIZ_STT_LOCAL_VAD_MIN_SPEECH_MS=250
-      - LEIBNIZ_STT_LOCAL_VAD_SILENCE_TIMEOUT_MS=800
-      - LEIBNIZ_STT_LOCAL_PARTIAL_UPDATE_INTERVAL_MS=500
-      - DOCKER_ENVIRONMENT=true
-    depends_on:
-      redis:
-        condition: service_healthy
-    # networks:
-    #   - leibniz-network
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    stdin_open: true
-    tty: true
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
+  # stt-local-service:  # COMMENTED OUT - Not needed for TARA (using tara-stt-vad-service)
+  #   build:
+  #     context: .
+  #     dockerfile: stt_local/Dockerfile
+  #   container_name: stt-local-service
+  #   runtime: nvidia
+  #   # ports:
+  #   #   - "8014:8006"
+  #   #   - "7863:7861"
+  #   network_mode: "host"
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - STT_LOCAL_HOST=0.0.0.0
+  #     - STT_LOCAL_PORT=8006
+  #     - FAST_RTC_PORT=7861
+  #     - REDIS_HOST=localhost
+  #     - REDIS_PORT=6381
+  #     - LEIBNIZ_REDIS_HOST=localhost
+  #     - LEIBNIZ_REDIS_PORT=6381
+  #     - LEIBNIZ_REDIS_DB=0
+  #     - LEIBNIZ_STT_LOCAL_WHISPER_MODEL_SIZE=base
+  #     - LEIBNIZ_STT_LOCAL_WHISPER_DEVICE=cuda
+  #     - LEIBNIZ_STT_LOCAL_WHISPER_COMPUTE_TYPE=float16
+  #     - LEIBNIZ_STT_LOCAL_WHISPER_LANGUAGE=en
+  #     - LEIBNIZ_STT_LOCAL_USE_GPU=true
+  #     - LEIBNIZ_STT_LOCAL_VAD_THRESHOLD=0.5
+  #     - LEIBNIZ_STT_LOCAL_VAD_MIN_SPEECH_MS=250
+  #     - LEIBNIZ_STT_LOCAL_VAD_SILENCE_TIMEOUT_MS=800
+  #     - LEIBNIZ_STT_LOCAL_PARTIAL_UPDATE_INTERVAL_MS=500
+  #     - DOCKER_ENVIRONMENT=true
+  #   depends_on:
+  #     redis:
+  #       condition: service_healthy
+  #   # networks:
+  #   #   - leibniz-network
+  #   restart: unless-stopped
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   stdin_open: true
+  #   tty: true
+  #   logging:
+  #     driver: "json-file"
+  #     options:
+  #       max-size: "100m"
+  #       max-file: "3"
 
 volumes:
-  redis_data:
-  tts_xtts_cache:
-  rag_index:
+  tara_task_redis_data:
+    name: tara-task-redis-data
+  tara_task_rag_index:
+    name: tara-task-rag-index
+  # tts_xtts_cache:  # COMMENTED OUT - Not needed for TARA
 
 networks:
-  leibniz-network:
-    name: services_leibniz-network
-    driver: bridge
-    external: false
+  tara-task-network:
+    name: tara-task-network
+    external: true

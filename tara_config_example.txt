@@ -1,0 +1,48 @@
+# TARA - Telugu TASK Customer Service Agent
+# Environment Variables Configuration
+# Copy this to .env and update with your API keys
+
+# ===========================================
+# API Keys (Required)
+# ===========================================
+GEMINI_API_KEY=your_gemini_api_key_here
+SARVAM_API_KEY=your_sarvam_api_key_here
+
+# ===========================================
+# TARA Configuration (Already set as defaults)
+# ===========================================
+# TARA_MODE=true
+# SKIP_INTENT_SERVICE=true
+# RESPONSE_LANGUAGE=te-mixed
+# ORGANIZATION_NAME=TASK
+# IGNORE_STT_WHILE_SPEAKING=true
+
+# ===========================================
+# Telugu Intro Greeting (Already set as default)
+# ===========================================
+# INTRO_GREETING=నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?
+
+# ===========================================
+# Knowledge Base (Optional - uses default)
+# ===========================================
+# TASK_KNOWLEDGE_BASE=./task_knowledge_base
+
+# ===========================================
+# Telugu TTS (Sarvam) Configuration
+# ===========================================
+# LEIBNIZ_SARVAM_SPEAKER=anushka
+# LEIBNIZ_SARVAM_LANGUAGE=te-IN
+# LEIBNIZ_SARVAM_MODEL=bulbul:v2
+
+# ===========================================
+# RAG Configuration
+# ===========================================
+# LEIBNIZ_RAG_RESPONSE_LANGUAGE=te-mixed
+# LEIBNIZ_RAG_ORGANIZATION=TASK
+# LEIBNIZ_RAG_AGENT_NAME=TARA
+# LEIBNIZ_RAG_ENABLE_HYBRID_SEARCH=true
+
+
+
+
+
