@@ -60,6 +60,7 @@ Expected output:
 
 #### Option B: Using curl (HTTP Endpoint)
 
+**ElevenLabs (tts-labs) - Port 2007:**
 ```bash
 # Test single text synthesis
 curl -X POST http://localhost:2007/api/v1/synthesize \
@@ -68,6 +69,32 @@ curl -X POST http://localhost:2007/api/v1/synthesize \
     "text": "Hello! This is a test of ElevenLabs ultra-low latency TTS.",
     "emotion": "helpful"
   }'
+```
+
+**Sarvam (tts-sarvam) - Port 2005:**
+```bash
+# Test single text synthesis
+curl -X POST http://localhost:2005/api/v1/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "Hello! This is a test of Sarvam TTS.",
+    "emotion": "helpful"
+  }'
+```
+
+**Save audio to file:**
+```bash
+# ElevenLabs - Save response to file
+curl -X POST http://localhost:2007/api/v1/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello! This is a test.", "emotion": "helpful"}' \
+  | jq -r '.audio' | base64 -d > elevenlabs_output.wav
+
+# Sarvam - Save response to file
+curl -X POST http://localhost:2005/api/v1/synthesize \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello! This is a test.", "emotion": "helpful"}' \
+  | jq -r '.audio' | base64 -d > sarvam_output.wav
 ```
 
 #### Option C: Using WebSocket (Direct)
