@@ -37,15 +37,6 @@ class TTSStreamingConfig:
     queue_max_size: int = 10  # Maximum sentences in queue
     inter_sentence_gap_ms: int = int(os.getenv("LEIBNIZ_TTS_INTER_SENTENCE_GAP_MS", "100"))
     
-    # Parallel synthesis settings
-    parallel_sentences: int = int(os.getenv("TTS_PARALLEL_SENTENCES", "3"))
-    warmup_on_start: bool = os.getenv("TTS_WARMUP_ON_START", "true").lower() == "true"
-    
-    # Connection pool settings
-    connection_limit: int = int(os.getenv("TTS_CONNECTION_LIMIT", "100"))
-    connection_limit_per_host: int = int(os.getenv("TTS_CONNECTION_LIMIT_PER_HOST", "20"))
-    keepalive_timeout: int = int(os.getenv("TTS_KEEPALIVE_TIMEOUT", "60"))
-    
     # Cache settings
     enable_cache: bool = True
     cache_dir: str = "/app/audio_cache"
@@ -54,12 +45,6 @@ class TTSStreamingConfig:
     
     # Streaming settings
     fastrtc_chunk_duration_ms: int = int(os.getenv("LEIBNIZ_TTS_FASTRTC_CHUNK_MS", "40"))
-
-    # Sarvam streaming settings
-    sarvam_min_buffer_size: int = int(os.getenv("SARVAM_MIN_BUFFER_SIZE", "50"))
-    sarvam_max_chunk_length: int = int(os.getenv("SARVAM_MAX_CHUNK_LENGTH", "200"))
-    sarvam_output_audio_codec: str = os.getenv("SARVAM_OUTPUT_AUDIO_CODEC", "mp3")
-    sarvam_output_audio_bitrate: str = os.getenv("SARVAM_OUTPUT_AUDIO_BITRATE", "128k")
     
     # Service settings
     timeout: float = 30.0
@@ -93,19 +78,7 @@ class TTSStreamingConfig:
             retry_delay=float(os.getenv("LEIBNIZ_TTS_RETRY_DELAY", "1.0")),
             port=int(os.getenv("TTS_STREAMING_PORT", "8025")),
             inter_sentence_gap_ms=int(os.getenv("LEIBNIZ_TTS_INTER_SENTENCE_GAP_MS", "100")),
-            fastrtc_chunk_duration_ms=int(os.getenv("LEIBNIZ_TTS_FASTRTC_CHUNK_MS", "40")),
-            # Parallel synthesis settings
-            parallel_sentences=int(os.getenv("TTS_PARALLEL_SENTENCES", "3")),
-            warmup_on_start=os.getenv("TTS_WARMUP_ON_START", "true").lower() == "true",
-            # Connection pool settings
-            connection_limit=int(os.getenv("TTS_CONNECTION_LIMIT", "100")),
-            connection_limit_per_host=int(os.getenv("TTS_CONNECTION_LIMIT_PER_HOST", "20")),
-            keepalive_timeout=int(os.getenv("TTS_KEEPALIVE_TIMEOUT", "60")),
-            # Sarvam streaming settings
-            sarvam_min_buffer_size=int(os.getenv("SARVAM_MIN_BUFFER_SIZE", "50")),
-            sarvam_max_chunk_length=int(os.getenv("SARVAM_MAX_CHUNK_LENGTH", "200")),
-            sarvam_output_audio_codec=os.getenv("SARVAM_OUTPUT_AUDIO_CODEC", "mp3"),
-            sarvam_output_audio_bitrate=os.getenv("SARVAM_OUTPUT_AUDIO_BITRATE", "128k")
+            fastrtc_chunk_duration_ms=int(os.getenv("LEIBNIZ_TTS_FASTRTC_CHUNK_MS", "40"))
         )
     
     def __post_init__(self):
@@ -124,24 +97,12 @@ class TTSStreamingConfig:
         
         if self.fastrtc_chunk_duration_ms <= 0:
             raise ValueError(f"Invalid fastrtc_chunk_duration_ms: {self.fastrtc_chunk_duration_ms}")
-
-        if self.sarvam_min_buffer_size <= 0:
-            raise ValueError(f"Invalid sarvam_min_buffer_size: {self.sarvam_min_buffer_size}")
-
-        if self.sarvam_max_chunk_length <= 0:
-            raise ValueError(f"Invalid sarvam_max_chunk_length: {self.sarvam_max_chunk_length}")
-
-        if self.sarvam_max_chunk_length < self.sarvam_min_buffer_size:
-            raise ValueError(f"sarvam_max_chunk_length ({self.sarvam_max_chunk_length}) must be >= sarvam_min_buffer_size ({self.sarvam_min_buffer_size})")
-
+        
         logger.info(
             f"TTS Streaming Config: model={self.sarvam_model}, speaker={self.sarvam_speaker}, "
             f"language={self.sarvam_language}, sample_rate={self.sample_rate}Hz, "
             f"queue_size={self.queue_max_size}, cache={self.enable_cache}, "
-            f"gap={self.inter_sentence_gap_ms}ms, chunk={self.fastrtc_chunk_duration_ms}ms, "
-            f"parallel_sentences={self.parallel_sentences}, warmup={self.warmup_on_start}, "
-            f"conn_limit={self.connection_limit}, keepalive={self.keepalive_timeout}s, "
-            f"streaming_buffer={self.sarvam_min_buffer_size}, max_chunk={self.sarvam_max_chunk_length}"
+            f"gap={self.inter_sentence_gap_ms}ms, chunk={self.fastrtc_chunk_duration_ms}ms"
         )
 
 

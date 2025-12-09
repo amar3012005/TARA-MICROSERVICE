@@ -35,9 +35,9 @@ class RAGConfig:
     Attributes:
         knowledge_base_path: Knowledge base directory path (required)
         vector_store_path: Vector store directory (default: /app/index)
-        embedding_model_name: HuggingFace model (default: sentence-transformers/all-MiniLM-L6-v2)
+        embedding_model_name: HuggingFace model (default: BAAI/bge-m3)
         gemini_api_key: Gemini API key for response generation
-        gemini_model: Gemini model name (default: gemini-2.0-flash-lite)
+        gemini_model: Gemini model name (default: gemini-2.5-flash-lite)
         top_k: Top-K candidates to retrieve (default: 8)
         top_n: Top-N documents after filtering (default: 5)
         similarity_threshold: Minimum similarity (default: 0.3)
@@ -60,15 +60,15 @@ class RAGConfig:
     
     # Vector store settings
     vector_store_path: str = "/app/index"
-    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model_name: str = "BAAI/bge-m3"  # Local high-quality embeddings (was: sentence-transformers/all-MiniLM-L6-v2)
     
     # Gemini settings
     gemini_model: str = "models/gemini-2.5-flash-lite"
     
     # Retrieval settings
-    top_k: int = 8
+    top_k: int = 10  # Increased for better recall (was 8)
     top_n: int = 5
-    similarity_threshold: float = 0.3
+    similarity_threshold: float = 0.25  # Lowered for better recall (was 0.3)
     
     # Chunking settings
     chunk_size_min: int = 500
@@ -85,12 +85,14 @@ class RAGConfig:
     
     # Cache settings
     cache_ttl: int = 3600
+    enable_embedding_cache: bool = field(default_factory=lambda: os.getenv("ENABLE_EMBEDDING_CACHE", "true").lower() == "true")
+    embedding_cache_ttl: int = field(default_factory=lambda: int(os.getenv("EMBEDDING_CACHE_TTL", "86400")))  # 24 hours
     
     # Prewarming settings
     enable_prewarming: bool = field(default_factory=lambda: os.getenv("ENABLE_PREWARMING", "true").lower() == "true")
     warmup_queries_count: int = field(default_factory=lambda: int(os.getenv("WARMUP_QUERIES_COUNT", "10")))
     enable_model_persistence: bool = field(default_factory=lambda: os.getenv("ENABLE_MODEL_PERSISTENCE", "true").lower() == "true")
-    prepopulate_cache: bool = field(default_factory=lambda: os.getenv("PREPOPULATE_CACHE", "true").lower() == "true")
+    prepopulate_cache: bool = field(default_factory=lambda: os.getenv("PREPOPULATE_CACHE", "false").lower() == "true")
 
     # Performance tuning
     gemini_timeout_ms: int = field(default_factory=lambda: int(os.getenv("GEMINI_TIMEOUT_MS", "5000")))
@@ -217,7 +219,7 @@ class RAGConfig:
         # Get API key - use default if not set or empty
         gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not gemini_api_key:
-            gemini_api_key = "AIzaSyBiKXVYsQ0UcxRicctFI1U5dEpQct2ieOA"
+            gemini_api_key = "AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw"
         
         return RAGConfig(
             # Required settings
@@ -234,7 +236,7 @@ class RAGConfig:
             ),
             embedding_model_name=os.getenv(
                 "TARA_RAG_EMBEDDING_MODEL",
-                os.getenv("LEIBNIZ_RAG_EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+                os.getenv("LEIBNIZ_RAG_EMBEDDING_MODEL", "BAAI/bge-m3")  # Local high-quality embeddings
             ),
             
             # Gemini settings

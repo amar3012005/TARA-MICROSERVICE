@@ -8,7 +8,7 @@ Supports TARA mode for Telugu TASK organization customer service agent.
 import os
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,17 @@ class OrchestratorConfig:
     # Ignore STT while speaking (prevents barge-in interference)
     ignore_stt_while_speaking: bool = os.getenv("IGNORE_STT_WHILE_SPEAKING", "true").lower() == "true"
     
+    # TTS Streaming Mode:
+    # - "buffered": Wait for complete sentences before sending to TTS (better prosody)
+    # - "continuous": Stream text chunks immediately (ultra-low latency, for ElevenLabs)
+    tts_streaming_mode: str = os.getenv("TTS_STREAMING_MODE", "buffered")
+    
+    # ElevenLabs TTS Configuration (for production ultra-low latency)
+    # When USE_ELEVENLABS_TTS=true, orchestrator uses direct ElevenLabs streaming
+    use_elevenlabs_tts: bool = os.getenv("USE_ELEVENLABS_TTS", "false").lower() == "true"
+    elevenlabs_tts_url: str = os.getenv("ELEVENLABS_TTS_URL", "http://tara-task-tts-labs:8006")
+    elevenlabs_prewarm_on_vad: bool = os.getenv("ELEVENLABS_PREWARM_ON_VAD", "true").lower() == "true"
+    
     # LLM (for future use)
     llm_provider: str = os.getenv("LLM_PROVIDER", "gemini")
     llm_api_key: str = os.getenv("LLM_API_KEY", os.getenv("GEMINI_API_KEY", ""))
@@ -69,6 +80,13 @@ class OrchestratorConfig:
     session_ttl_seconds: int = int(os.getenv("SESSION_TTL_SECONDS", "3600"))  # 1 hour
     max_concurrent_sessions: int = int(os.getenv("MAX_CONCURRENT_SESSIONS", "1000"))
     buffer_size: int = int(os.getenv("BUFFER_SIZE", "200"))
+    
+    # Dialogue Manager Configuration
+    timeout_seconds: int = int(os.getenv("TIMEOUT_SECONDS", "10"))  # 10 seconds timeout for no response
+    exit_keywords: List[str] = os.getenv(
+        "EXIT_KEYWORDS", 
+        "bye,exit,quit,goodbye,see you,thank you,thanks,stop,end"
+    ).split(",")  # Keywords that trigger exit dialogue
     
     # Latency targets (ms)
     intent_timeout_ms: int = int(os.getenv("INTENT_TIMEOUT_MS", "100"))
@@ -110,7 +128,17 @@ class OrchestratorConfig:
             logger.info(f"   Skip Intent Service: {self.skip_intent_service}")
             logger.info(f"   Skip Appointment Service: {self.skip_appointment_service}")
             logger.info(f"   Ignore STT While Speaking: {self.ignore_stt_while_speaking}")
+            logger.info(f"   TTS Streaming Mode: {self.tts_streaming_mode}")
             logger.info(f"   Intro: {self.intro_greeting[:50]}...")
+            logger.info("=" * 70)
+        
+        # Log ElevenLabs TTS configuration
+        if self.use_elevenlabs_tts:
+            logger.info("=" * 70)
+            logger.info("🎙️ ELEVENLABS TTS ENABLED - Ultra-low latency streaming")
+            logger.info(f"   TTS URL: {self.elevenlabs_tts_url}")
+            logger.info(f"   Prewarm on VAD: {self.elevenlabs_prewarm_on_vad}")
+            logger.info(f"   Streaming Mode: {self.tts_streaming_mode}")
             logger.info("=" * 70)
 
 

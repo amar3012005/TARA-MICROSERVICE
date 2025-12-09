@@ -574,19 +574,16 @@ Instructions:
     )
 
 
-async def accumulate_pre_llm_context(session_id: str, chunk_text: str, is_final: bool = False) -> dict:
+async def accumulate_text_chunks(session_id: str, chunk_text: str, is_final: bool = False) -> dict:
     """
-    Main accumulation function called for each chunk.
-    Performs all pre-LLM processing and stores in buffer.
+    Simple text accumulation function - only stores text chunks without API calls.
+    All processing (retrieval, extraction, prompt building) happens only when is_final=True.
+    This prevents wasting API tokens during incremental speech input.
     """
-    import re as regex_module
     accumulation_start_time = time.time()
     
     # Get existing buffer
     buffer_key = f"{INCREMENTAL_BUFFER_PREFIX}{session_id}"
-    logger.info(f"[PRE-LLM DEBUG] accumulate_pre_llm_context called for session: {session_id}")
-    logger.info(f"[PRE-LLM DEBUG] Buffer key: {buffer_key}")
-    logger.info(f"[PRE-LLM DEBUG] Chunk text: '{chunk_text[:50]}...' (is_final={is_final})")
     existing_buffer_raw = await app.state.redis.get(buffer_key)
     
     if existing_buffer_raw:
@@ -595,88 +592,22 @@ async def accumulate_pre_llm_context(session_id: str, chunk_text: str, is_final:
         buffer_data = {
             'chunks': [],
             'accumulated_text': '',
-            'relevance_scores': [],
-            'context': '',
-            'pattern': None,
-            'extracted_info': {},
-            'prompt_components': [],
-            'pre_built_prompt': None,
-            'processing_metadata': {
-                'chunk_count': 0,
-                'last_pattern_update': None,
-                'confidence_score': 0.0
-            },
-            'docs': [],
             'session_id': session_id,
             'last_updated': time.time()
         }
     
-    # Accumulate text
+    # Accumulate text only (no API calls)
     if 'chunks' not in buffer_data:
         buffer_data['chunks'] = []
     buffer_data['chunks'].append(chunk_text)
     buffer_data['accumulated_text'] = ' '.join(buffer_data['chunks'])
-    
-    if 'processing_metadata' not in buffer_data:
-        buffer_data['processing_metadata'] = {'chunk_count': 0, 'last_pattern_update': None, 'confidence_score': 0.0}
-    buffer_data['processing_metadata']['chunk_count'] += 1
-    
-    # 1. PATTERN DETECTION (Fast: 1-5ms)
-    pattern = detect_query_pattern(buffer_data['accumulated_text'])
-    buffer_data['pattern'] = pattern
-    buffer_data['processing_metadata']['confidence_score'] = pattern['confidence']
-    
-    # 2. DOCUMENT RETRIEVAL (50-200ms) - Only if text changed significantly
-    accumulated_text = buffer_data['accumulated_text']
-    if len(accumulated_text) > 10:  # Only retrieve if we have enough text
-        try:
-            # Use existing parallel retrieval
-            docs = await retrieve_documents_parallel(accumulated_text, None)
-            
-            # Build context from docs
-            context_parts = []
-            for i, doc in enumerate(docs[:5]):
-                content = doc.get('content', doc.get('chunk_text', doc.get('text', '')))
-                score = doc.get('similarity', doc.get('score', 0))
-                context_parts.append(f"[Doc {i+1}, Score: {score:.2f}]: {content[:500]}")
-            
-            buffer_data['context'] = '\n\n'.join(context_parts)
-            buffer_data['relevance_scores'] = [doc.get('similarity', doc.get('score', 0)) for doc in docs[:5]]
-            
-            # Merge with existing docs using smart buffering
-            if 'docs' not in buffer_data:
-                buffer_data['docs'] = []
-            buffer_data['docs'] = merge_and_deduplicate_docs(buffer_data.get('docs', []), docs)
-            
-        except Exception as e:
-            logger.warning(f"Document retrieval failed during accumulation: {e}")
-    
-    # 3. INFORMATION EXTRACTION (10-50ms)
-    docs_for_extraction = buffer_data.get('docs', [])
-    buffer_data['extracted_info'] = extract_template_fields(
-        accumulated_text,
-        docs_for_extraction,
-        pattern
-    )
-    
-    # 4. PROMPT CONSTRUCTION (5-15ms)
-    buffer_data['pre_built_prompt'] = build_incremental_prompt(
-        accumulated_text,
-        buffer_data['extracted_info'],
-        pattern,
-        buffer_data['context']
-    )
-    
-    # Store updated buffer
-    buffer_data['processing_metadata']['last_pattern_update'] = time.time()
     buffer_data['last_updated'] = time.time()
+    
+    # Store updated buffer (simple text accumulation)
     redis_set_result = await app.state.redis.setex(buffer_key, 300, json.dumps(buffer_data, ensure_ascii=False))  # 5 min TTL
     
     processing_time = (time.time() - accumulation_start_time) * 1000
-    logger.info(f"[PRE-LLM DEBUG] Redis SET result: {redis_set_result}")
-    logger.info(f"[PRE-LLM DEBUG] Stored pre_built_prompt: {bool(buffer_data.get('pre_built_prompt'))}")
-    logger.info(f"[PRE-LLM DEBUG] Prompt length: {len(buffer_data.get('pre_built_prompt', '')) if buffer_data.get('pre_built_prompt') else 0}")
-    logger.info(f"🔄 Pre-LLM accumulation completed in {processing_time:.1f}ms for session {session_id}")
+    logger.debug(f"📝 Text chunk accumulated for session {session_id} in {processing_time:.1f}ms")
     
     return buffer_data
 
@@ -771,17 +702,14 @@ async def process_chunk_parallel(session_id: str, chunk_text: str, context: Opti
 async def retrieve_documents_parallel(query_text: str, context: Optional[Dict] = None) -> List[Dict]:
     """
     Parallel document retrieval optimized for Telugu text and incremental chunks.
+    Uses cached embeddings for 100-150ms latency reduction on repeated queries.
     """
     try:
         # Telugu-aware query enrichment
         enriched_query = enrich_telugu_query(query_text, context)
 
-        # Async embedding (runs in thread pool)
-        loop = asyncio.get_running_loop()
-        query_embedding = await loop.run_in_executor(
-            None,
-            lambda: app.state.rag_engine.embeddings.embed_query(enriched_query)
-        )
+        # Async embedding WITH CACHING (major latency optimization)
+        query_embedding = await app.state.rag_engine._embed_with_cache(enriched_query)
 
         # Prepare for FAISS search
         import numpy as np
@@ -1171,12 +1099,14 @@ async def lifespan(app: FastAPI):
         
         # If index not loaded, try to build it
         if not rag_engine.vector_store or not rag_engine.documents:
-            logger.warning("⚠️ FAISS index not found, attempting to build...")
+            logger.info("🔨 Building FAISS index (this may take a few minutes on first run)...")
             from leibniz_agent.services.rag.index_builder import IndexBuilder
             builder = IndexBuilder(config)
+            build_start = time.time()
             if builder.build_index():
                 rag_engine.load_index()  # Reload after build
-                logger.info(f"✅ Index built successfully: {len(rag_engine.documents)} documents")
+                build_time = time.time() - build_start
+                logger.info(f"✅ Index built successfully: {len(rag_engine.documents)} documents in {build_time:.1f}s")
             else:
                 logger.error("❌ Index build failed")
         
@@ -1240,6 +1170,11 @@ async def lifespan(app: FastAPI):
         app.state.cache_hits = cache_hits
         app.state.cache_misses = cache_misses
         app.state.start_time = app_start_time
+        
+        # Inject Redis client into RAG engine for embedding caching
+        if redis_client:
+            rag_engine.set_redis_client(redis_client)
+            logger.info("✅ Redis client injected into RAG engine for embedding caching")
         
         logger.info("=" * 70)
         logger.info("✅ RAG SERVICE FULLY PREWARMED AND READY")
@@ -1389,7 +1324,9 @@ async def stream_query_knowledge_base(request: QueryRequest):
             result = json.loads(cached)
             answer = result.get('answer', '')
             
-            logger.info(f" CACHE HIT (Streaming): {request.query[:50]}...")
+            logger.info(f"✅ CACHE HIT (Streaming): {request.query[:50]}...")
+            logger.info(f"📤 Complete cached response:")
+            logger.info(f"   {answer}")
             
             # Stream the cached answer in chunks to simulate natural typing/speech
             chunk_size = 20
@@ -1410,6 +1347,7 @@ async def stream_query_knowledge_base(request: QueryRequest):
         
         # Container for the full result to cache later
         full_result_container = {}
+        accumulated_response = ""  # Track complete response for logging
         
         def callback(text, is_final):
             loop.call_soon_threadsafe(q.put_nowait, (text, is_final))
@@ -1440,7 +1378,13 @@ async def stream_query_knowledge_base(request: QueryRequest):
             if item is None:
                 break
             text, is_final = item
+            accumulated_response += text  # Accumulate for logging
             yield json.dumps({"text": text, "is_final": is_final}) + "\n"
+            
+        # Log complete response after streaming finishes
+        if accumulated_response:
+            logger.info(f"📤 Complete streaming response for query '{request.query[:50]}...':")
+            logger.info(f"   {accumulated_response}")
             
         # After streaming is done, cache the result if we have it
         if 'data' in full_result_container and app.state.redis:
@@ -1488,170 +1432,128 @@ async def incremental_query(request: IncrementalQueryRequest):
     try:
         if not request.is_final:
             # =================================================================
-            # PRE-LLM ACCUMULATION PHASE - Do all pre-LLM work during speech
+            # TRUE PARALLEL PHASE: Accumulate text AND retrieve docs in background
             # =================================================================
-            logger.info(f"⚡ PRE-LLM ACCUMULATION: Processing chunk for {request.session_id}: '{request.text[:30]}...'")
+            logger.debug(f"📝 Parallel processing chunk for {request.session_id}: '{request.text[:30]}...'")
 
-            # Fire-and-forget: Start background pre-LLM accumulation
-            # This does pattern detection, retrieval, extraction, and prompt building
+            # 1. Accumulate text (fast, synchronous)
+            buffer_data = await accumulate_text_chunks(
+                session_id=request.session_id,
+                chunk_text=request.text,
+                is_final=False
+            )
+            
+            # 2. Spawn background task for parallel document retrieval (NON-BLOCKING)
+            # This populates the Smart Buffer while user is still speaking
+            chunk_count = len(buffer_data.get('chunks', []))
             asyncio.create_task(
-                accumulate_pre_llm_context(
+                process_chunk_parallel(
                     session_id=request.session_id,
                     chunk_text=request.text,
-                    is_final=False
+                    context=request.context,
+                    sequence_number=chunk_count
                 )
             )
+            logger.debug(f"🚀 Background retrieval task spawned for chunk {chunk_count}")
 
-            # Return immediately - don't wait for processing
+            # Return immediately - processing continues in background
             return IncrementalBufferResponse(
-                status="buffering",
+                status="parallel_processing",
                 session_id=request.session_id,
-                docs_retrieved=0,  # Will be updated asynchronously
-                buffer_size_chars=0,  # Will be updated asynchronously
+                docs_retrieved=0,  # Docs being retrieved in background
+                buffer_size_chars=len(buffer_data.get('accumulated_text', '')),
                 timing_ms=(time.time() - start_time) * 1000,
-                message="Chunk queued for pre-LLM accumulation"
+                message=f"Chunk {chunk_count} queued for parallel retrieval"
             )
         
         else:
             # =================================================================
-            # TRUE PARALLEL GENERATION PHASE: Use smart buffered context
+            # FINAL GENERATION PHASE: Process accumulated text once
             # =================================================================
-            logger.info(f"🚀 TRUE PARALLEL: Final generation for {request.session_id}: '{request.text[:30]}...'")
+            logger.info(f"🚀 Final generation for {request.session_id}: '{request.text[:30]}...'")
 
-            async def generate_from_smart_buffer():
+            async def generate_from_accumulated_text():
                 """
-                OPTIMIZED: Generate response using pre-accumulated context.
-                Fast path when pre-built prompt is available.
+                Process accumulated text using PRE-RETRIEVED documents from parallel processing.
+                Falls back to fresh retrieval only if no buffered docs exist.
                 """
                 gen_start = time.time()
 
-                # Get smart buffered documents with pre-computed data
-                buffer_key_debug = f"{INCREMENTAL_BUFFER_PREFIX}{request.session_id}"
-                logger.info(f"[PRE-LLM DEBUG] Final generation - Looking for cached prompt")
-                logger.info(f"[PRE-LLM DEBUG] Session ID: {request.session_id}")
-                logger.info(f"[PRE-LLM DEBUG] Buffer key being searched: {buffer_key_debug}")
-                
+                # Get accumulated text AND pre-retrieved docs from Smart Buffer
                 buffer = await get_incremental_buffer(request.session_id)
-                logger.info(f"[PRE-LLM DEBUG] Buffer found: {buffer is not None}")
                 
-                if buffer:
-                    buffered_docs = buffer.get('docs', [])
-                    chunks_processed = buffer.get('chunks_processed', buffer.get('processing_metadata', {}).get('chunk_count', 0))
-                    total_chars = buffer.get('total_chars', len(buffer.get('accumulated_text', '')))
-                    pre_built_prompt = buffer.get('pre_built_prompt')
-                    
-                    logger.info(f"[PRE-LLM DEBUG] Pre-built prompt found: {bool(pre_built_prompt)}")
-                    logger.info(f"[PRE-LLM DEBUG] Prompt length: {len(pre_built_prompt) if pre_built_prompt else 0}")
-                    logger.info(f"📊 Using smart buffer: {len(buffered_docs)} docs, {chunks_processed} chunks, pre-built prompt: {bool(pre_built_prompt)}")
-                else:
-                    buffered_docs = []
-                    pre_built_prompt = None
-                    logger.warning(f"[PRE-LLM DEBUG] ⚠️ No smart buffer found for {request.session_id}")
+                # Use final query text (may differ from accumulated)
+                query_text = request.text.strip()
+                if buffer and buffer.get('accumulated_text'):
+                    # Prefer accumulated text if final text is empty or very short
+                    if len(query_text) < 10:
+                        query_text = buffer.get('accumulated_text', '').strip()
+                    else:
+                        # Use final text, but accumulated might have more context
+                        query_text = request.text.strip()
+                
+                logger.info(f"📊 Processing final query: '{query_text[:50]}...' (length: {len(query_text)})")
 
-                # FAST PATH: Use pre-built prompt if available
-                if pre_built_prompt:
+                # TRUE PARALLEL OPTIMIZATION: Use pre-retrieved docs if available
+                try:
+                    # Check for pre-retrieved docs from parallel processing
+                    buffered_docs = buffer.get('docs', []) if buffer else []
+                    
+                    if buffered_docs and len(buffered_docs) >= 3:
+                        # Use buffered docs (saves ~100-200ms retrieval time!)
+                        docs = buffered_docs
+                        logger.info(f"⚡ Using {len(docs)} PRE-RETRIEVED docs from Smart Buffer (parallel win!)")
+                    else:
+                        # Fallback: Fresh retrieval (first query or buffer miss)
+                        docs = await retrieve_documents_parallel(query_text, request.context)
+                        logger.info(f"📚 Fresh retrieval: {len(docs)} documents")
+                    
+                    # 2. Pattern detection
+                    pattern = detect_query_pattern(query_text)
+                    
+                    # 3. Information extraction
+                    extracted_info = extract_template_fields(query_text, docs, pattern)
+                    
+                    # 4. Build context from docs
+                    context_parts = []
+                    for i, doc in enumerate(docs[:5]):
+                        content = doc.get('content', doc.get('chunk_text', doc.get('text', '')))
+                        score = doc.get('similarity', doc.get('score', 0))
+                        context_parts.append(f"[Doc {i+1}, Score: {score:.2f}]: {content[:500]}")
+                    context = '\n\n'.join(context_parts)
+                    
+                    # 5. Build prompt
+                    prompt = build_incremental_prompt(query_text, extracted_info, pattern, context)
+                    
                     prep_time = (time.time() - gen_start) * 1000
-                    logger.info(f"[PRE-LLM DEBUG] ✅ FAST PATH ACTIVATED - Using pre-built prompt!")
-                    logger.info(f"🚀 FAST PATH: Using pre-built prompt, prep time: {prep_time:.1f}ms")
+                    logger.info(f"⚡ Prompt built in {prep_time:.1f}ms, starting generation...")
                     
-                    # Check if final query differs from accumulated text
-                    accumulated_text = buffer.get('accumulated_text', '')
-                    if request.text and request.text.strip() != accumulated_text.strip():
-                        # Re-build prompt with final query (quick operation)
-                        logger.info("Re-building prompt with final query text")
-                        pattern = buffer.get('pattern', {'type': 'general'})
-                        extracted_info = buffer.get('extracted_info', {})
-                        context = buffer.get('context', '')
-                        pre_built_prompt = build_incremental_prompt(
-                            request.text,
-                            extracted_info,
-                            pattern,
-                            context
-                        )
-                    
-                    # Direct LLM generation with pre-built prompt
-                    # First, send a metadata chunk indicating fast path
-                    yield json.dumps({"text": "", "is_final": False, "cached": True, "fast_path": True}) + "\n"
-                    
-                    async for chunk in generate_with_prompt(pre_built_prompt):
-                        yield json.dumps({"text": chunk, "is_final": False}) + "\n"
-                    
-                    yield json.dumps({"text": "", "is_final": True, "cached": True}) + "\n"
-                    
-                    # Clean up smart buffer after generation
+                except Exception as e:
+                    logger.error(f"❌ Error during processing: {e}")
+                    # Fallback to standard RAG processing
+                    logger.info("⚠️ Falling back to standard RAG processing")
+                    result = await app.state.rag_engine.process_query(
+                        query_text,
+                        request.context,
+                        streaming_callback=None
+                    )
+                    yield json.dumps({"text": result.get('answer', ''), "is_final": True}) + "\n"
                     await clear_incremental_buffer(request.session_id)
-                    
-                    gen_ms = (time.time() - gen_start) * 1000
-                    logger.info(f"✅ FAST PATH generation complete for {request.session_id} in {gen_ms:.0f}ms")
                     return
-
-                # FALLBACK: Standard processing if no pre-built prompt
-                logger.info("[PRE-LLM DEBUG] ❌ FALLBACK PATH - No pre-built prompt available")
-                logger.info("⚠️ FALLBACK: No pre-built prompt, using standard processing")
                 
-                # Parallel generation with streaming
-                q = asyncio.Queue()
-                loop = asyncio.get_running_loop()
-                full_result = {}
-
-                def streaming_callback(text, is_final):
-                    """Streaming callback for incremental text generation"""
-                    loop.call_soon_threadsafe(q.put_nowait, (text, is_final))
-
-                async def run_parallel_generation():
-                    try:
-                        # Use smart buffered context for Telugu-aware generation
-                        if buffered_docs:
-                            # Build enriched context from smart buffer
-                            context_docs = buffered_docs[:app.state.rag_engine.config.top_n]
-                            context_text = build_telugu_context(context_docs)
-                            sources = extract_sources_from_buffer(buffered_docs)
-
-                            logger.info(f"🌐 Generating with {len(context_docs)} smart buffered docs")
-
-                            # Telugu-aware generation with pre-buffered context
-                            result = await generate_with_buffered_context(
-                                query=request.text,
-                                context_docs=context_docs,
-                                context_text=context_text,
-                                intent_context=request.context,
-                                streaming_callback=streaming_callback
-                            )
-                        else:
-                            # Fallback to standard generation
-                            logger.warning("Falling back to standard generation (no buffer)")
-                            result = await app.state.rag_engine.process_query(
-                                request.text,
-                                request.context,
-                                streaming_callback=streaming_callback
-                            )
-
-                        full_result['data'] = result
-
-                    except Exception as e:
-                        logger.error(f"❌ Parallel generation error: {e}")
-                        loop.call_soon_threadsafe(q.put_nowait, (f"తప్పు: {str(e)}", True))
-                    finally:
-                        await q.put(None)  # Sentinel
-
-                # Start parallel generation immediately
-                asyncio.create_task(run_parallel_generation())
-
-                # Stream results as they become available
-                while True:
-                    item = await q.get()
-                    if item is None:
-                        break
-                    text, is_final = item
-                    yield json.dumps({"text": text, "is_final": is_final}) + "\n"
-
-                # Clean up smart buffer after generation
+                # Generate with built prompt
+                async for chunk in generate_with_prompt(prompt):
+                    yield json.dumps({"text": chunk, "is_final": False}) + "\n"
+                
+                yield json.dumps({"text": "", "is_final": True}) + "\n"
+                
+                # Clean up buffer after generation
                 await clear_incremental_buffer(request.session_id)
-
+                
                 gen_ms = (time.time() - gen_start) * 1000
-                logger.info(f"✅ TRUE PARALLEL generation complete for {request.session_id} in {gen_ms:.0f}ms")
+                logger.info(f"✅ Generation complete for {request.session_id} in {gen_ms:.0f}ms")
 
-            return StreamingResponse(generate_from_smart_buffer(), media_type="application/x-ndjson")
+            return StreamingResponse(generate_from_accumulated_text(), media_type="application/x-ndjson")
     
     except Exception as e:
         logger.error(f"❌ Incremental query error: {e}", exc_info=True)

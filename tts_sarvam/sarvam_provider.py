@@ -15,9 +15,8 @@ import asyncio
 import logging
 import base64
 import json
-import time
 import unicodedata
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List
 
 try:
     import aiohttp
@@ -115,99 +114,27 @@ class SarvamProvider:
         )
 
     async def _ensure_session(self):
-        """Create optimized aiohttp session if not exists"""
+        """Create aiohttp session if not exists"""
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(
-                total=30,
-                connect=5,  # Fast connection timeout
-                sock_read=15  # Socket read timeout
-            )
-            connector = aiohttp.TCPConnector(
-                limit=100,  # Max concurrent connections
-                limit_per_host=20,  # Per-host limit for Sarvam API
-                ttl_dns_cache=300,  # DNS cache TTL
-                keepalive_timeout=60,  # Keep connections alive longer
-                enable_cleanup_closed=True
-            )
-            self.session = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout
-            )
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
+            self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
-    async def warmup(self) -> Dict[str, Any]:
+    async def warmup(self):
         """
         Pre-warm the connection to Sarvam API.
-        Returns warmup statistics.
+        Establishes SSL/TCP connection to avoid handshake latency on first request.
         """
         logger.info("🔥 Pre-warming Sarvam API connection...")
-        stats = {"warmup_time_ms": 0, "success": False}
-        start = time.time()
-        
         try:
             await self._ensure_session()
-            
-            # Send warmup request with minimal text
-            warmup_text = "Hello"
-            audio = await self.synthesize(
-                text=warmup_text,
-                speaker=self.speaker,
-                language=self.language
-            )
-            
-            stats["warmup_time_ms"] = (time.time() - start) * 1000
-            stats["success"] = True
-            stats["audio_bytes"] = len(audio)
-            
-            logger.info(f"✅ Sarvam API warmed up in {stats['warmup_time_ms']:.0f}ms")
+            # Send a lightweight OPTIONS or dummy request if possible, 
+            # but just opening the session/connector is often enough for DNS/TCP.
+            # We'll synthesize a single character to force full SSL handshake.
+            await self.synthesize(text="Hello", speaker=self.speaker, language=self.language)
+            logger.info("✅ Sarvam API connection warmed up and ready!")
         except Exception as e:
-            stats["warmup_time_ms"] = (time.time() - start) * 1000
-            stats["error"] = str(e)
             logger.warning(f"⚠️ Warmup failed (non-critical): {e}")
-        
-        return stats
-
-    async def synthesize_parallel(
-        self,
-        texts: List[str],
-        max_concurrent: int = 3,
-        **kwargs
-    ) -> List[Tuple[bytes, float]]:
-        """
-        Synthesize multiple texts in parallel.
-        
-        Args:
-            texts: List of texts to synthesize
-            max_concurrent: Maximum concurrent requests (default 3)
-            **kwargs: Pass-through to synthesize()
-        
-        Returns:
-            List of tuples (audio_bytes, duration_ms)
-        """
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def synthesize_with_limit(text: str, index: int):
-            async with semaphore:
-                start = time.time()
-                audio = await self.synthesize(text, **kwargs)
-                duration_ms = (time.time() - start) * 1000
-                return (index, audio, duration_ms)
-        
-        tasks = [
-            synthesize_with_limit(text, i)
-            for i, text in enumerate(texts)
-        ]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Sort by original index and filter errors
-        ordered = []
-        for result in sorted(results, key=lambda x: x[0] if not isinstance(x, Exception) else float('inf')):
-            if isinstance(result, Exception):
-                logger.error(f"Parallel synthesis error: {result}")
-                continue
-            ordered.append((result[1], result[2]))
-        
-        return ordered
 
     async def synthesize(
         self,

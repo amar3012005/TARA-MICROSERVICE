@@ -1,0 +1,69 @@
+version: '3.8'
+
+services:
+  gemini-live-experiment:
+    build:
+      context: .
+      dockerfile: gemini_live_experiment/Dockerfile
+    container_name: gemini-live-experiment
+    ports:
+      - "8027:8001"
+      - "7862:7860"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - STT_VAD_HOST=0.0.0.0
+      - STT_VAD_PORT=8001
+      - FAST_RTC_PORT=7860
+      - REDIS_HOST=experiment-redis
+      - REDIS_PORT=6381
+      - TARA_REDIS_HOST=experiment-redis
+      - TARA_REDIS_PORT=6381
+      - TARA_REDIS_DB=0
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
+      # RAG Disabled for simple experiment
+      # - RAG_SERVICE_URL=http://tara-task-rag:8003
+      - DOCKER_ENVIRONMENT=true
+    depends_on:
+      - redis
+    networks:
+      - experiment-network
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  redis:
+    image: redis:7-alpine
+    container_name: experiment-redis
+    ports:
+      - "6382:6381"  # Port 6382 to avoid conflict with existing redis on 6381
+    volumes:
+      - experiment_redis_data:/data
+    command: redis-server --appendonly yes --port 6381 --bind 0.0.0.0
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6381", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - experiment-network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+volumes:
+  experiment_redis_data:
+    name: experiment-redis-data
+
+networks:
+  experiment-network:
+    driver: bridge

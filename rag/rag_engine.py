@@ -77,15 +77,21 @@ class RAGEngine:
         self.query_count = 0
         self.total_query_time = 0.0
         
+        # Embedding cache (Redis client injected by app.py)
+        self.redis_client = None  # Set by app.py after initialization
+        self._local_embedding_cache: Dict[str, List[float]] = {}  # In-memory fallback cache
+        self._embedding_cache_hits = 0
+        self._embedding_cache_misses = 0
+        
         # HYBRID APPROACH: Rule-based patterns for instant context reduction
         # Reduces Gemini token count by 50-70% for common queries
         # CUSTOMIZED FOR TASK ORGANIZATION BASED ON KNOWLEDGE BASE
         self.quick_answer_patterns = {
             "organization_info": {
-                "keywords": ["what is task", "about task", "task organization", "telangana academy", "task academy", "mission", "vision", "history", "established", "government organization"],
+                "keywords": ["what is task", "about task", "task organization", "telangana academy", "task academy", "mission", "vision", "history", "established", "founded", "background", "government organization"],
                 "response_template": "T.A.S.K (Telangana Academy for Skill and Knowledge) is a {description}. {additional_info}",
-                "faiss_boost": ["organization_overview", "general_information", "mission_vision"],
-                "max_context_chars": 2500,
+                "faiss_boost": ["organization_overview", "general_information", "mission_vision", "history_establishment"],
+                "max_context_chars": 3000,
                 "priority": 1
             },
             "contact_info": {
@@ -124,10 +130,10 @@ class RAGEngine:
                 "priority": 2
             },
             "placement_stats": {
-                "keywords": ["placement", "placement rate", "job placement", "hiring", "companies", "salary", "average salary", "highest package", "placement statistics", "career"],
+                "keywords": ["placement", "placement rate", "job placement", "hiring", "companies", "salary", "average salary", "highest package", "placement statistics", "career", "jobs", "job opportunities", "openings", "vacancies", "recruitment"],
                 "response_template": "T.A.S.K placement statistics: {stats}. {additional_info}",
                 "faiss_boost": ["placement_career", "placement_statistics"],
-                "max_context_chars": 2800,
+                "max_context_chars": 3000,
                 "priority": 2
             },
             "available_programs": {
@@ -226,11 +232,11 @@ class RAGEngine:
                 "keywords": [
                     "placement", "ప్లేస్మెంట్", "placement rate", "ప్లేస్మెంట్ రేట్", "job placement", "జాబ్ ప్లేస్మెంట్",
                     "companies", "కంపెనీలు", "salary", "సెలరీ", "average salary", "అవరేజ్ సెలరీ",
-                    "highest package", "హైయెస్ట్ ప్యాకేజ్", "hiring", "హైరింగ్", "career", "కెరీర్"
+                    "jobs", "జాబ్స్", "opportunities", "అవకాశాలు", "openings", "ఓపెనింగ్స్", "hiring", "హైరింగ్"
                 ],
                 "response_template": "T.A.S.K ప్లేస్మెంట్ స్టాటిస్టిక్స్: {stats}. {additional_info}",
                 "faiss_boost": ["placement_career", "placement_statistics"],
-                "max_context_chars": 2800,
+                "max_context_chars": 3000,
                 "priority": 2
             },
             "task_documents": {
@@ -271,6 +277,117 @@ class RAGEngine:
         # Load index
         self.load_index()
 
+    def set_redis_client(self, redis_client):
+        """Inject Redis client for embedding caching (called by app.py after startup)."""
+        self.redis_client = redis_client
+        logger.info("✅ Redis client injected for embedding caching")
+
+    async def _embed_with_cache(self, text: str) -> List[float]:
+        """
+        Generate embedding with Redis caching for 100-150ms latency reduction.
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector as list of floats
+        """
+        # Generate cache key
+        cache_key = f"rag:emb:{hashlib.md5(text.encode()).hexdigest()}"
+        
+        # Check local in-memory cache first (fastest)
+        if cache_key in self._local_embedding_cache:
+            self._embedding_cache_hits += 1
+            logger.debug(f"⚡ Embedding cache HIT (local): {text[:30]}...")
+            return self._local_embedding_cache[cache_key]
+        
+        # Check Redis cache (if available and enabled)
+        if self.redis_client and self.config.enable_embedding_cache:
+            try:
+                cached = await self.redis_client.get(cache_key)
+                if cached:
+                    self._embedding_cache_hits += 1
+                    embedding = json.loads(cached)
+                    # Store in local cache for faster subsequent access
+                    self._local_embedding_cache[cache_key] = embedding
+                    logger.debug(f"⚡ Embedding cache HIT (Redis): {text[:30]}...")
+                    return embedding
+            except Exception as e:
+                logger.warning(f"⚠️ Redis embedding cache read failed: {e}")
+        
+        # Cache miss - generate embedding locally
+        self._embedding_cache_misses += 1
+        start_time = time.time()
+        
+        # Run embedding in thread pool (non-blocking)
+        loop = asyncio.get_running_loop()
+        embedding = await loop.run_in_executor(
+            None,
+            lambda: self.embeddings.embed_query(text)
+        )
+        
+        embed_time = (time.time() - start_time) * 1000
+        logger.debug(f"🔄 Embedding generated in {embed_time:.1f}ms: {text[:30]}...")
+        
+        # Store in local cache
+        self._local_embedding_cache[cache_key] = embedding
+        
+        # Store in Redis cache (if available and enabled)
+        if self.redis_client and self.config.enable_embedding_cache:
+            try:
+                await self.redis_client.setex(
+                    cache_key,
+                    self.config.embedding_cache_ttl,  # 24 hours default
+                    json.dumps(embedding)
+                )
+            except Exception as e:
+                logger.warning(f"⚠️ Redis embedding cache write failed: {e}")
+        
+        return embedding
+
+    def _embed_with_cache_sync(self, text: str) -> List[float]:
+        """
+        Synchronous version of embedding with local cache only.
+        For use in non-async contexts (retrieval functions).
+        
+        Args:
+            text: Text to embed
+            
+        Returns:
+            Embedding vector as list of floats
+        """
+        # Generate cache key
+        cache_key = f"rag:emb:{hashlib.md5(text.encode()).hexdigest()}"
+        
+        # Check local in-memory cache first (fastest)
+        if cache_key in self._local_embedding_cache:
+            self._embedding_cache_hits += 1
+            logger.debug(f"⚡ Embedding cache HIT (local-sync): {text[:30]}...")
+            return self._local_embedding_cache[cache_key]
+        
+        # Cache miss - generate embedding locally
+        self._embedding_cache_misses += 1
+        start_time = time.time()
+        embedding = self.embeddings.embed_query(text)
+        embed_time = (time.time() - start_time) * 1000
+        logger.debug(f"🔄 Embedding generated (sync) in {embed_time:.1f}ms: {text[:30]}...")
+        
+        # Store in local cache
+        self._local_embedding_cache[cache_key] = embedding
+        
+        return embedding
+
+    def get_embedding_cache_stats(self) -> Dict[str, Any]:
+        """Get embedding cache statistics."""
+        total = self._embedding_cache_hits + self._embedding_cache_misses
+        hit_rate = self._embedding_cache_hits / total if total > 0 else 0.0
+        return {
+            "hits": self._embedding_cache_hits,
+            "misses": self._embedding_cache_misses,
+            "hit_rate": round(hit_rate, 3),
+            "local_cache_size": len(self._local_embedding_cache)
+        }
+
     async def warmup_embeddings(self):
         """Pre-warm sentence transformer to avoid first-query latency"""
         logger.info("🔥 Pre-warming sentence transformer...")
@@ -304,33 +421,18 @@ class RAGEngine:
             logger.warning(f"⚠️ Embedding warmup failed: {e}")
 
     async def warmup_gemini(self):
-        """Pre-warm Gemini model with a test generation"""
+        """
+        Pre-warm Gemini model - DISABLED to prevent API quota exhaustion.
+        Model initialization is sufficient for warmup, no API call needed.
+        """
         if not self.gemini_model:
             return
             
-        logger.info("🔥 Pre-warming Gemini model...")
-        start_time = time.time()
+        logger.info("🔥 Gemini model warmup skipped (API call disabled to prevent quota exhaustion)")
+        logger.info("✅ Gemini model initialized and ready (no API warmup call made)")
         
-        try:
-            # Simple warmup query in Telugu-English mixed
-            warmup_prompt = "నమస్కారం, TASK కస్టమర్ సర్వీస్ ఏజెంట్ TARA ఇక్కడ ఉన్నాను. మీకు ఎలా సహాయం చేయగలను?"
-            
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.gemini_model.generate_content(
-                    warmup_prompt,
-                    generation_config=genai.types.GenerationConfig(
-                        temperature=0.1,
-                        max_output_tokens=10
-                    )
-                )
-            )
-            
-            warmup_time = (time.time() - start_time) * 1000
-            logger.info(f"✅ Gemini model warmed up in {warmup_time:.0f}ms")
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Gemini warmup failed: {e}")
+        # NOTE: Removed API call to prevent quota exhaustion on free tier
+        # The model is already initialized and ready to use without warmup API call
 
     def enable_model_persistence(self):
         """Enable model persistence to avoid reloads"""
@@ -391,6 +493,30 @@ class RAGEngine:
             # Load FAISS index
             self.vector_store = faiss.read_index(index_path)
             
+            # CRITICAL: Validate embedding dimension matches current model
+            # BGE-M3 = 1024 dims, all-MiniLM-L6-v2 = 384 dims
+            expected_dim = len(self.embeddings.embed_query("test"))
+            actual_dim = self.vector_store.d
+            
+            if expected_dim != actual_dim:
+                logger.warning(
+                    f"⚠️ FAISS DIMENSION MISMATCH detected: "
+                    f"Index has {actual_dim} dimensions, but current embedding model ({self.config.embedding_model_name}) "
+                    f"produces {expected_dim} dimensions. Auto-deleting old index for rebuild..."
+                )
+                # Auto-delete old index files to trigger clean rebuild
+                self.vector_store = None
+                try:
+                    import shutil
+                    for old_file in [index_path, metadata_path, texts_path]:
+                        if os.path.exists(old_file):
+                            os.remove(old_file)
+                            logger.info(f"🗑️ Deleted old index file: {os.path.basename(old_file)}")
+                    logger.info("✅ Old index files removed - will rebuild automatically on startup")
+                except Exception as e:
+                    logger.error(f"⚠️ Failed to delete old index files: {e}")
+                return False
+            
             # Load metadata and texts
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 self.doc_metadata = json.load(f)
@@ -398,7 +524,7 @@ class RAGEngine:
             with open(texts_path, 'r', encoding='utf-8') as f:
                 self.documents = json.load(f)
             
-            logger.info(f" Loaded FAISS index: {len(self.documents)} documents")
+            logger.info(f"✅ Loaded FAISS index: {len(self.documents)} documents (dim={actual_dim})")
             return True
         
         except Exception as e:
@@ -613,9 +739,9 @@ class RAGEngine:
             entity_terms = ' '.join([f"{k} {v}" for k, v in entities.items()])
             enriched_query = f"{enriched_query} {entity_terms}"
         
-        # Embed query
+        # Embed query (with local cache for repeated queries)
         embed_start = time.time()
-        query_embedding = self.embeddings.embed_query(enriched_query)
+        query_embedding = self._embed_with_cache_sync(enriched_query)
         query_embedding = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
         timing['embedding_ms'] = (time.time() - embed_start) * 1000
         
@@ -1083,12 +1209,13 @@ class RAGEngine:
         template = pattern["response_template"]
         pattern_name = pattern["name"]
         
-        # Build compact context summary (only essential info)
+        # Build context summary from ALL retrieved docs (already truncated by _retrieve_with_boosting)
         context_summary = ""
         if retrieved_docs:
-            # Take first 300 chars of top doc (increased for better context)
-            top_doc_text = retrieved_docs[0].get('text', '')[:300]
-            context_summary = f"\nKey information: {top_doc_text}..."
+            # Use full text from all retrieved docs (max_context_chars already enforced by retrieval)
+            all_docs_text = "\n\n".join([doc.get('text', '') for doc in retrieved_docs])
+            context_summary = f"\nKey information from knowledge base:\n{all_docs_text}"
+            logger.debug(f"📚 Hybrid context: {len(all_docs_text)} chars from {len(retrieved_docs)} docs")
         
         # Determine language instruction based on config and context
         language_instruction = ""
@@ -1352,8 +1479,14 @@ Response:"""
                         # Generate response with compact prompt
                         gen_start = time.time()
                         
+                        # DEBUG: Log the final prompt being sent to LLM
+                        logger.debug(f"📋 HYBRID PROMPT ({len(prompt)} chars):\n{prompt[:500]}...")
+                        logger.info(f"📋 Hybrid prompt: {len(prompt)} chars, {len(relevant_docs)} docs retrieved")
+                        
                         if streaming_callback:
-                            # Streaming generation for Hybrid Path
+                            # Streaming generation for Hybrid Path (LOW LATENCY)
+                            # IMPORTANT: Stream chunks immediately instead of waiting for full sentences.
+                            # This dramatically reduces Time To First Byte (TTFB).
                             accumulated_text = ""
                             try:
                                 response_stream = self.gemini_model.generate_content(
@@ -1366,36 +1499,40 @@ Response:"""
                                     stream=True
                                 )
                                 
-                                sentence_buffer = ""
                                 for chunk in response_stream:
                                     chunk_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
-                                    accumulated_text += chunk_text
-                                    sentence_buffer += chunk_text
+                                    if not chunk_text:
+                                        continue
                                     
-                                    # Split by sentence boundaries
-                                    sentences = re.split(r'[.!?]\s+', sentence_buffer)
-                                    if len(sentences) > 1:
-                                        for complete_sentence in sentences[:-1]:
-                                            if complete_sentence.strip():
-                                                streaming_callback(complete_sentence.strip() + '.', False)
-                                        sentence_buffer = sentences[-1]
+                                    accumulated_text += chunk_text
+                                    # Stream raw chunk immediately (frontend can handle sentence grouping)
+                                    streaming_callback(chunk_text, False)
                                 
-                                if sentence_buffer.strip():
-                                    streaming_callback(sentence_buffer.strip(), True)
+                                # Signal completion (empty final chunk with is_final=True)
+                                streaming_callback("", True)
                                     
                                 answer = accumulated_text.strip()
                             except Exception as e:
                                 logger.error(f"Hybrid streaming error: {e}")
                                 # Fallback to non-streaming
-                                response = self.gemini_model.generate_content(
-                                    prompt,
-                                    generation_config=genai.types.GenerationConfig(
-                                        temperature=0.7,
-                                        top_p=0.9,
-                                        max_output_tokens=150,  # ~200-300 chars for 2-3 sentences
+                                try:
+                                    response = self.gemini_model.generate_content(
+                                        prompt,
+                                        generation_config=genai.types.GenerationConfig(
+                                            temperature=0.7,
+                                            top_p=0.9,
+                                            max_output_tokens=150,
+                                        )
                                     )
-                                )
-                                answer = response.text.strip()
+                                    answer = response.text.strip() if response else "Sorry, I couldn't generate a response."
+                                except Exception as fallback_error:
+                                    logger.error(f"Hybrid fallback also failed: {fallback_error}")
+                                    answer = "Sorry, I encountered an error. Please try again."
+                                
+                                # CRITICAL: Stream the fallback response to prevent empty responses
+                                if streaming_callback and answer:
+                                    streaming_callback(answer, False)
+                                    streaming_callback("", True)
                         else:
                             response = self.gemini_model.generate_content(
                                 prompt,
@@ -1411,10 +1548,9 @@ Response:"""
                         # Get sources from retrieved docs
                         sources = list(set([doc['metadata'].get('source', 'Unknown') for doc in relevant_docs]))
                         
-                        # Calculate confidence
+                        # Calculate confidence (NON-BLOCKING: use retrieval similarity directly, skip validation)
                         avg_similarity = sum(d.get('similarity', 0) for d in relevant_docs) / len(relevant_docs) if relevant_docs else 0.0
-                        quality = self.validate_response_quality(answer)
-                        confidence = min(avg_similarity, quality.get('quality_score', 0.5))
+                        confidence = avg_similarity  # Direct use, saves ~40ms
                         
                         # Humanize response if enabled
                         is_first_turn = True
@@ -1438,7 +1574,7 @@ Response:"""
                             'timing_breakdown': timing,
                             'metadata': {
                                 'categories': list(set(d['metadata'].get('category', '') for d in relevant_docs)),
-                                'quality_score': quality.get('quality_score', 0.0),
+                                'quality_score': confidence,  # Use same as confidence (non-blocking)
                                 'num_docs_retrieved': len(relevant_docs),
                                 'pattern': detected_pattern.get('name', 'unknown'),
                                 'method': 'hybrid'
@@ -1464,9 +1600,9 @@ Response:"""
                 user_goal = context['user_goal']
                 enriched_query = f"{enriched_query} {user_goal}"
             
-            # Step 4: Embed query
+            # Step 4: Embed query (with local cache for repeated queries)
             embed_start = time.time()
-            query_embedding = self.embeddings.embed_query(enriched_query)
+            query_embedding = self._embed_with_cache_sync(enriched_query)
             query_embedding = np.array(query_embedding, dtype=np.float32).reshape(1, -1)
             timing['embedding_ms'] = (time.time() - embed_start) * 1000
             
@@ -1576,8 +1712,14 @@ Your response:"""
             # Step 8: Generate response
             gen_start = time.time()
             
+            # DEBUG: Log the final prompt being sent to LLM
+            logger.debug(f"📋 STANDARD PROMPT ({len(prompt)} chars):\n{prompt[:500]}...")
+            logger.info(f"📋 Standard prompt: {len(prompt)} chars, {len(relevant_docs)} docs retrieved")
+            
             if streaming_callback:
-                # Streaming generation
+                # Streaming generation (LOW LATENCY)
+                # IMPORTANT: Stream chunks immediately instead of waiting for full sentences.
+                # This dramatically reduces Time To First Byte (TTFB).
                 accumulated_text = ""
                 try:
                     response_stream = self.gemini_model.generate_content(
@@ -1591,28 +1733,33 @@ Your response:"""
                         stream=True
                     )
                     
-                    sentence_buffer = ""
                     for chunk in response_stream:
                         chunk_text = chunk.text if hasattr(chunk, 'text') else str(chunk)
-                        accumulated_text += chunk_text
-                        sentence_buffer += chunk_text
+                        if not chunk_text:
+                            continue
                         
-                        # Split by sentence boundaries
-                        sentences = re.split(r'[.!?]\s+', sentence_buffer)
-                        if len(sentences) > 1:
-                            for complete_sentence in sentences[:-1]:
-                                if complete_sentence.strip():
-                                    streaming_callback(complete_sentence.strip() + '.', False)
-                            sentence_buffer = sentences[-1]
+                        accumulated_text += chunk_text
+                        # Stream raw chunk immediately (frontend can handle sentence grouping)
+                        streaming_callback(chunk_text, False)
                     
-                    if sentence_buffer.strip():
-                        streaming_callback(sentence_buffer.strip(), True)
+                    # Signal completion (empty final chunk with is_final=True)
+                    streaming_callback("", True)
                     
                     raw_response = accumulated_text
                 except Exception as e:
                     logger.error(f"Streaming error: {e}")
-                    response = self.gemini_model.generate_content(prompt)
-                    raw_response = response.text if response else "Sorry, I couldn't generate a response."
+                    # Fallback to non-streaming
+                    try:
+                        response = self.gemini_model.generate_content(prompt)
+                        raw_response = response.text if response else "Sorry, I couldn't generate a response."
+                    except Exception as fallback_error:
+                        logger.error(f"Standard fallback also failed: {fallback_error}")
+                        raw_response = "Sorry, I encountered an error. Please try again."
+                    
+                    # CRITICAL: Stream the fallback response to prevent empty responses
+                    if streaming_callback and raw_response:
+                        streaming_callback(raw_response, False)
+                        streaming_callback("", True)
             else:
                 # Standard generation
                 response = self.gemini_model.generate_content(
@@ -1628,12 +1775,8 @@ Your response:"""
             
             timing['generation_ms'] = (time.time() - gen_start) * 1000
             
-            # Step 9: Validate quality
-            quality = self.validate_response_quality(raw_response)
-            if quality.get('retry', False) and quality.get('quality_score', 0) < self.config.min_quality_score:
-                retry_prompt = prompt + "\n\nIMPORTANT: Please make the response more friendly and conversational, avoiding formal language."
-                response = self.gemini_model.generate_content(retry_prompt)
-                raw_response = response.text if response else raw_response
+            # Step 9: NON-BLOCKING - Skip quality validation (saves ~40ms)
+            # Use retrieval similarity as confidence metric directly
             
             # Step 10: Humanize response
             is_first_turn = True
@@ -1653,9 +1796,9 @@ Your response:"""
             logger.info(f"✅ RAG Generation Complete ({timing['total_ms']:.0f}ms)")
             logger.info(f"   Response: {final_response}")
             
-            # Calculate confidence
+            # Calculate confidence (NON-BLOCKING: use retrieval similarity directly)
             avg_similarity = sum(d['similarity'] for d in relevant_docs) / len(relevant_docs) if relevant_docs else 0.0
-            confidence = min(avg_similarity, quality.get('quality_score', 0.5))
+            confidence = avg_similarity  # Direct use, saves ~40ms
             
             # Step 11: Return structured result
             return {
@@ -1665,15 +1808,22 @@ Your response:"""
                 'timing_breakdown': timing,
                 'metadata': {
                     'categories': list(set(d['metadata'].get('category', '') for d in relevant_docs)),
-                    'quality_score': quality.get('quality_score', 0.0),
+                    'quality_score': confidence,  # Use same as confidence (non-blocking)
                     'num_docs_retrieved': len(relevant_docs)
                 }
             }
         
         except Exception as e:
             logger.error(f" RAG query error: {e}", exc_info=True)
+            error_response = "I apologize, but I encountered an error while processing your question. Could you please try rephrasing it?"
+            
+            # CRITICAL: Stream the error response to prevent empty responses
+            if streaming_callback:
+                streaming_callback(error_response, False)
+                streaming_callback("", True)
+            
             return {
-                'answer': "I apologize, but I encountered an error while processing your question. Could you please try rephrasing it?",
+                'answer': error_response,
                 'sources': [],
                 'confidence': 0.0,
                 'timing_breakdown': {'total_ms': (time.time() - start_time) * 1000},
@@ -1801,8 +1951,8 @@ Your response:"""
             
             timing['generation_ms'] = (time.time() - gen_start) * 1000
             
-            # Validate and humanize
-            quality = self.validate_response_quality(raw_response)
+            # NON-BLOCKING: Skip quality validation (saves ~40ms)
+            # Use retrieval similarity as confidence metric directly
             
             is_first_turn = True
             if intent_context:
@@ -1817,8 +1967,9 @@ Your response:"""
             self.query_count += 1
             self.total_query_time += timing['total_ms']
             
+            # Calculate confidence (NON-BLOCKING: use retrieval similarity directly)
             avg_similarity = sum(d.get('similarity', 0.5) for d in relevant_docs) / len(relevant_docs) if relevant_docs else 0.5
-            confidence = min(avg_similarity, quality.get('quality_score', 0.5))
+            confidence = avg_similarity  # Direct use, saves ~40ms
             
             logger.info(f"✅ Incremental RAG Generation Complete ({timing['total_ms']:.0f}ms)")
             
@@ -1829,7 +1980,7 @@ Your response:"""
                 'timing_breakdown': timing,
                 'metadata': {
                     'categories': list(set(d.get('metadata', {}).get('category', '') for d in relevant_docs)),
-                    'quality_score': quality.get('quality_score', 0.0),
+                    'quality_score': confidence,  # Use same as confidence (non-blocking)
                     'num_docs_retrieved': len(relevant_docs),
                     'method': 'incremental_buffered'
                 }

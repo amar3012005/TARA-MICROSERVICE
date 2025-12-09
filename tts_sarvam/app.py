@@ -21,10 +21,7 @@ from pydantic import BaseModel, Field
 from .config import TTSStreamingConfig
 from .sentence_splitter import split_into_sentences
 from .sarvam_provider import SarvamProvider
-from .sarvam_streaming_provider import SarvamStreamingProvider, StreamingConfig
-from .sarvam_websocket_tts import SarvamWebSocketTTS
 from .audio_cache import AudioCache
-from .filler_cache import FillerPhraseCache
 from .tts_queue import TTSStreamingQueue
 from .fastrtc_handler import FastRTCTTSHandler
 
@@ -67,10 +64,7 @@ except ImportError:
 # Global state
 config: Optional[TTSStreamingConfig] = None
 provider: Optional[SarvamProvider] = None
-streaming_provider: Optional[SarvamStreamingProvider] = None
-websocket_tts: Optional[SarvamWebSocketTTS] = None
 cache: Optional[AudioCache] = None
-filler_cache: Optional[FillerPhraseCache] = None
 active_sessions: Dict[str, Dict[str, Any]] = {}
 app_start_time: float = time.time()
 fastrtc_handler: Optional[FastRTCTTSHandler] = None
@@ -81,12 +75,12 @@ redis_client = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler for application startup/shutdown"""
-    global config, provider, streaming_provider, websocket_tts, cache, filler_cache
-
+    global config, provider, cache
+    
     logger.info("=" * 70)
     logger.info("🚀 Starting TTS Streaming Microservice")
     logger.info("=" * 70)
-
+    
     # Load configuration
     try:
         config = TTSStreamingConfig.from_env()
@@ -94,20 +88,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to load configuration: {e}")
         raise
-
+    
     # Update FastRTC defaults with configuration values
     FastRTCTTSHandler.default_chunk_duration_ms = config.fastrtc_chunk_duration_ms
     if fastrtc_handler:
         fastrtc_handler.update_stream_settings(
             chunk_duration_ms=config.fastrtc_chunk_duration_ms
         )
-
+    
     # Initialize Sarvam provider
     try:
         if not config.sarvam_api_key:
             logger.warning("⚠️ SARVAM_API_KEY not set - service will not function properly")
             provider = None
-            streaming_provider = None
         else:
             provider = SarvamProvider(
                 api_key=config.sarvam_api_key,
@@ -120,45 +113,13 @@ async def lifespan(app: FastAPI):
                 enable_preprocessing=config.sarvam_preprocessing
             )
             logger.info(f"✅ Sarvam provider initialized: {config.sarvam_model} | {config.sarvam_speaker} | {config.sarvam_language}")
-
-            # Initialize streaming provider
-            streaming_config = StreamingConfig(
-                min_buffer_size=config.sarvam_min_buffer_size,
-                max_chunk_length=config.sarvam_max_chunk_length,
-                output_audio_codec=config.sarvam_output_audio_codec,
-                output_audio_bitrate=config.sarvam_output_audio_bitrate
-            )
-            streaming_provider = SarvamStreamingProvider(
-                api_key=config.sarvam_api_key,
-                speaker=config.sarvam_speaker,
-                language=config.sarvam_language,
-                model=config.sarvam_model,
-                pitch=config.sarvam_pitch,
-                pace=config.sarvam_pace,
-                loudness=config.sarvam_loudness,
-                enable_preprocessing=config.sarvam_preprocessing,
-                streaming_config=streaming_config,
-                provider=provider  # Keep for fallback
-            )
-            logger.info(f"✅ Sarvam streaming provider initialized: buffer_size={config.sarvam_min_buffer_size}, max_chunk={config.sarvam_max_chunk_length}")
-
-            # Initialize WebSocket TTS for ultra-fast streaming
-            websocket_tts = SarvamWebSocketTTS(config.sarvam_api_key, config)
-            if await websocket_tts.connect_and_configure():
-                # Inject REST provider for fallback
-                websocket_tts.rest_provider = provider
-                logger.info("✅ WebSocket TTS streaming initialized for <500ms first chunks")
-            else:
-                websocket_tts = None
-                logger.warning("⚠️ WebSocket TTS initialization failed - will use REST fallback")
-
+            
             # Warmup connection in background
             asyncio.create_task(provider.warmup())
-
+            
     except Exception as e:
         logger.error(f"Failed to initialize Sarvam provider: {e}")
         provider = None
-        streaming_provider = None
     
     # Initialize cache
     try:
@@ -174,19 +135,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to initialize cache: {e}")
         cache = None
-
-    # Initialize filler phrase cache for ultra-low latency
-    try:
-        if provider and cache:
-            filler_cache = FillerPhraseCache(provider, cache, auto_preload=True)
-            await filler_cache.initialize()
-            logger.info("✅ Filler phrase cache initialized for ultra-low latency")
-        else:
-            filler_cache = None
-            logger.warning("⚠️ Filler cache not initialized - provider or cache unavailable")
-    except Exception as e:
-        logger.warning(f"Failed to initialize filler cache: {e}")
-        filler_cache = None
     
     # Initialize FastRTC handler (will be set up after app creation)
     # Note: fastrtc_handler is initialized at module level to support gr.mount_gradio_app
@@ -247,19 +195,11 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
     logger.info("🛑 Shutting down TTS Streaming microservice...")
     logger.info("=" * 70)
-
-    # Close provider sessions
+    
+    # Close provider session
     if provider:
         await provider.close()
         logger.info("✅ Sarvam provider closed")
-
-    if streaming_provider:
-        await streaming_provider.disconnect()
-        logger.info("✅ Sarvam streaming provider disconnected")
-
-    if websocket_tts:
-        await websocket_tts.disconnect()
-        logger.info("✅ WebSocket TTS streaming disconnected")
 
     if redis_client:
         logger.info("🔌 Closing Redis connection...")
@@ -329,7 +269,6 @@ class SynthesizeRequest(BaseModel):
     emotion: str = Field(default="helpful", description="Emotion type")
     voice: Optional[str] = Field(default=None, description="Voice name")
     language: Optional[str] = Field(default=None, description="Language code")
-    parallel: bool = Field(default=True, description="Use parallel synthesis for multiple sentences")
 
 
 class SynthesizeResponse(BaseModel):
@@ -347,28 +286,19 @@ class SynthesizeResponse(BaseModel):
 async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
     """
     WebSocket endpoint for streaming TTS synthesis.
-
+    
     Message protocol:
     Client -> Server:
-        {"type": "synthesize", "text": "...", "emotion": "helpful", "streaming": false}
-        {"type": "synthesize", "text": "...", "streaming": true}  # For incremental streaming
-        {"type": "add_text", "text": "..."}  # Add more text to streaming session
-        {"type": "finish_stream"}  # Finish streaming session
+        {"type": "synthesize", "text": "...", "emotion": "helpful"}
         {"type": "cancel"}
         {"type": "ping"}
-
+    
     Server -> Client:
         {"type": "connected", "session_id": "..."}
-        # Regular mode:
         {"type": "sentence_start", "index": 0, "text": "..."}
         {"type": "audio", "data": "<base64>", "index": 0, "sample_rate": 24000}
         {"type": "sentence_complete", "index": 0, "duration_ms": 450}
         {"type": "complete", "total_sentences": 2, "total_duration_ms": 1200}
-        # Streaming mode:
-        {"type": "streaming_started", "session_id": "...", "buffer_size": 50, "max_chunk_length": 200}
-        {"type": "audio", "data": "<base64>", "index": 0, "sample_rate": 24000, "text_chunk": "...", "is_final": false}
-        {"type": "text_added", "text_length": 100}
-        {"type": "stream_finished"}
         {"type": "error", "message": "..."}
     """
     await websocket.accept()
@@ -382,11 +312,11 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
         "timestamp": time.time()
     })
     
-    # Check if providers are available
-    if not provider and not streaming_provider:
+    # Check if provider is available
+    if not provider:
         await websocket.send_json({
             "type": "error",
-            "message": "No TTS providers initialized. Check SARVAM_API_KEY."
+            "message": "Sarvam provider not initialized. Check SARVAM_API_KEY."
         })
         await websocket.close()
         return
@@ -469,230 +399,72 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                 emotion = message.get("emotion", "helpful")
                 voice = message.get("voice")
                 language = message.get("language")
-                use_parallel = message.get("parallel", True)  # Default to parallel mode
-                use_streaming = message.get("streaming", True)  # Enable streaming by default for ultra-low latency
-
+                
                 if not text.strip():
                     await websocket.send_json({
                         "type": "error",
                         "message": "Empty text provided"
                     })
                     continue
-
-                # Check if streaming mode is requested
-                if use_streaming:
-                    # Prioritize WebSocket TTS for ultra-fast first chunks
-                    if websocket_tts and websocket_tts.is_connected:
-                        logger.info(f"⚡ Using WebSocket TTS streaming for ultra-fast <500ms first chunk")
-
-                        # Audio callback for ultra-fast streaming
-                        async def ultra_fast_audio_callback(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
-                            """Callback to send ultra-fast audio chunks immediately"""
-                            try:
-                                # Send to WebSocket client
-                                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                                await websocket.send_json({
-                                    "type": "audio",
-                                    "data": audio_b64,
-                                    "index": metadata.get('chunk_index', 0),
-                                    "sample_rate": sample_rate,
-                                    "streaming": True,
-                                    "latency_ms": metadata.get('latency_ms', 0),
-                                    "ultra_fast": True
-                                })
-
-                                # Broadcast to FastRTC for instant browser playback
-                                await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
-
-                                logger.debug(f"⚡ Ultra-fast audio chunk {metadata.get('chunk_index', 0)} delivered instantly")
-
-                            except Exception as e:
-                                logger.error(f"Error sending ultra-fast audio chunk: {e}")
-
-                        # Set callback and synthesize with ultra-fast WebSocket TTS
-                        websocket_tts.audio_callback = ultra_fast_audio_callback
-
-                        # Send streaming_started BEFORE synthesis (so orchestrator knows we're starting)
-                        await websocket.send_json({
-                            "type": "streaming_started",
-                            "session_id": session_id,
-                            "ultra_fast": True,
-                            "text": text[:50] + "..." if len(text) > 50 else text
-                        })
-
-                        try:
-                            start_time = time.time()
-                            
-                            # This should deliver first chunk in <500ms
-                            first_chunk = await websocket_tts.synthesize_streaming(text)
-
-                            synthesis_time_ms = (time.time() - start_time) * 1000
-
-                            if first_chunk:
-                                logger.info(f"✅ Ultra-fast WebSocket TTS streaming successful ({synthesis_time_ms:.0f}ms)")
-                                
-                                # Send complete message after all chunks delivered
-                                await websocket.send_json({
-                                    "type": "complete",
-                                    "session_id": session_id,
-                                    "total_sentences": 1,
-                                    "total_duration_ms": synthesis_time_ms,
-                                    "ultra_fast": True,
-                                    "chunks_delivered": websocket_tts.chunks_received if hasattr(websocket_tts, 'chunks_received') else 0,
-                                    "first_chunk_latency_ms": websocket_tts.first_chunk_time * 1000 if websocket_tts.first_chunk_time else 0
-                                })
-                            else:
-                                logger.warning("⚠️ WebSocket TTS failed, falling back to REST")
-                                await websocket.send_json({
-                                    "type": "error",
-                                    "message": "Ultra-fast streaming failed, falling back"
-                                })
-
-                        except Exception as e:
-                            logger.error(f"❌ WebSocket TTS streaming error: {e}")
-                            await websocket.send_json({
-                                "type": "error",
-                                "message": f"Streaming failed: {str(e)}"
-                            })
-
-                    # Fallback to existing streaming provider
-                    elif streaming_provider:
-                        logger.info(f"🌊 Using fallback streaming synthesis for session {session_id}")
-
-                        # Cancel any existing streaming session
-                        if consumer_task and not consumer_task.done():
-                            consumer_task.cancel()
-                            try:
-                                await consumer_task
-                            except Exception:
-                                pass
-
-                        # Audio callback for fallback streaming
-                        async def fallback_audio_callback(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
-                            """Callback to send fallback streaming audio chunks"""
-                            try:
-                                # Send to WebSocket
-                                audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-                                await websocket.send_json({
-                                    "type": "audio",
-                                    "data": audio_b64,
-                                    "index": metadata.get('chunk_index', 0),
-                                    "sample_rate": sample_rate,
-                                    "text_chunk": metadata.get('text_chunk', ''),
-                                    "is_final": metadata.get('is_final', False),
-                                    "fallback": True
-                                })
-
-                                # Send to FastRTC handler
-                                await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
-
-                            except Exception as e:
-                                logger.error(f"Error sending fallback audio chunk: {e}")
-
-                        # Start fallback streaming session
-                        await streaming_provider.start_streaming_session(fallback_audio_callback)
-
-                        # Send initial text
-                        await streaming_provider.add_text(text)
-
-                        # Send streaming started message
-                        await websocket.send_json({
-                            "type": "streaming_started",
-                            "session_id": session_id,
-                            "buffer_size": config.sarvam_min_buffer_size,
-                            "max_chunk_length": config.sarvam_max_chunk_length,
-                            "fallback": True
-                        })
-
-                    else:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "No streaming providers available"
-                        })
-                        continue
-
-                    # Keep the session alive (WebSocket TTS handles itself, fallback needs timeout)
-                    if websocket_tts and websocket_tts.is_connected:
-                        consumer_task = asyncio.create_task(asyncio.sleep(30))  # Keep alive
-                    else:
-                        consumer_task = asyncio.create_task(asyncio.sleep(30))  # Keep alive for fallback
-                    active_sessions[session_id]["consumer_task"] = consumer_task
-
-                else:
-                    # Original queue-based processing
-                    if not provider:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "Regular provider not available"
-                        })
-                        continue
-
-                    # Split into sentences
-                    sentences = split_into_sentences(text)
-
-                    if not sentences:
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": "No valid sentences found"
-                        })
-                        continue
-
-                    logger.info(f"📝 Processing {len(sentences)} sentences for session {session_id} (parallel={use_parallel})")
-
-                    # Cancel any existing consumer
-                    if consumer_task and not consumer_task.done():
-                        queue.cancel()
-                        try:
-                            await consumer_task
-                        except Exception:
-                            pass
-
-                    # Reset queue
-                    queue.reset()
-
-                    # Enqueue sentences
-                    await queue.enqueue_sentences(sentences, emotion, voice, language)
-
-                    # Send sentence start notifications
-                    for i, sentence in enumerate(sentences):
-                        await websocket.send_json({
-                            "type": "sentence_start",
-                            "index": i,
-                            "text": sentence
-                        })
-
-                    # Start consumer task - use parallel mode if enabled and multiple sentences
-                    if use_parallel and len(sentences) > 1:
-                        logger.info(f"⚡ Using parallel synthesis for {len(sentences)} sentences")
-                        consumer_task = asyncio.create_task(
-                            queue.consume_queue_parallel(batch_size=config.parallel_sentences)
-                        )
-                    else:
-                        consumer_task = asyncio.create_task(queue.consume_queue())
-                    active_sessions[session_id]["consumer_task"] = consumer_task
-
-                    # Wait for consumer to complete
+                
+                # Split into sentences
+                sentences = split_into_sentences(text)
+                
+                if not sentences:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "No valid sentences found"
+                    })
+                    continue
+                
+                logger.info(f"📝 Processing {len(sentences)} sentences for session {session_id}")
+                
+                # Cancel any existing consumer
+                if consumer_task and not consumer_task.done():
+                    queue.cancel()
                     try:
-                        stats = await consumer_task
-
-                        # Send completion message
-                        await websocket.send_json({
-                            "type": "complete",
-                            "total_sentences": len(sentences),
-                            "total_duration_ms": stats.get('total_duration_ms', 0),
-                            "sentences_played": stats.get('sentences_played', 0),
-                            "sentences_failed": stats.get('sentences_failed', 0),
-                            "cache_hits": stats.get('cache_hits', 0),
-                            "cache_misses": stats.get('cache_misses', 0),
-                            "parallel_batches": stats.get('parallel_batches', 0),
-                            "time_to_first_audio_ms": stats.get('time_to_first_audio_ms', 0)
-                        })
-                    except Exception as e:
-                        logger.error(f"Consumer error: {e}")
-                        await websocket.send_json({
-                            "type": "error",
-                            "message": f"Processing error: {str(e)}"
-                        })
+                        await consumer_task
+                    except Exception:
+                        pass
+                
+                # Reset queue
+                queue.reset()
+                
+                # Enqueue sentences
+                await queue.enqueue_sentences(sentences, emotion, voice, language)
+                
+                # Send sentence start notifications
+                for i, sentence in enumerate(sentences):
+                    await websocket.send_json({
+                        "type": "sentence_start",
+                        "index": i,
+                        "text": sentence
+                    })
+                
+                # Start consumer task
+                consumer_task = asyncio.create_task(queue.consume_queue())
+                active_sessions[session_id]["consumer_task"] = consumer_task
+                
+                # Wait for consumer to complete
+                try:
+                    stats = await consumer_task
+                    
+                    # Send completion message
+                    await websocket.send_json({
+                        "type": "complete",
+                        "total_sentences": len(sentences),
+                        "total_duration_ms": stats.get('total_duration_ms', 0),
+                        "sentences_played": stats.get('sentences_played', 0),
+                        "sentences_failed": stats.get('sentences_failed', 0),
+                        "cache_hits": stats.get('cache_hits', 0),
+                        "cache_misses": stats.get('cache_misses', 0)
+                    })
+                except Exception as e:
+                    logger.error(f"Consumer error: {e}")
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": f"Processing error: {str(e)}"
+                    })
             
             elif msg_type == "cancel":
                 # Cancel current synthesis
@@ -710,48 +482,13 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                     "message": "Synthesis cancelled"
                 })
             
-            elif msg_type == "add_text":
-                # Add more text to streaming session
-                additional_text = message.get("text", "")
-                if not additional_text.strip():
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Empty text provided"
-                    })
-                    continue
-
-                if streaming_provider and streaming_provider.is_connected:
-                    await streaming_provider.add_text(additional_text)
-                    await websocket.send_json({
-                        "type": "text_added",
-                        "text_length": len(additional_text)
-                    })
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "No active streaming session"
-                    })
-
-            elif msg_type == "finish_stream":
-                # Finish streaming session
-                if streaming_provider and streaming_provider.is_connected:
-                    await streaming_provider.finish_stream()
-                    await websocket.send_json({
-                        "type": "stream_finished"
-                    })
-                else:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "No active streaming session"
-                    })
-
             elif msg_type == "ping":
                 # Respond to ping
                 await websocket.send_json({
                     "type": "pong",
                     "timestamp": time.time()
                 })
-
+            
             else:
                 await websocket.send_json({
                     "type": "error",
@@ -794,7 +531,6 @@ async def synthesize_text(request: SynthesizeRequest):
     HTTP endpoint for single text synthesis (non-streaming).
     
     Returns base64-encoded audio data.
-    Supports parallel synthesis for multiple sentences when request.parallel=True.
     """
     if not provider:
         raise HTTPException(
@@ -812,59 +548,9 @@ async def synthesize_text(request: SynthesizeRequest):
                 error="No valid sentences found"
             )
         
-        # Use parallel synthesis if enabled and multiple sentences
-        if request.parallel and len(sentences) > 1:
-            logger.info(f"⚡ Using parallel synthesis for {len(sentences)} sentences")
-            
-            try:
-                # Synthesize all sentences in parallel
-                results = await provider.synthesize_parallel(
-                    texts=sentences,
-                    max_concurrent=config.parallel_sentences,
-                    speaker=request.voice or config.sarvam_speaker,
-                    language=request.language or config.sarvam_language
-                )
-                
-                all_audio_chunks = []
-                total_duration_ms = 0.0
-                sample_rate = config.sample_rate
-                
-                for audio_bytes, synth_time_ms in results:
-                    all_audio_chunks.append(audio_bytes)
-                    duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
-                    total_duration_ms += duration_ms
-                    
-                    # Broadcast to FastRTC for monitoring/debugging
-                    try:
-                        await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
-                    except Exception as broadcast_err:
-                        logger.warning(f"Failed to broadcast to FastRTC: {broadcast_err}")
-                
-                # Concatenate all audio chunks
-                combined_audio = b''.join(all_audio_chunks)
-                
-                # Encode as base64
-                audio_b64 = base64.b64encode(combined_audio).decode('utf-8')
-                
-                return SynthesizeResponse(
-                    success=True,
-                    audio_data=audio_b64,
-                    sample_rate=sample_rate,
-                    duration_ms=total_duration_ms,
-                    sentences=len(sentences)
-                )
-                
-            except Exception as e:
-                logger.error(f"Parallel synthesis error: {e}")
-                return SynthesizeResponse(
-                    success=False,
-                    error=f"Parallel synthesis failed: {str(e)}"
-                )
-        
-        # Sequential synthesis (original behavior)
+        # Synthesize all sentences
         all_audio_chunks = []
         total_duration_ms = 0.0
-        sample_rate = config.sample_rate
         
         for sentence in sentences:
             try:
@@ -931,92 +617,31 @@ async def synthesize_text(request: SynthesizeRequest):
         )
 
 
-@app.get("/filler-cache/status")
-async def filler_cache_status():
-    """Get filler cache status and statistics"""
-    if filler_cache:
-        return {
-            "status": "active",
-            "cache_stats": filler_cache.get_cache_stats()
-        }
-    return {"status": "inactive", "message": "Filler cache not initialized"}
-
-@app.get("/websocket-tts/metrics")
-async def websocket_tts_metrics():
-    """Get WebSocket TTS streaming performance metrics"""
-    if websocket_tts:
-        metrics = websocket_tts.get_metrics()
-        return {
-            "status": "active",
-            "websocket_connected": metrics["connected"],
-            "total_chunks": metrics["total_chunks"],
-            "avg_latency_seconds": metrics["avg_latency"],
-            "fallback_count": metrics["fallback_count"],
-            "last_latency_seconds": metrics["last_latency"],
-            "target_latency_seconds": 0.5  # <500ms target
-        }
-    return {"status": "inactive", "message": "WebSocket TTS not initialized"}
-
-@app.post("/filler-cache/test")
-async def test_filler_phrase(category: str = "thinking"):
-    """Test a filler phrase from cache"""
-    if not filler_cache:
-        raise HTTPException(status_code=503, detail="Filler cache not initialized")
-
-    audio_bytes = await filler_cache.get_filler_audio(category)
-    if not audio_bytes:
-        raise HTTPException(status_code=404, detail=f"No cached audio for category: {category}")
-
-    # Return as base64 for testing
-    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-    return {
-        "success": True,
-        "category": category,
-        "audio_size_bytes": len(audio_bytes),
-        "audio_data": audio_b64
-    }
-
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     uptime_seconds = time.time() - app_start_time
     
     provider_status = "available" if provider else "unavailable"
-    streaming_provider_status = "available" if streaming_provider else "unavailable"
-    websocket_tts_status = "active" if (websocket_tts and websocket_tts.is_connected) else "inactive"
     cache_status = "enabled" if cache else "disabled"
-    filler_cache_status = "active" if filler_cache else "inactive"
-
+    
     # Determine overall status
     if not provider:
         status = "unhealthy"
     else:
         status = "healthy"
-
+    
     cache_stats = {}
     if cache:
         cache_stats = cache.get_stats()
-
-    filler_stats = {}
-    if filler_cache:
-        filler_stats = filler_cache.get_cache_stats()
-
-    websocket_metrics = {}
-    if websocket_tts:
-        websocket_metrics = websocket_tts.get_metrics()
-
+    
     return {
         "status": status,
         "service": "tts-streaming",
         "uptime_seconds": uptime_seconds,
         "provider": provider_status,
-        "streaming_provider": streaming_provider_status,
-        "websocket_tts": websocket_tts_status,
         "cache": cache_status,
-        "filler_cache": filler_cache_status,
         "cache_stats": cache_stats,
-        "filler_cache_stats": filler_stats,
-        "websocket_tts_metrics": websocket_metrics,
         "active_sessions": len(active_sessions)
     }
 

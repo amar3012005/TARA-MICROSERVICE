@@ -1,0 +1,86 @@
+{
+  "language": "en",
+  "dialogues": {
+    "intro": [
+      {
+        "text": "Hello! I'm TARA, the customer service agent for TASK. How can I help you today?",
+        "emotion": "warm",
+        "audio_file": "intro.wav"
+      }
+    ],
+    "exit": [
+      {
+        "text": "Thank you! If you need any more assistance, please call again. Have a great day!",
+        "emotion": "grateful",
+        "audio_file": "exit.wav",
+        "keywords": ["bye", "goodbye", "see you", "thanks", "thank you"]
+      },
+      {
+        "text": "Glad I could help! If you need anything else, just let us know. Take care!",
+        "emotion": "friendly",
+        "audio_file": "exit_alt.wav"
+      }
+    ],
+    "filler_immediate": [
+      {
+        "text": "Okay.",
+        "emotion": "neutral",
+        "trigger": "immediate",
+        "audio_file": "filler_ok_short.wav"
+      },
+      {
+        "text": "Got it.",
+        "emotion": "neutral",
+        "trigger": "immediate"
+      },
+      {
+        "text": "I see.",
+        "emotion": "neutral",
+        "trigger": "immediate"
+      }
+    ],
+    "filler_latency": [
+      {
+        "text": "Let me check that for you...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:1500",
+        "audio_file": "filler_thinking.wav"
+      },
+      {
+        "text": "Give me a moment while I find that out...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:2000",
+        "audio_file": "filler_moment.wav"
+      },
+      {
+        "text": "I'm just looking that up for you...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:1800"
+      }
+    ],
+    "timeout": [
+      {
+        "text": "Are you still there? I'm here to help you.",
+        "emotion": "concerned",
+        "trigger": "timeout_ms:10000",
+        "audio_file": "timeout.wav"
+      },
+      {
+        "text": "Can you hear me? If you'd like to say something, please speak.",
+        "emotion": "helpful",
+        "trigger": "timeout_ms:10000",
+        "audio_file": "timeout_alt.wav"
+      }
+    ],
+    "unclear": [
+      {
+        "text": "Sorry, I didn't catch that clearly. Could you say it again?",
+        "emotion": "neutral"
+      },
+      {
+        "text": "I might have missed that. Please repeat your question.",
+        "emotion": "neutral"
+      }
+    ]
+  }
+}

@@ -1,30 +1,30 @@
+# ============================================================================
 # Intent Classification Service Dependencies
-# Phase 3 - Cloud Transformation - 3-Layer Architecture
+# OPTIMIZED ORDER FOR DOCKER LAYER CACHING
+# Heavy packages installed FIRST so they're cached when lighter packages change
+# ============================================================================
 
-# Web framework
+# HEAVIEST: Core ML frameworks (install FIRST for best caching)
+# These rarely change and take longest to download/install (~2GB)
+torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
+numpy>=1.24.0
+
+# HEAVY: ML frameworks (depend on torch/numpy)
+# These are large but more stable than application code (~500MB)
+transformers>=4.40.0
+spacy>=3.7.0
+
+# MEDIUM: API clients
+google-generativeai>=0.8.0
+# Optional: Google GenAI SDK (newer API) - for future migration
+# google-genai>=0.2.0
+
+# LIGHT: Application framework (changes more frequently)
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 pydantic>=2.5.0
 
-# Gemini API for LLM fallback (Layer 3)
-google-generativeai>=0.8.0
-
-# Optional: Google GenAI SDK (newer API) - for future migration
-# google-genai>=0.2.0
-
-# Redis for distributed caching
+# LIGHTEST: Utilities and helpers (change most frequently)
 redis[asyncio]>=5.0.0
-
-# HTTP client for health checks
 httpx>=0.27.0
-
-# Environment variables
 python-dotenv>=1.0.0
-
-# Layer 2: DistilBERT for SLM-based classification
-transformers>=4.40.0
-torch>=2.0.0 --index-url https://download.pytorch.org/whl/cpu
-numpy>=1.24.0
-
-# Spacy for semantic context extraction (NER, noun chunks, lemmatization)
-spacy>=3.7.0

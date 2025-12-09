@@ -1,0 +1,6 @@
+# Assets directory for pre-synthesized audio files
+# Place audio files here:
+# - intro.wav
+# - exit.wav, exit_alt.wav
+# - filler_thinking.wav, filler_ok.wav, filler_moment.wav, filler_listening.wav
+# - timeout.wav, timeout_alt.wav

@@ -15,6 +15,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy requirements and install dependencies
 # Context is project root
+# Requirements.txt is optimized: HEAVY packages (torch, transformers) first
+# This ensures heavy packages are cached when lighter packages change
 COPY intent/requirements.txt /build/requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --default-timeout=1000 --user -r requirements.txt

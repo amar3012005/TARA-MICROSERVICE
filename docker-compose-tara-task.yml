@@ -48,27 +48,35 @@ services:
       - LEIBNIZ_REDIS_HOST=tara-task-redis
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
-      - INTENT_SERVICE_URL=http://tara-task-intent:8002
+      - INTENT_SERVICE_URL=http://localhost:8002
       - RAG_SERVICE_URL=http://tara-task-rag:8003
       - STT_SERVICE_URL=http://tara-task-stt-vad:8001
-      - TTS_SERVICE_URL=http://tara-task-tts-sarvam:8025
+      - TTS_SERVICE_URL=${TTS_SERVICE_URL:-http://tara-task-tts-sarvam:8025}
+      - TTS_STREAMING_MODE=${TTS_STREAMING_MODE:-continuous}
+      # ElevenLabs TTS Direct Streaming Configuration
+      - USE_ELEVENLABS_TTS=${USE_ELEVENLABS_TTS:-true}
+      - ELEVENLABS_TTS_URL=${ELEVENLABS_TTS_URL:-http://tara-task-tts-labs:8006}
+      - ELEVENLABS_PREWARM_ON_VAD=${ELEVENLABS_PREWARM_ON_VAD:-true}
       - TARA_MODE=true
-      - SKIP_INTENT_SERVICE=false
+      - SKIP_INTENT_SERVICE=true
       - SKIP_APPOINTMENT_SERVICE=true
       - RESPONSE_LANGUAGE=te-mixed
       - ORGANIZATION_NAME=TASK
       - IGNORE_STT_WHILE_SPEAKING=true
       - INTRO_GREETING=నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?
-      - AUTO_START_SERVICES=true
+      - AUTO_START_SERVICES=false
       - DOCKER_COMPOSE_FILE=/app/docker-compose-tara-task.yml
       - DOCKER_PROJECT_NAME=tara-task
       - DOCKER_CONTEXT=desktop-linux
       - STT_GRADIO_URL=http://localhost:2012
-      - TTS_GRADIO_URL=http://localhost:2005/fastrtc
+      - TTS_GRADIO_URL=http://localhost:2007/fastrtc  # tts-labs FastRTC (port 2007)
       - LOG_LEVEL=INFO
       - SESSION_TTL_SECONDS=3600
       - MAX_CONCURRENT_SESSIONS=1000
       - PORT=8004
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-secret}
+      - LIVEKIT_URL=http://livekit:7880
     depends_on:
       redis:
         condition: service_healthy
@@ -110,7 +118,7 @@ services:
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
       - DOCKER_ENVIRONMENT=true
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyCJVAfzsg3KJGjry018gIoet5PVzf6azQ8}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw}
     depends_on:
       redis:
         condition: service_healthy
@@ -183,11 +191,11 @@ services:
     ports:
       - "2003:8003"
     volumes:
-      - tara_task_rag_index:/app/index
+      - tara_task_rag_index_v2:/app/index
     environment:
       - PYTHONUNBUFFERED=1
       - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw}
-      - GEMINI_MODEL=models/gemini-2.5-flash-lite
+      - GEMINI_MODEL=gemini-2.0-flash-lite
       - LEIBNIZ_REDIS_HOST=tara-task-redis
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
@@ -202,9 +210,13 @@ services:
       - ENABLE_PREWARMING=true
       - WARMUP_QUERIES_COUNT=10
       - ENABLE_MODEL_PERSISTENCE=true
-      - PREPOPULATE_CACHE=true
+      - PREPOPULATE_CACHE=false
       - GEMINI_TIMEOUT_MS=5000
       - EMBEDDING_BATCH_SIZE=32
+      # Embedding optimization (new)
+      - LEIBNIZ_RAG_EMBEDDING_MODEL=BAAI/bge-m3
+      - ENABLE_EMBEDDING_CACHE=true
+      - EMBEDDING_CACHE_TTL=86400
     depends_on:
       redis:
         condition: service_healthy
@@ -234,13 +246,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - SARVAM_API_KEY=${SARVAM_API_KEY:-sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr}
-      - SARVAM_TTS_SPEAKER=anushka
-      - SARVAM_TTS_LANGUAGE=te-IN
-      - SARVAM_TTS_MODEL=bulbul:v2
+      - LEIBNIZ_SARVAM_SPEAKER=anushka
+      - LEIBNIZ_SARVAM_LANGUAGE=te-IN
+      - LEIBNIZ_SARVAM_MODEL=bulbul:v2
       - TTS_STREAMING_PORT=8025
-      - SARVAM_MIN_BUFFER_SIZE=10
-      - SARVAM_TTS_PREPROCESSING=false
-      - SARVAM_OUTPUT_AUDIO_CODEC=wav
       - LEIBNIZ_TTS_CACHE_ENABLED=true
       - LEIBNIZ_TTS_SAMPLE_RATE=22050
       - REDIS_HOST=tara-task-redis
@@ -262,25 +271,45 @@ services:
     labels:
       - "com.tara.project=tara-task"
       - "com.tara.service=tts-sarvam"
-
+# =========================================================================
   # ============================================================================
-  # Intent Classification: Intent Service
-  # ============================================================================
-  intent:
+  # TTS_LABS: ElevenLabs Ultra-Low Latency TTS Service
+  # Uses eleven_flash_v2_5 model with WebSocket stream-input for <150ms TTFA
+  # =========================================================================
+  tts-labs:
     build:
       context: .
-      dockerfile: intent/Dockerfile
-    container_name: tara-task-intent
+      dockerfile: TTS_LABS/Dockerfile
+    container_name: tara-task-tts-labs
     ports:
-      - "2007:8002"   # API
+      - "2007:8006"   # API + FastRTC (different port from tts-sarvam:2005)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyC6cvyEl4FNjIQCV_p5_2wJkOa1cUObFHU}
+      # ElevenLabs API Configuration
+      - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-sk_b52c643178d624ed09d8b52da3554ee7ff3096d02e55299b}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-21m00Tcm4TlvDq8ikWAM}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_flash_v2_5}
+      - ELEVENLABS_LATENCY_OPTIMIZATION=${ELEVENLABS_LATENCY_OPTIMIZATION:-4}
+      - ELEVENLABS_OUTPUT_FORMAT=${ELEVENLABS_OUTPUT_FORMAT:-pcm_24000}
+      # Voice settings
+      - ELEVENLABS_STABILITY=${ELEVENLABS_STABILITY:-0.5}
+      - ELEVENLABS_SIMILARITY_BOOST=${ELEVENLABS_SIMILARITY_BOOST:-0.75}
+      - ELEVENLABS_STYLE=${ELEVENLABS_STYLE:-0.0}
+      - ELEVENLABS_SPEAKER_BOOST=${ELEVENLABS_SPEAKER_BOOST:-true}
+      # Service configuration
+      - TTS_LABS_PORT=8006
+      - LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+      - LEIBNIZ_TTS_CACHE_ENABLED=true
+      - LEIBNIZ_TTS_CACHE_MAX_SIZE=500
+      - LEIBNIZ_TTS_INTER_SENTENCE_GAP_MS=50
+      - LEIBNIZ_TTS_FASTRTC_CHUNK_MS=40
+      # Redis for orchestrator coordination (matches tara-task Redis on port 6379)
+      - REDIS_HOST=tara-task-redis
+      - REDIS_PORT=6379
       - LEIBNIZ_REDIS_HOST=tara-task-redis
       - LEIBNIZ_REDIS_PORT=6379
-      - LEIBNIZ_REDIS_DB=0
-      - PORT=8002
-      - LOG_LEVEL=INFO
     depends_on:
       redis:
         condition: service_healthy
@@ -288,14 +317,62 @@ services:
       - tara-task-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=5)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health', timeout=5)"]
       interval: 30s
       timeout: 10s
       start_period: 30s
       retries: 3
     labels:
       - "com.tara.project=tara-task"
-      - "com.tara.service=intent"
+      - "com.tara.service=tts-labs"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
+
+  # ============================================================================
+  # LiveKit: WebRTC Server
+  # ============================================================================
+  livekit:
+    image: livekit/livekit-server
+    container_name: tara-task-livekit
+    command: --dev --bind 0.0.0.0
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    networks:
+      - tara-task-network
+    restart: unless-stopped
+    labels:
+      - "com.tara.project=tara-task"
+      - "com.tara.service=livekit"
+
+  # ============================================================================
+  # LiveKit Bridge: Connection Agent
+  # ============================================================================
+  livekit-bridge:
+    build:
+      context: .
+      dockerfile: livekit_bridge/Dockerfile
+    container_name: tara-task-livekit-bridge
+    environment:
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-secret}
+      - STT_URL=ws://tara-task-stt-vad:8001/api/v1/transcribe/stream
+      - ORCHESTRATOR_URL=ws://tara-task-orchestrator:8004/orchestrate
+    depends_on:
+      - livekit
+      - stt-vad
+      - orchestrator
+    networks:
+      - tara-task-network
+    restart: unless-stopped
+    labels:
+      - "com.tara.project=tara-task"
+      - "com.tara.service=livekit-bridge"
 
 # ============================================================================
 # Volumes
@@ -305,8 +382,8 @@ volumes:
     name: tara-task-redis-data
     labels:
       - "com.tara.project=tara-task"
-  tara_task_rag_index:
-    name: tara-task-rag-index
+  tara_task_rag_index_v2:
+    name: tara-task-rag-index-v2
     labels:
       - "com.tara.project=tara-task"
 

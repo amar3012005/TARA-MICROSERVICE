@@ -19,8 +19,9 @@ from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, AsyncGenerator
 
 import aiohttp
+from livekit.api import AccessToken, VideoGrants
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -28,15 +29,28 @@ from fastapi.responses import FileResponse
 from leibniz_agent.services.orchestrator.config import OrchestratorConfig, TARA_INTRO_GREETING, DEFAULT_INTRO_GREETING
 from leibniz_agent.services.orchestrator.state_manager import StateManager, State
 from leibniz_agent.services.orchestrator.parallel_pipeline import (
-    process_intent_rag_llm,
+    process_intent_rag_llm, 
     process_rag_direct,
     process_rag_incremental,
-    buffer_rag_incremental,
-    reset_chunk_sequence
+    buffer_rag_incremental
 )
 from leibniz_agent.services.orchestrator.interruption_handler import InterruptionHandler
 from leibniz_agent.services.orchestrator.service_manager import ServiceManager
+from leibniz_agent.services.orchestrator.dialogue_manager import DialogueManager, DialogueType
 from leibniz_agent.services.shared.redis_client import get_redis_client, close_redis_client, ping_redis
+
+# ElevenLabs TTS client for ultra-low latency streaming
+try:
+    from leibniz_agent.services.orchestrator.eleven_tts_client import ElevenLabsTTSClient
+    ELEVENLABS_CLIENT_AVAILABLE = True
+except ImportError:
+    try:
+        from .eleven_tts_client import ElevenLabsTTSClient
+        ELEVENLABS_CLIENT_AVAILABLE = True
+    except ImportError:
+        ELEVENLABS_CLIENT_AVAILABLE = False
+        ElevenLabsTTSClient = None
+        # Warning logged after logger is configured
 
 # Configure logging
 logging.basicConfig(
@@ -49,8 +63,10 @@ logger = logging.getLogger(__name__)
 redis_client = None
 redis_subscriber = None
 redis_listener_task = None
+timeout_monitor_task = None
 active_sessions: Dict[str, Any] = {}
 config: Optional[OrchestratorConfig] = None
+dialogue_manager: Optional[DialogueManager] = None
 app_start_time: float = time.time()
 STT_GRADIO_URL = os.getenv("STT_GRADIO_URL", "http://localhost:8001/fastrtc")
 TTS_GRADIO_URL = os.getenv("TTS_GRADIO_URL", "http://localhost:8005/fastrtc")
@@ -58,6 +74,9 @@ service_connections = {
     "stt": {"connected": False, "session_id": None, "timestamp": None},
     "tts": {"connected": False, "session_id": None, "timestamp": None}
 }
+
+# ElevenLabs TTS client instances per session (for prewarm and streaming)
+eleven_tts_clients: Dict[str, ElevenLabsTTSClient] = {} if ELEVENLABS_CLIENT_AVAILABLE else {}
 
 # Workflow control - wait for manual start trigger
 workflow_ready = False  # True when both STT and TTS are connected
@@ -99,7 +118,7 @@ async def check_service_health(name: str, url: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler for application startup/shutdown"""
-    global redis_client, config, INTRO_GREETING
+    global redis_client, config, INTRO_GREETING, dialogue_manager
     
     logger.info("=" * 70)
     logger.info("🚀 Starting StateManager Orchestrator")
@@ -108,6 +127,10 @@ async def lifespan(app: FastAPI):
     # Load configuration
     config = OrchestratorConfig.from_env()
     logger.info(f"📋 Configuration loaded")
+    
+    # Initialize Dialogue Manager
+    dialogue_manager = DialogueManager(tara_mode=config.tara_mode)
+    logger.info(f"✅ Dialogue Manager initialized")
     
     # Set intro greeting from config (supports TARA Telugu mode)
     INTRO_GREETING = config.intro_greeting
@@ -233,10 +256,14 @@ async def lifespan(app: FastAPI):
                 redis_client = None
     
     # Start Redis subscriber background task
-    global redis_listener_task
+    global redis_listener_task, timeout_monitor_task
     if redis_client:
         redis_listener_task = asyncio.create_task(listen_to_redis_events())
         logger.info("✅ Redis event listener started")
+    
+    # Start timeout monitor background task
+    timeout_monitor_task = asyncio.create_task(monitor_timeouts())
+    logger.info("✅ Timeout monitor started")
     
     logger.info("=" * 70)
     logger.info("✅ StateManager Orchestrator Ready")
@@ -263,11 +290,18 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown Redis listener
+    # Shutdown background tasks
     if redis_listener_task:
         redis_listener_task.cancel()
         try:
             await redis_listener_task
+        except asyncio.CancelledError:
+            pass
+    
+    if timeout_monitor_task:
+        timeout_monitor_task.cancel()
+        try:
+            await timeout_monitor_task
         except asyncio.CancelledError:
             pass
     
@@ -310,6 +344,38 @@ async def root():
     if os.path.exists(static_file):
         return FileResponse(static_file)
     return {"message": "Leibniz Orchestrator API", "client": "/static/client.html"}
+
+
+@app.get("/livekit")
+async def livekit_client():
+    """Serve the LiveKit client HTML"""
+    static_file = os.path.join(os.path.dirname(__file__), "static", "livekit_client.html")
+    if os.path.exists(static_file):
+        return FileResponse(static_file)
+    return {"message": "LiveKit client not found", "client": "/static/livekit_client.html"}
+
+
+@app.get("/token")
+async def get_token(room_name: str = Query("room-1"), participant_name: str = Query("user")):
+    """
+    Generate a LiveKit access token for the frontend client.
+    """
+    api_key = os.getenv("LIVEKIT_API_KEY", "devkey")
+    api_secret = os.getenv("LIVEKIT_API_SECRET", "secret")
+
+    grant = VideoGrants(
+        room_join=True,
+        room=room_name,
+        can_publish=True,
+        can_subscribe=True
+    )
+
+    token = AccessToken(api_key, api_secret) \
+        .with_grants(grant) \
+        .with_identity(participant_name) \
+        .with_name(participant_name)
+    
+    return {"token": token.to_jwt(), "room_name": room_name, "participant_name": participant_name}
 
 
 @app.websocket("/orchestrate")
@@ -505,14 +571,123 @@ async def orchestrate(websocket: WebSocket, session_id: str = Query(...)):
                 intro_task.cancel()
             del active_sessions[session_id]
         
+        # Clean up ElevenLabs TTS client if exists
+        if session_id in eleven_tts_clients:
+            await cleanup_elevenlabs_client(session_id)
+        
         logger.info(f"✅ Session cleanup complete: {session_id}")
 
 
-async def play_intro_greeting(session_id: str, websocket: Optional[WebSocket], state_mgr: StateManager):
-    """Play intro greeting via TTS streaming service"""
+async def stream_audio_file(
+    session_id: str,
+    audio_file_path: str,
+    websocket: Optional[WebSocket],
+    state_mgr: StateManager,
+    skip_state_transition: bool = False
+):
+    """Stream pre-synthesized audio file via TTS service WebSocket
+    
+    Reads audio file and sends it to TTS service for playback.
+    This simulates TTS streaming but uses pre-recorded audio.
+    """
     try:
-        logger.info(f"🎤 Playing intro greeting: {INTRO_GREETING[:50]}...")
-        await stream_tts_audio(session_id, INTRO_GREETING, websocket, state_mgr, emotion="helpful")
+        import wave
+        import struct
+        
+        # Read audio file
+        with wave.open(audio_file_path, 'rb') as wav_file:
+            sample_rate = wav_file.getframerate()
+            num_channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            
+            logger.info(f"📁 Audio file: {audio_file_path}")
+            logger.info(f"   Sample rate: {sample_rate}Hz, Channels: {num_channels}, Width: {sample_width} bytes")
+            
+            # Connect to TTS service WebSocket (for routing to FastRTC UI)
+            tts_ws_url = config.tts_service_url.replace("http://", "ws://").replace("https://", "wss://")
+            tts_ws_url = f"{tts_ws_url}/api/v1/stream?session_id={session_id}"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(tts_ws_url) as tts_ws:
+                    # Send audio file metadata
+                    await tts_ws.send_json({
+                        "type": "audio_file",
+                        "sample_rate": sample_rate,
+                        "channels": num_channels,
+                        "sample_width": sample_width
+                    })
+                    
+                    # Read and send audio chunks
+                    chunk_size = 4096  # 4KB chunks
+                    total_bytes = 0
+                    
+                    while True:
+                        audio_data = wav_file.readframes(chunk_size // sample_width)
+                        if not audio_data:
+                            break
+                        
+                        # Encode audio data as base64
+                        audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                        
+                        # Send audio chunk
+                        await tts_ws.send_json({
+                            "type": "audio_chunk",
+                            "data": audio_b64
+                        })
+                        
+                        total_bytes += len(audio_data)
+                        
+                        # Forward to client WebSocket if exists
+                        if websocket:
+                            try:
+                                await websocket.send_bytes(audio_data)
+                            except Exception as ws_err:
+                                logger.debug(f"Could not forward audio to client: {ws_err}")
+                        
+                        # Small delay to simulate streaming
+                        await asyncio.sleep(0.01)
+                    
+                    # Send completion
+                    await tts_ws.send_json({
+                        "type": "audio_complete",
+                        "total_bytes": total_bytes
+                    })
+                    
+                    logger.info(f"✅ Audio file streaming complete: {total_bytes} bytes")
+                    
+                    # Handle state transition (unless skipping for fillers)
+                    if not skip_state_transition:
+                        await state_mgr.transition(State.IDLE, "audio_complete", {})
+                        state_mgr.context.turn_number += 1
+                        state_mgr.context.text_buffer = []
+                        await state_mgr.save_state()
+                        logger.info(f"✅ Audio playback complete, ready for next turn")
+                    else:
+                        logger.info(f"✅ Audio playback complete (filler, state unchanged)")
+                    
+    except Exception as e:
+        logger.error(f"❌ Error streaming audio file: {e}", exc_info=True)
+        raise
+
+
+async def play_intro_greeting(session_id: str, websocket: Optional[WebSocket], state_mgr: StateManager):
+    """Play intro greeting via Dialogue Manager (supports pre-synthesized audio)"""
+    try:
+        if dialogue_manager:
+            intro_asset = dialogue_manager.get_asset(DialogueType.INTRO)
+            logger.info(f"🎤 Playing intro greeting: {intro_asset.text[:50]}...")
+            await stream_tts_audio(
+                session_id, 
+                intro_asset.text, 
+                websocket, 
+                state_mgr, 
+                emotion=intro_asset.emotion,
+                audio_file_path=intro_asset.audio_path if intro_asset.has_audio() else None
+            )
+        else:
+            # Fallback to config intro greeting
+            logger.info(f"🎤 Playing intro greeting (fallback): {INTRO_GREETING[:50]}...")
+            await stream_tts_audio(session_id, INTRO_GREETING, websocket, state_mgr, emotion="helpful")
     except Exception as e:
         logger.error(f"❌ Intro greeting error: {e}")
 
@@ -522,13 +697,29 @@ async def stream_tts_audio(
     text: str, 
     websocket: Optional[WebSocket], 
     state_mgr: StateManager,
-    emotion: str = "helpful"
+    emotion: str = "helpful",
+    audio_file_path: Optional[str] = None,
+    skip_state_transition: bool = False
 ):
-    """Stream TTS audio from tts-streaming-service via WebSocket
+    """Stream TTS audio from tts-streaming-service via WebSocket or play pre-synthesized audio
+    
+    If audio_file_path is provided and file exists, streams the audio file directly.
+    Otherwise, synthesizes text via TTS service.
     
     If websocket is None (auto-created session), audio still streams to TTS FastRTC UI.
     The TTS service handles audio playback directly.
     """
+    # Check if we have a pre-synthesized audio file
+    if audio_file_path and os.path.exists(audio_file_path):
+        try:
+            logger.info(f"🔊 Playing pre-synthesized audio: {audio_file_path}")
+            await stream_audio_file(session_id, audio_file_path, websocket, state_mgr, skip_state_transition)
+            return
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to play audio file, falling back to TTS: {e}")
+            # Fall through to TTS synthesis
+    
+    # Synthesize via TTS service
     tts_ws_url = config.tts_service_url.replace("http://", "ws://").replace("https://", "wss://")
     tts_ws_url = f"{tts_ws_url}/api/v1/stream?session_id={session_id}"
     
@@ -538,12 +729,11 @@ async def stream_tts_audio(
         
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(tts_ws_url) as tts_ws:
-                # Send synthesis request with streaming enabled for ultra-low latency
+                # Send synthesis request
                 await tts_ws.send_json({
                     "type": "synthesize",
                     "text": text,
-                    "emotion": emotion,
-                    "streaming": True  # Enable Sarvam streaming API for fastest audio chunks
+                    "emotion": emotion
                 })
                 
                 # Receive audio chunks and forward to client
@@ -557,14 +747,6 @@ async def stream_tts_audio(
                         
                         if msg_type == "connected":
                             logger.info(f"✅ TTS service connected")
-                        
-                        elif msg_type == "streaming_started":
-                            # Ultra-fast streaming mode started
-                            is_ultra_fast = data.get("ultra_fast", False)
-                            if is_ultra_fast:
-                                logger.info(f"⚡ Ultra-fast TTS streaming started (target: <500ms first chunk)")
-                            else:
-                                logger.info(f"🌊 Streaming synthesis started")
                         
                         elif msg_type == "sentence_start":
                             sentence_count += 1
@@ -600,13 +782,7 @@ async def stream_tts_audio(
                             logger.debug(f"✅ Sentence {data.get('index', 0)} synthesis complete ({duration_ms:.0f}ms)")
                         
                         elif msg_type == "complete":
-                            is_ultra_fast = data.get("ultra_fast", False)
-                            if is_ultra_fast:
-                                first_chunk_latency = data.get("first_chunk_latency_ms", 0)
-                                chunks_delivered = data.get("chunks_delivered", 0)
-                                logger.info(f"⚡ Ultra-fast TTS complete: {chunks_delivered} chunks, first chunk: {first_chunk_latency:.0f}ms, total: {data.get('total_duration_ms', 0):.0f}ms")
-                            else:
-                                logger.info(f"✅ TTS complete: {data.get('total_sentences', 0)} sentences, {data.get('total_duration_ms', 0):.0f}ms")
+                            logger.info(f"✅ TTS complete: {data.get('total_sentences', 0)} sentences, {data.get('total_duration_ms', 0):.0f}ms")
                             break
                         
                         elif msg_type == "error":
@@ -625,13 +801,15 @@ async def stream_tts_audio(
                         logger.error(f"❌ TTS WebSocket error: {tts_ws.exception()}")
                         break
                 
-                # TTS complete - transition to IDLE
-                await state_mgr.transition(State.IDLE, "tts_complete", {})
-                state_mgr.context.turn_number += 1
-                state_mgr.context.text_buffer = []  # Clear buffer for next turn
-                await state_mgr.save_state()
-                
-                logger.info(f"✅ TTS streaming complete, ready for next turn")
+                # TTS complete - transition to IDLE (unless skipping for fillers)
+                if not skip_state_transition:
+                    await state_mgr.transition(State.IDLE, "tts_complete", {})
+                    state_mgr.context.turn_number += 1
+                    state_mgr.context.text_buffer = []  # Clear buffer for next turn
+                    await state_mgr.save_state()
+                    logger.info(f"✅ TTS streaming complete, ready for next turn")
+                else:
+                    logger.info(f"✅ TTS streaming complete (filler, state unchanged)")
                 
                 # Send turn complete message (if WebSocket exists)
                 if websocket:
@@ -858,6 +1036,81 @@ async def start_intro_sequence(session_id: str):
             session_entry["intro_task"] = None
 
 
+async def monitor_timeouts():
+    """Background task to monitor timeout for sessions in LISTENING state"""
+    global config, dialogue_manager
+    
+    while True:
+        try:
+            await asyncio.sleep(1.0)  # Check every second
+            
+            if not config or not dialogue_manager:
+                continue
+            
+            timeout_seconds = config.timeout_seconds
+            current_time = time.time()
+            
+            # Check all active sessions
+            for session_id, session_data in list(active_sessions.items()):
+                state_mgr = session_data.get("state_mgr")
+                websocket = session_data.get("websocket")
+                workflow_started = session_data.get("workflow_started", False)
+                
+                if not state_mgr or not workflow_started:
+                    continue
+                
+                # Only check timeout for sessions in LISTENING state
+                if state_mgr.state != State.LISTENING:
+                    continue
+                
+                # Check if timeout has occurred
+                last_activity = state_mgr.context.last_activity_time
+                if last_activity and (current_time - last_activity) >= timeout_seconds:
+                    logger.info("=" * 70)
+                    logger.info(f"⏱️ TIMEOUT DETECTED for session {session_id}")
+                    logger.info(f"   Last activity: {last_activity:.2f}, Current: {current_time:.2f}")
+                    logger.info(f"   Timeout duration: {timeout_seconds}s")
+                    logger.info("=" * 70)
+                    
+                    # Get timeout dialogue from Dialogue Manager (JSON-driven)
+                    timeout_asset = dialogue_manager.get_timeout_prompt()
+                    logger.info(f"🎤 Playing timeout prompt: {timeout_asset.text[:50]}...")
+                    
+                    # Transition to SPEAKING for timeout message
+                    try:
+                        await state_mgr.transition(State.SPEAKING, "timeout_detected", {})
+                        
+                        # Play timeout dialogue
+                        await stream_tts_audio(
+                            session_id,
+                            timeout_asset.text,
+                            websocket,
+                            state_mgr,
+                            emotion=timeout_asset.emotion,
+                            audio_file_path=timeout_asset.audio_path if timeout_asset.has_audio() else None
+                        )
+                        
+                        # Transition back to LISTENING and reset activity time
+                        await state_mgr.transition(State.LISTENING, "timeout_complete", {})
+                        state_mgr.context.last_activity_time = time.time()  # Reset timeout timer
+                        
+                        if websocket:
+                            try:
+                                await websocket.send_json({
+                                    "type": "timeout",
+                                    "session_id": session_id,
+                                    "message": "No response detected, prompting user..."
+                                })
+                            except:
+                                pass
+                    except Exception as e:
+                        logger.error(f"❌ Error handling timeout for session {session_id}: {e}", exc_info=True)
+        
+        except Exception as e:
+            logger.error(f"❌ Error in timeout monitor: {e}", exc_info=True)
+            await asyncio.sleep(5.0)  # Wait longer on error
+
+
 async def listen_to_redis_events():
     """Background task to listen for STT transcripts and service connection events via Redis"""
     global redis_client, redis_subscriber
@@ -938,50 +1191,46 @@ async def listen_to_redis_events():
                                      # Process final transcripts to trigger the pipeline
                                      # Works for both WebSocket and auto-created sessions
                                      if is_final:
-                                          await handle_stt_event(ws_session_id, text, websocket, state_mgr)
+                                         await handle_stt_event(ws_session_id, text, websocket, state_mgr)
                                      else:
-                                          # ═══════════════════════════════════════════════════════════════
-                                          # PRE-LLM ACCUMULATION: Trigger RAG pre-processing on partial STT
-                                          # RAG now performs full pre-LLM work during speech:
-                                          # - Pattern detection
-                                          # - Document retrieval
-                                          # - Information extraction
-                                          # - Prompt construction
-                                          # This reduces final generation latency from ~400ms to ~355ms
-                                          # ═══════════════════════════════════════════════════════════════
-                                          if config.tara_mode and config.rag_service_url:
-                                              # Track chunk sequence in state manager
-                                              state_mgr.context.increment_chunk(text)
-                                              chunk_seq = state_mgr.context.chunk_sequence
-                                              
-                                              # Fire-and-forget pre-LLM accumulation (don't await)
-                                              asyncio.create_task(buffer_rag_incremental(
-                                                  text=text,
-                                                  session_id=ws_session_id,
-                                                  rag_url=config.rag_service_url,
-                                                  language=config.response_language,
-                                                  organization=config.organization_name,
-                                                  chunk_sequence=chunk_seq
-                                              ))
-                                              logger.info(
-                                                  f"[SESSION:{ws_session_id}] Partial chunk {chunk_seq}: "
-                                                  f"triggering RAG pre-LLM accumulation"
-                                              )
-                                          
-                                          # Notify client if WebSocket exists
-                                          if websocket:
-                                              try:
-                                                  await websocket.send_json({
-                                                      "type": "stt_partial",
-                                                      "text": text,
-                                                      "session_id": ws_session_id,
-                                                      "chunk_sequence": state_mgr.context.chunk_sequence if config.tara_mode else 0
-                                                  })
-                                              except:
-                                                  pass
-                                          else:
-                                              logger.debug(f"📝 Partial STT (chunk {state_mgr.context.chunk_sequence}): {text[:50]}...")
-                                          routed = True
+                                         # ═══════════════════════════════════════════════════
+                                         # INCREMENTAL BUFFERING: Pre-fetch documents on partial STT
+                                         # This hides retrieval latency by fetching while user speaks
+                                         # ═══════════════════════════════════════════════════
+                                         if config.tara_mode and config.rag_service_url:
+                                             # Fire-and-forget buffering (don't await)
+                                             asyncio.create_task(buffer_rag_incremental(
+                                                 text=text,
+                                                 session_id=ws_session_id,
+                                                 rag_url=config.rag_service_url,
+                                                 language=config.response_language,
+                                                 organization=config.organization_name
+                                             ))
+                                             logger.debug(f"📦 Incremental buffer triggered for: {text[:30]}...")
+                                         
+                                         # ═══════════════════════════════════════════════════
+                                         # ELEVENLABS PREWARM: Pre-warm TTS connection on VAD
+                                         # This hides TTS connection latency by connecting early
+                                         # ═══════════════════════════════════════════════════
+                                         if config.use_elevenlabs_tts and config.elevenlabs_prewarm_on_vad:
+                                             if ws_session_id not in eleven_tts_clients:
+                                                 # Fire-and-forget prewarm (don't await)
+                                                 asyncio.create_task(prewarm_elevenlabs_tts(ws_session_id))
+                                                 logger.debug(f"⚡ ElevenLabs prewarm triggered for: {ws_session_id}")
+                                         
+                                         # Notify client if WebSocket exists
+                                         if websocket:
+                                             try:
+                                                 await websocket.send_json({
+                                                     "type": "stt_partial",
+                                                     "text": text,
+                                                     "session_id": ws_session_id
+                                                 })
+                                             except:
+                                                 pass
+                                         else:
+                                             logger.debug(f"📝 Partial STT: {text[:50]}...")
+                                     routed = True
                                 else:
                                     if state_mgr:
                                         logger.debug(f"Skipping session {ws_session_id}: state={state_mgr.state.value}")
@@ -1005,15 +1254,79 @@ async def listen_to_redis_events():
         logger.error(f"❌ Redis event listener error: {e}", exc_info=True)
 
 
+async def prewarm_elevenlabs_tts(session_id: str) -> bool:
+    """
+    Pre-warm ElevenLabs TTS connection for ultra-low latency.
+    
+    Called when VAD detects user speech (partial STT) to establish
+    the TTS connection before the RAG response is ready.
+    
+    Args:
+        session_id: Session identifier for the TTS connection
+        
+    Returns:
+        True if prewarm successful, False otherwise
+    """
+    global eleven_tts_clients, config
+    
+    # Check if ElevenLabs TTS is enabled
+    if not config or not config.use_elevenlabs_tts:
+        return False
+    
+    if not ELEVENLABS_CLIENT_AVAILABLE:
+        logger.warning("ElevenLabs TTS client not available")
+        return False
+    
+    # Check if already prewarmed for this session
+    if session_id in eleven_tts_clients:
+        client = eleven_tts_clients[session_id]
+        if client.is_prewarmed:
+            logger.debug(f"ElevenLabs already prewarmed for {session_id}")
+            return True
+    
+    try:
+        # Create new client
+        client = ElevenLabsTTSClient(
+            tts_service_url=config.elevenlabs_tts_url,
+            session_id=f"eleven_{session_id}_{int(time.time())}"
+        )
+        
+        # Prewarm connection
+        if await client.prewarm():
+            eleven_tts_clients[session_id] = client
+            logger.info(f"⚡ ElevenLabs TTS pre-warmed for session {session_id}")
+            return True
+        else:
+            await client.close()
+            logger.warning(f"Failed to prewarm ElevenLabs TTS for {session_id}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error prewarming ElevenLabs TTS: {e}")
+        return False
+
+
+async def cleanup_elevenlabs_client(session_id: str):
+    """Clean up ElevenLabs TTS client for a session."""
+    global eleven_tts_clients
+    
+    if session_id in eleven_tts_clients:
+        client = eleven_tts_clients.pop(session_id)
+        try:
+            await client.close()
+        except Exception as e:
+            logger.debug(f"Error closing ElevenLabs client: {e}")
+
+
 class SmartBuffer:
     """
-    Buffers tokens and releases complete sentences or phrases for TTS.
-    Ensures natural prosody by avoiding sending partial words, but allows phrases.
+    Buffers tokens and releases complete sentences for TTS.
+    Ensures natural prosody by avoiding sending partial sentences.
     """
-    def __init__(self, min_length: int = 10):
+    def __init__(self, min_length: int = 20):
         self.buffer = ""
         self.min_length = min_length
-        self.sentence_endings = {'.', '!', '?', '।', '\n', ',', ';', ':'}
+        self.sentence_endings = {'.', '!', '?', '।', '\n'}
         self.abbreviations = {'Mr.', 'Mrs.', 'Dr.', 'St.', 'Prof.'}
 
     def add_token(self, token: str) -> Optional[str]:
@@ -1082,48 +1395,169 @@ async def stream_tts_from_generator(
     emotion: str = "helpful"
 ):
     """
-    Consumes text generator and streams sentences to TTS service.
+    Consumes text generator and streams to TTS service.
+    
+    Supports three modes:
+    - "elevenlabs": Direct ElevenLabs streaming with prewarmed connection (ultra-low latency)
+    - "continuous": Stream chunks immediately via standard TTS WebSocket (for ElevenLabs tts-labs)
+    - "buffered": Wait for complete sentences (SmartBuffer) for better prosody (Sarvam)
     """
+    global eleven_tts_clients
+    
+    # Check if we should use direct ElevenLabs streaming
+    use_elevenlabs_direct = (
+        config.use_elevenlabs_tts and 
+        ELEVENLABS_CLIENT_AVAILABLE and 
+        session_id in eleven_tts_clients
+    )
+    
+    if use_elevenlabs_direct:
+        # ═══════════════════════════════════════════════════════════════════
+        # ELEVENLABS DIRECT MODE: Use pre-warmed ElevenLabs client
+        # Bypasses standard TTS WebSocket for ultra-low latency
+        # ═══════════════════════════════════════════════════════════════════
+        logger.info("⚡ Using ELEVENLABS DIRECT streaming mode (pre-warmed)")
+        client = eleven_tts_clients[session_id]
+        
+        try:
+            first_audio_sent = False
+            
+            async def on_first_audio(latency_ms: float):
+                nonlocal first_audio_sent
+                if not first_audio_sent:
+                    first_audio_sent = True
+                    if websocket:
+                        try:
+                            await websocket.send_json({
+                                "type": "first_audio",
+                                "latency_ms": latency_ms,
+                                "mode": "elevenlabs_direct"
+                            })
+                        except Exception:
+                            pass
+            
+            # Stream text to audio and forward immediately to browser
+            chunks_sent = 0
+            total_bytes_sent = 0
+            
+            async for audio_bytes, metadata in client.stream_text_to_audio(generator, on_first_audio):
+                # Forward audio to WebSocket client IMMEDIATELY (no buffering)
+                if websocket:
+                    try:
+                        await websocket.send_bytes(audio_bytes)
+                        chunks_sent += 1
+                        total_bytes_sent += len(audio_bytes)
+                        logger.debug(f"📤 Forwarded audio chunk {chunks_sent}: {len(audio_bytes)} bytes")
+                    except Exception as e:
+                        logger.warning(f"Could not forward audio to client: {e}")
+                        # Don't break, continue forwarding remaining chunks
+                
+                # Log progress
+                if metadata.get("is_final"):
+                    logger.info(f"✅ ElevenLabs stream complete (forwarded {chunks_sent} chunks, {total_bytes_sent} bytes)")
+            
+            # Get metrics
+            metrics = client.get_metrics()
+            logger.info(f"📊 ElevenLabs metrics: received {metrics.get('chunks_received')} chunks, "
+                       f"{metrics.get('total_audio_bytes')} bytes | "
+                       f"forwarded {chunks_sent} chunks, {total_bytes_sent} bytes | "
+                       f"first audio: {metrics.get('first_audio_latency_ms', 'N/A')}ms")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in ElevenLabs direct streaming: {e}")
+        finally:
+            # Clean up the client after streaming
+            await cleanup_elevenlabs_client(session_id)
+        
+        return
+    
+    # ═══════════════════════════════════════════════════════════════════
+    # STANDARD MODE: Use generic TTS WebSocket (tts-sarvam or tts-labs)
+    # ═══════════════════════════════════════════════════════════════════
     tts_ws_url = config.tts_service_url.replace("http://", "ws://").replace("https://", "wss://")
     tts_ws_url = f"{tts_ws_url}/api/v1/stream?session_id={session_id}"
     
-    buffer = SmartBuffer()
+    # Determine streaming mode
+    streaming_mode = getattr(config, 'tts_streaming_mode', 'buffered')
+    use_continuous_mode = streaming_mode == "continuous"
+    
+    buffer = SmartBuffer() if not use_continuous_mode else None
     full_text = ""
     
     try:
         logger.info(f"🔊 Connecting to TTS service for streaming: {tts_ws_url}")
+        logger.info(f"   Streaming mode: {streaming_mode}")
         
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(tts_ws_url) as tts_ws:
+                # Send initial connection message
+                await tts_ws.send_json({
+                    "type": "connect",
+                    "session_id": session_id
+                })
+                
                 # Start a background task to receive TTS events (audio, etc.)
                 receive_task = asyncio.create_task(
                     _handle_tts_responses(tts_ws, websocket)
                 )
                 
                 try:
-                    async for token in generator:
-                        full_text += token
-                        sentence = buffer.add_token(token)
-                        if sentence:
-                            logger.info(f"📤 Sending phrase to TTS: {sentence[:50]}...")
+                    if use_continuous_mode:
+                        # =======================================================
+                        # CONTINUOUS MODE: Stream chunks directly (ultra-low latency)
+                        # Bypasses SmartBuffer for ElevenLabs stream-input API
+                        # =======================================================
+                        logger.info("⚡ Using CONTINUOUS streaming mode (bypassing SmartBuffer)")
+                        chunk_count = 0
+                        
+                        async for token in generator:
+                            if not token:
+                                continue
+                            full_text += token
+                            chunk_count += 1
+                            
+                            # Send each token/chunk immediately
+                            logger.debug(f"📤 Sending chunk {chunk_count}: {len(token)} chars")
                             await tts_ws.send_json({
-                                "type": "synthesize",
-                                "text": sentence,
-                                "streaming": True,
+                                "type": "stream_chunk",
+                                "text": token,
                                 "emotion": emotion
                             })
-                    
-                    # Flush remaining buffer
-                    remaining = buffer.flush()
-                    if remaining:
-                        logger.info(f"📤 Sending final phrase to TTS: {remaining[:50]}...")
-                        await tts_ws.send_json({
-                            "type": "synthesize",
-                            "text": remaining,
-                            "streaming": True,
-                            "emotion": emotion
-                        })
                         
+                        logger.info(f"📤 Sent {chunk_count} chunks in continuous mode")
+                    else:
+                        # =======================================================
+                        # BUFFERED MODE: Wait for complete sentences (better prosody)
+                        # Uses SmartBuffer for natural speech patterns
+                        # =======================================================
+                        logger.info("📝 Using BUFFERED streaming mode (SmartBuffer)")
+                        
+                        async for token in generator:
+                            full_text += token
+                            sentence = buffer.add_token(token)
+                            if sentence:
+                                logger.info(f"📤 Sending sentence to TTS: {sentence[:50]}...")
+                                await tts_ws.send_json({
+                                    "type": "stream_chunk",
+                                    "text": sentence,
+                                    "emotion": emotion
+                                })
+                        
+                        # Flush remaining buffer
+                        remaining = buffer.flush()
+                        if remaining:
+                            logger.info(f"📤 Sending final chunk to TTS: {remaining[:50]}...")
+                            await tts_ws.send_json({
+                                "type": "stream_chunk",
+                                "text": remaining,
+                                "emotion": emotion
+                            })
+                        
+                    # Send end of stream
+                    await tts_ws.send_json({
+                        "type": "stream_end"
+                    })
+                    
                     # Keep connection open for a bit to receive remaining audio
                     await asyncio.sleep(2.0)
                     
@@ -1141,57 +1575,156 @@ async def stream_tts_from_generator(
 
 
 async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSocket], state_mgr: StateManager):
-    """
-    Handle final STT event from Redis - trigger Intent+RAG+LLM pipeline or direct RAG (TARA mode).
-    
-    Pre-LLM Accumulation Optimization:
-    - When this is called (is_final=true), RAG already has pre-built prompt from partial chunks
-    - Generation uses the pre-accumulated context for faster response (~355ms vs ~400ms)
-    """
+    """Handle STT event from Redis - trigger Intent+RAG+LLM pipeline or direct RAG (TARA mode)"""
     try:
-        # Log accumulation stats
-        chunks_processed = state_mgr.context.chunk_sequence
-        accumulation_active = state_mgr.context.rag_accumulation_active
-        
         logger.info("=" * 70)
-        logger.info(f"[SESSION:{session_id}] 🤐 Processing final STT event")
-        logger.info(f"   📝 Text: {text}")
-        logger.info(f"   📊 Pre-LLM Stats: {chunks_processed} chunks accumulated, active={accumulation_active}")
+        logger.info(f"🤐 Processing STT event")
+        logger.info(f"📝 Text: {text}")
         if config.tara_mode:
-            logger.info(f"   🇮🇳 TARA MODE: Using optimized RAG generation (pre-built prompt)")
+            logger.info(f"🇮🇳 TARA MODE: Direct RAG (skip Intent)")
         logger.info("=" * 70)
+        
+        session_data = active_sessions.get(session_id, {})
+        
+        # Check for exit keywords
+        text_lower = text.lower().strip()
+        # Prefer keywords from DialogueManager (JSON), fall back to config
+        exit_keywords: list[str] = []
+        if dialogue_manager and dialogue_manager.exit_keywords:
+            exit_keywords.extend(dialogue_manager.exit_keywords)
+        if hasattr(config, "exit_keywords"):
+            exit_keywords.extend(
+                kw.strip().lower() for kw in config.exit_keywords if kw.strip()
+            )
+        # Deduplicate
+        exit_keywords = sorted(set(exit_keywords))
+        if any(keyword in text_lower for keyword in exit_keywords):
+            logger.info("=" * 70)
+            logger.info(f"🚪 EXIT DETECTED: User said '{text}'")
+            logger.info("=" * 70)
+            
+            # Get exit dialogue from Dialogue Manager
+            if dialogue_manager:
+                exit_asset = dialogue_manager.get_random_exit()
+                logger.info(f"🎤 Playing exit dialogue: {exit_asset.text[:50]}...")
+                
+                # Transition to SPEAKING for exit message
+                await state_mgr.transition(State.SPEAKING, "exit_detected", {})
+                
+                # Play exit dialogue
+                await stream_tts_audio(
+                    session_id,
+                    exit_asset.text,
+                    websocket,
+                    state_mgr,
+                    emotion=exit_asset.emotion,
+                    audio_file_path=exit_asset.audio_path if exit_asset.has_audio() else None
+                )
+                
+                # Transition to IDLE and mark session for cleanup
+                await state_mgr.transition(State.IDLE, "exit_complete", {})
+                
+                if websocket:
+                    try:
+                        await websocket.send_json({
+                            "type": "exit",
+                            "session_id": session_id,
+                            "message": "Session ending..."
+                        })
+                    except:
+                        pass
+                
+                # Remove session after a short delay
+                await asyncio.sleep(1.0)
+                if session_id in active_sessions:
+                    del active_sessions[session_id]
+                    logger.info(f"✅ Session {session_id} ended and cleaned up")
+                
+                return
         
         # Update state to THINKING
         await state_mgr.transition(State.THINKING, "stt_received", {"text": text})
         
+        # Handle unclear / empty text with a dedicated prompt
         if not text.strip():
-            logger.warning(f"[SESSION:{session_id}] ⚠️ Empty user text, skipping processing")
-            # Reset accumulation for next utterance
-            state_mgr.context.reset_accumulation()
-            reset_chunk_sequence(session_id)
-            await state_mgr.transition(State.IDLE, "empty_text", {})
+            logger.warning("⚠️ Empty/unclear user text, playing UNCLEAR prompt if available")
+            if dialogue_manager:
+                unclear_asset = dialogue_manager.get_unclear_prompt()
+                await state_mgr.transition(State.SPEAKING, "unclear_prompt", {})
+                await stream_tts_audio(
+                    session_id,
+                    unclear_asset.text,
+                    websocket,
+                    state_mgr,
+                    emotion=unclear_asset.emotion,
+                    audio_file_path=unclear_asset.audio_path if unclear_asset.has_audio() else None,
+                )
+                await state_mgr.transition(State.LISTENING, "unclear_complete", {})
+            else:
+                await state_mgr.transition(State.IDLE, "empty_text", {})
             return
+        
+        # ──────────────────────────────────────────────────────────────
+        # 1) IMMEDIATE FILLER – right after user stops (hold the floor)
+        # ──────────────────────────────────────────────────────────────
+        latency_filler_task = None
+        if dialogue_manager:
+            immediate_asset = dialogue_manager.get_immediate_filler()
+            logger.info(f"💭 Playing immediate filler: {immediate_asset.text[:50]}...")
+            asyncio.create_task(
+                stream_tts_audio(
+                    session_id,
+                    immediate_asset.text,
+                    websocket,
+                    state_mgr,
+                    emotion=immediate_asset.emotion,
+                    audio_file_path=immediate_asset.audio_path if immediate_asset.has_audio() else None,
+                    skip_state_transition=True,  # Don't change FSM state for fillers
+                )
+            )
+            
+            # ──────────────────────────────────────────────────────────
+            # 2) DELAYED FILLER – only if RAG/LLM+TTS takes > ~1.5s
+            # ──────────────────────────────────────────────────────────
+            async def delayed_latency_filler():
+                try:
+                    # Wait for latency threshold
+                    await asyncio.sleep(1.5)
+                    latency_asset = dialogue_manager.get_latency_filler()
+                    logger.info(f"⏳ Playing latency filler: {latency_asset.text[:50]}...")
+                    await stream_tts_audio(
+                        session_id,
+                        latency_asset.text,
+                        websocket,
+                        state_mgr,
+                        emotion=latency_asset.emotion,
+                        audio_file_path=latency_asset.audio_path if latency_asset.has_audio() else None,
+                        skip_state_transition=True,  # Don't change FSM state
+                    )
+                except asyncio.CancelledError:
+                    logger.info(f"Latency filler task cancelled for session {session_id}")
+                    raise
+                except Exception as exc:
+                    logger.error(f"Error in latency filler for session {session_id}: {exc}", exc_info=True)
+
+            latency_filler_task = asyncio.create_task(delayed_latency_filler())
+            if isinstance(session_data, dict):
+                session_data["latency_filler_task"] = latency_filler_task
         
         start_time = time.time()
         
-        # ═══════════════════════════════════════════════════════════════════════
-        # TARA MODE: Optimized RAG call with Pre-LLM Accumulation
+        # ═══════════════════════════════════════════════════════════════
+        # TARA MODE: Direct RAG call (skip Intent service)
         # For Telugu TASK customer service agent
-        #
-        # Optimization Flow:
-        # 1. Partial chunks → RAG pre-processing (pattern, retrieval, extraction, prompt)
-        # 2. Final text → RAG generation using pre-built prompt (fast ~355ms)
-        # ═══════════════════════════════════════════════════════════════════════
+        # Now uses INCREMENTAL RAG for lower latency
+        # ═══════════════════════════════════════════════════════════════
         generator = None
         
         if config.skip_intent_service or config.tara_mode:
             if config.rag_service_url:
-                logger.info(
-                    f"[SESSION:{session_id}] 🇮🇳 TARA: Requesting optimized generation "
-                    f"(pre-accumulated from {chunks_processed} chunks)..."
-                )
+                logger.info("🇮🇳 TARA: Incremental RAG processing (using buffered context)...")
                 
-                # Use incremental RAG which leverages pre-built prompt
+                # Use incremental RAG which leverages pre-buffered documents
                 generator = process_rag_incremental(
                     user_text=text,
                     session_id=session_id,
@@ -1218,6 +1751,13 @@ async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSo
                 config.rag_service_url  # Can be None if RAG not configured
             )
         
+        # Cancel latency filler once we're ready to start speaking
+        if isinstance(session_data, dict):
+            task = session_data.get("latency_filler_task")
+            if task and not task.done():
+                task.cancel()
+            session_data["latency_filler_task"] = None
+        
         # Transition to SPEAKING immediately as we start streaming
         await state_mgr.transition(State.SPEAKING, "streaming_started", {})
         
@@ -1226,23 +1766,13 @@ async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSo
             await stream_tts_from_generator(session_id, generator, websocket, state_mgr)
         
         total_time = (time.time() - start_time) * 1000
-        logger.info(
-            f"[SESSION:{session_id}] ✅ Interaction completed in {total_time:.0f}ms "
-            f"(with {chunks_processed} pre-accumulated chunks)"
-        )
-        
-        # Reset accumulation state for next utterance
-        state_mgr.context.reset_accumulation()
-        reset_chunk_sequence(session_id)
+        logger.info(f"✅ Interaction completed in {total_time:.0f}ms")
         
         # Transition back to LISTENING (or IDLE)
         await state_mgr.transition(State.LISTENING, "interaction_complete", {})
         
     except Exception as e:
-        logger.error(f"[SESSION:{session_id}] ❌ Error in handle_stt_event: {e}", exc_info=True)
-        # Reset accumulation on error
-        state_mgr.context.reset_accumulation()
-        reset_chunk_sequence(session_id)
+        logger.error(f"❌ Error in handle_stt_event: {e}", exc_info=True)
         await state_mgr.transition(State.IDLE, "error", {"error": str(e)})
 
 

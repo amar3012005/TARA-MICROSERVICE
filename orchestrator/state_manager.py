@@ -41,12 +41,16 @@ class ConversationContext:
     rag_accumulation_active: bool = False
     last_partial_text: str = ""
     accumulation_start_time: Optional[float] = None
+    # Activity tracking for timeout detection
+    last_activity_time: Optional[float] = None
     
     def __post_init__(self):
         if self.timestamps is None:
             self.timestamps = {}
         if self.text_buffer is None:
             self.text_buffer = []
+        if self.last_activity_time is None:
+            self.last_activity_time = time.time()
     
     def reset_accumulation(self):
         """Reset RAG accumulation state for new utterance"""
@@ -103,6 +107,8 @@ class StateManager:
                     self.context.turn_number = int(existing.get("turn_number", 0))
                     if existing.get("text_buffer"):
                         self.context.text_buffer = json.loads(existing.get("text_buffer", "[]"))
+                    if existing.get("last_activity_time"):
+                        self.context.last_activity_time = float(existing.get("last_activity_time", time.time()))
                     self.state = State(self.context.state)
                 else:
                     logger.info(f"[{self.session_id}] 🆕 Created new session")
@@ -137,6 +143,10 @@ class StateManager:
                 self.context.rag_results = data["rag_results"]
             if "response" in data:
                 self.context.llm_response = data["response"]
+        
+        # Update activity time for user interaction triggers
+        if trigger in ("stt_fragment", "vad_end", "stt_received"):
+            self.context.last_activity_time = timestamp
         
         # Persist to Redis (O(1) operation)
         await self.save_state()
@@ -177,7 +187,8 @@ class StateManager:
             "intent": json.dumps(self.context.intent or {}),
             "rag_results": json.dumps(self.context.rag_results or {}),
             "llm_response": self.context.llm_response or "",
-            "last_update": str(time.time())
+            "last_update": str(time.time()),
+            "last_activity_time": str(self.context.last_activity_time or time.time())
         }
         
         try:
@@ -204,6 +215,8 @@ class StateManager:
                     if data.get("rag_results"):
                         self.context.rag_results = json.loads(data.get("rag_results", "{}"))
                     self.context.llm_response = data.get("llm_response", "")
+                    if data.get("last_activity_time"):
+                        self.context.last_activity_time = float(data.get("last_activity_time", time.time()))
                     self.state = State(self.context.state)
                     logger.debug(f"[{self.session_id}] ✅ State loaded from Redis")
         except Exception as e:

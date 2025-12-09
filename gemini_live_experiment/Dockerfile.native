@@ -1,0 +1,38 @@
+# Dockerfile for Native WebRTC (UDP) Mode
+# Uses native_app.py as the single entry point
+
+FROM python:3.11-slim
+
+# Install system dependencies (libsndfile for audio, portaudio)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+    portaudio19-dev \
+    iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install Python dependencies
+COPY stt_vad/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy code
+COPY . .
+WORKDIR /app/stt_vad
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV GEMINI_API_KEY="AIzaSyCXz2gMP-1zXqA4xyJO0L_4PP3zHhsBCCg"
+
+# Ports
+# 7860: Gradio UI / Signaling (TCP)
+# 50000-50050: WebRTC Media (UDP) - Must match docker-compose
+EXPOSE 7860
+EXPOSE 50000-50050/udp
+
+# Entry point: Run the native app directly
+CMD ["python", "-u", "native_app.py"]
+
+
+
+

@@ -26,13 +26,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ========== CRITICAL: Copy ONLY requirements first for caching ==========
 # This layer is cached unless requirements.txt changes
+# Requirements.txt is ordered: HEAVY packages first (torch, numpy, faiss)
+#                              then ML frameworks (sentence-transformers)
+#                              then application code (fastapi, uvicorn)
+# This ensures heavy packages are cached when lighter packages change
 COPY rag/requirements.txt /build/requirements.txt
 
-# Install ALL heavy packages (torch, transformers, faiss, etc.)
-# This is the expensive step - gets cached after first build
+# Install ALL packages in optimized order (heavy → light)
+# Docker caches this layer - only rebuilds if requirements.txt changes
+# With optimized order, pip installs heaviest packages first (best caching)
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --default-timeout=1000 --user -r requirements.txt && \
-    echo "✅ All heavy packages installed (cached for future builds)"
+    echo "✅ All packages installed (heavy packages cached for future builds)"
 
 # Verify key packages
 RUN python -c "import torch; import sentence_transformers; import faiss; print('✅ torch, transformers, faiss verified')"
@@ -114,7 +119,7 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # TARA Mode defaults
-ENV GEMINI_API_KEY="AIzaSyC-Dq_oF3H-qdG7ZxXcLLO9dTscl1dWjdE"
+ENV GEMINI_API_KEY="AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw"
 ENV GEMINI_MODEL="gemini-2.0-flash-lite"
 ENV LEIBNIZ_REDIS_HOST="tara-redis"
 ENV LEIBNIZ_REDIS_PORT="6379"
@@ -138,7 +143,7 @@ ENV LOG_LEVEL="INFO"
 ENV ENABLE_PREWARMING="true"
 ENV WARMUP_QUERIES_COUNT="10"
 ENV ENABLE_MODEL_PERSISTENCE="true"
-ENV PREPOPULATE_CACHE="true"
+ENV PREPOPULATE_CACHE="false"
 ENV GEMINI_TIMEOUT_MS="5000"
 ENV EMBEDDING_BATCH_SIZE="32"
 

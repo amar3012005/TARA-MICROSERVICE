@@ -340,3 +340,4 @@ class SarvamWebSocketTTS:
             "last_latency": self.last_latency,
             "chunks_in_last_request": self.chunks_received
         }
+

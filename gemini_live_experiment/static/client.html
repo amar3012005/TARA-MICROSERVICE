@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Leibniz STT/VAD - TCP Client</title>
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: #1a1f2e;
+            --text-primary: #e0e0e0;
+            --text-secondary: #a0a0a0;
+            --accent: #3b82f6;
+            --accent-hover: #2563eb;
+            --success: #10b981;
+            --error: #ef4444;
+            --border: #2e374a;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 20px;
+            height: 100vh;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 800px;
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+            padding: 24px;
+            border: 1px solid var(--border);
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 16px;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .badge {
+            font-size: 0.75rem;
+            padding: 4px 8px;
+            border-radius: 4px;
+            background: rgba(59, 130, 246, 0.2);
+            color: var(--accent);
+            border: 1px solid rgba(59, 130, 246, 0.3);
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.875rem;
+            padding: 6px 12px;
+            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--text-secondary);
+        }
+
+        .dot.connected { background-color: var(--success); box-shadow: 0 0 8px var(--success); }
+        .dot.disconnected { background-color: var(--error); }
+        .dot.connecting { background-color: #fbbf24; animation: pulse 1.5s infinite; }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .controls {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        button {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            font-size: 1rem;
+        }
+
+        #startBtn {
+            background-color: var(--accent);
+            color: white;
+        }
+
+        #startBtn:hover:not(:disabled) { background-color: var(--accent-hover); }
+        
+        #stopBtn {
+            background-color: rgba(239, 68, 68, 0.2);
+            color: var(--error);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        #stopBtn:hover:not(:disabled) { background-color: rgba(239, 68, 68, 0.3); }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            filter: grayscale(1);
+        }
+
+        .visualizer-container {
+            height: 60px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 8px;
+            margin-bottom: 24px;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+
+        canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .transcript-area {
+            min-height: 120px;
+            max-height: 200px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 24px;
+            font-size: 1.1rem;
+            line-height: 1.5;
+        }
+
+        .placeholder {
+            color: var(--text-secondary);
+            font-style: italic;
+            text-align: center;
+            margin-top: 40px;
+        }
+
+        .fragment {
+            transition: color 0.3s;
+        }
+        .fragment.final { color: var(--text-primary); }
+        .fragment.partial { color: var(--text-secondary); }
+
+        .logs-container {
+            background: #000;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            height: 150px;
+            overflow-y: auto;
+            color: var(--success);
+            border: 1px solid var(--border);
+        }
+
+        .log-entry { margin-bottom: 4px; word-break: break-all; }
+        .log-entry.error { color: var(--error); }
+        .log-entry.info { color: var(--text-secondary); }
+        
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-secondary); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                🎙️ Leibniz Agent
+                <span class="badge">TCP/WebSocket</span>
+            </h1>
+            <div class="status-indicator">
+                <div id="statusDot" class="dot disconnected"></div>
+                <span id="statusText">Disconnected</span>
+            </div>
+        </header>
+
+        <div class="controls">
+            <button id="startBtn" onclick="startRecording()">
+                <span>▶</span> Start Microphone
+            </button>
+            <button id="stopBtn" onclick="stopRecording()" disabled>
+                <span>⏹</span> Stop
+            </button>
+        </div>
+
+        <div class="visualizer-container">
+            <canvas id="visualizer"></canvas>
+        </div>
+
+        <div id="transcriptArea" class="transcript-area">
+            <div class="placeholder">Transcripts will appear here...</div>
+        </div>
+
+        <div class="logs-container" id="logs">
+            <div class="log-entry info">System ready. waiting for connection...</div>
+        </div>
+    </div>
+
+    <script>
+        // Configuration
+        const SAMPLE_RATE = 16000;
+        const BUFFER_SIZE = 4096;
+        
+        // State
+        let socket;
+        let audioContext;
+        let processor;
+        let input;
+        let isRecording = false;
+        let sessionId = "tcp_client_" + Date.now();
+        let canvas, ctx;
+        
+        // Elements
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const transcriptArea = document.getElementById('transcriptArea');
+        const logsDiv = document.getElementById('logs');
+
+        // Initialization
+        window.onload = () => {
+            initVisualizer();
+            connectWebSocket();
+        };
+
+        function log(msg, type = 'normal') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `> ${msg}`;
+            logsDiv.appendChild(entry);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+
+        function setStatus(state) {
+            statusDot.className = `dot ${state}`;
+            statusText.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+        }
+
+        function initVisualizer() {
+            canvas = document.getElementById('visualizer');
+            ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
+            const rect = canvas.getBoundingClientRect();
+            canvas.width = rect.width * dpr;
+            canvas.height = rect.height * dpr;
+            ctx.scale(dpr, dpr);
+            
+            // Draw initial line
+            ctx.beginPath();
+            ctx.moveTo(0, rect.height / 2);
+            ctx.lineTo(rect.width, rect.height / 2);
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+
+        function drawVisualizer(dataArray) {
+            if (!ctx) return;
+            const width = canvas.width / (window.devicePixelRatio || 1);
+            const height = canvas.height / (window.devicePixelRatio || 1);
+            
+            ctx.clearRect(0, 0, width, height);
+            ctx.lineWidth = 2;
+            ctx.strokeStyle = '#3b82f6';
+            ctx.beginPath();
+
+            const sliceWidth = width * 1.0 / dataArray.length;
+            let x = 0;
+
+            for (let i = 0; i < dataArray.length; i++) {
+                const v = dataArray[i]; // Float -1 to 1
+                const y = (v + 1) / 2 * height;
+
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+
+                x += sliceWidth;
+            }
+
+            ctx.lineTo(width, height / 2);
+            ctx.stroke();
+        }
+
+        function connectWebSocket() {
+            setStatus('connecting');
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/api/v1/transcribe/stream?session_id=${sessionId}`;
+            
+            log(`Connecting to ${wsUrl}...`, 'info');
+            
+            socket = new WebSocket(wsUrl);
+
+            socket.onopen = () => {
+                log("WebSocket Connected", 'normal');
+                setStatus('connected');
+                startBtn.disabled = false;
+                stopBtn.disabled = true;
+            };
+
+            socket.onclose = (e) => {
+                log(`WebSocket Disconnected (Code: ${e.code})`, 'error');
+                setStatus('disconnected');
+                stopRecording();
+                startBtn.disabled = true;
+                
+                // Auto reconnect after 3s
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            socket.onerror = (error) => {
+                log("WebSocket Error", 'error');
+            };
+
+            socket.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.type === 'fragment') {
+                        updateTranscript(data.text, data.is_final);
+                    } else if (data.type === 'connected') {
+                        log(`Server: ${data.message}`, 'success');
+                    }
+                } catch (e) {
+                    // Ignore binary or non-json
+                }
+            };
+        }
+
+        let currentText = "";
+        function updateTranscript(text, isFinal) {
+            // Simple transcript display: Just show the latest text
+            // In a real app you'd merge fragments
+            if (transcriptArea.querySelector('.placeholder')) {
+                transcriptArea.innerHTML = '';
+            }
+            
+            const div = document.createElement('div');
+            div.className = `fragment ${isFinal ? 'final' : 'partial'}`;
+            div.textContent = text;
+            
+            // For this demo, we just clear and show latest, 
+            // or append if final.
+            if (isFinal) {
+                const p = document.createElement('p');
+                p.textContent = "✅ " + text;
+                p.style.color = "#10b981";
+                transcriptArea.appendChild(p);
+                currentText = "";
+                transcriptArea.scrollTop = transcriptArea.scrollHeight;
+            } else {
+                // Find existing partial
+                let partial = document.getElementById('partial-text');
+                if (!partial) {
+                    partial = document.createElement('div');
+                    partial.id = 'partial-text';
+                    partial.style.color = "#a0a0a0";
+                    transcriptArea.appendChild(partial);
+                }
+                partial.textContent = "..." + text;
+            }
+        }
+
+        async function startRecording() {
+            try {
+                if (!socket || socket.readyState !== WebSocket.OPEN) {
+                    log("WebSocket not connected", 'error');
+                    return;
+                }
+
+                log("Requesting microphone...", 'info');
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                input = audioContext.createMediaStreamSource(stream);
+                
+                // Use ScriptProcessor for compatibility (AudioWorklet is better but more complex setup)
+                processor = audioContext.createScriptProcessor(BUFFER_SIZE, 1, 1);
+                
+                input.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (!isRecording) return;
+
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    
+                    // Draw visualizer
+                    // Downsample for visualizer (take every nth sample)
+                    const visData = [];
+                    for(let i=0; i<inputData.length; i+=32) visData.push(inputData[i]);
+                    drawVisualizer(visData);
+
+                    // Convert float32 to int16 for server
+                    const buffer = new Int16Array(inputData.length);
+                    for (let i = 0; i < inputData.length; i++) {
+                        const s = Math.max(-1, Math.min(1, inputData[i]));
+                        buffer[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    
+                    if (socket.readyState === WebSocket.OPEN) {
+                        socket.send(buffer.buffer);
+                    }
+                };
+
+                isRecording = true;
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                startBtn.innerHTML = "<span>●</span> Recording...";
+                startBtn.style.background = "rgba(59, 130, 246, 0.1)";
+                startBtn.style.color = "#3b82f6";
+                
+                log("Microphone active - Sending audio", 'success');
+                
+                // Send start command
+                socket.send(JSON.stringify({ type: "start_capture" }));
+
+            } catch (err) {
+                log("Microphone Error: " + err.message, 'error');
+                alert("Could not access microphone: " + err.message);
+            }
+        }
+
+        function stopRecording() {
+            isRecording = false;
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            startBtn.innerHTML = "<span>▶</span> Start Microphone";
+            startBtn.style.background = "";
+            startBtn.style.color = "";
+            
+            if (processor) {
+                processor.disconnect();
+                input.disconnect();
+            }
+            if (audioContext) {
+                audioContext.close();
+            }
+            
+            // Clear visualizer
+            if (ctx) {
+                const width = canvas.width / (window.devicePixelRatio || 1);
+                const height = canvas.height / (window.devicePixelRatio || 1);
+                ctx.clearRect(0, 0, width, height);
+                ctx.beginPath();
+                ctx.moveTo(0, height/2);
+                ctx.lineTo(width, height/2);
+                ctx.strokeStyle = '#3b82f6';
+                ctx.stroke();
+            }
+
+            log("Recording stopped", 'info');
+        }
+    </script>
+</body>
+</html>

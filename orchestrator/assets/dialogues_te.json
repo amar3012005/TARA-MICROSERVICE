@@ -1,0 +1,85 @@
+{
+  "language": "te-mixed",
+  "dialogues": {
+    "intro": [
+      {
+        "text": "నమస్కారం అండి! నేను TARA, TASK యొక్క కస్టమర్ సర్వీస్ ఏజెంట్. మీకు ఎలా సహాయం చేయగలను?",
+        "emotion": "warm",
+        "audio_file": "intro.wav"
+      }
+    ],
+    "exit": [
+      {
+        "text": "ధన్యవాదాలు! మీకు మరో సహాయం కావాలంటే, మళ్లీ కాల్ చేయండి. మంచి రోజు!",
+        "emotion": "grateful",
+        "audio_file": "exit.wav",
+        "keywords": ["bye", "goodbye", "సెలవు"]
+      },
+      {
+        "text": "సంతోషంగా! మీకు మరో సహాయం కావాలంటే, మాకు తెలపండి. శుభం!",
+        "emotion": "friendly",
+        "audio_file": "exit_alt.wav"
+      }
+    ],
+    "filler_immediate": [
+      {
+        "text": "సరే.",
+        "emotion": "neutral",
+        "trigger": "immediate"
+      },
+      {
+        "text": "అలాగే.",
+        "emotion": "neutral",
+        "trigger": "immediate"
+      },
+      {
+        "text": "బాగుంది.",
+        "emotion": "neutral",
+        "trigger": "immediate"
+      }
+    ],
+    "filler_latency": [
+      {
+        "text": "చూస్తున్నాను, ఒక్క క్షణం...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:1500",
+        "audio_file": "filler_thinking.wav"
+      },
+      {
+        "text": "మీ కోసం వివరాలు తీసుకువస్తున్నాను...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:2000",
+        "audio_file": "filler_moment.wav"
+      },
+      {
+        "text": "ఒక్కసారి చూసి చెబుతాను...",
+        "emotion": "thinking",
+        "trigger": "delay_ms:1800"
+      }
+    ],
+    "timeout": [
+      {
+        "text": "మీరు అక్కడ ఉన్నారా? నేను మీకు సహాయం చేయగలను.",
+        "emotion": "concerned",
+        "trigger": "timeout_ms:10000",
+        "audio_file": "timeout.wav"
+      },
+      {
+        "text": "మీరు వింటున్నారా? మాట్లాడాలని ఉంటే, దయచేసి మాట్లాడండి.",
+        "emotion": "helpful",
+        "trigger": "timeout_ms:10000",
+        "audio_file": "timeout_alt.wav"
+      }
+    ],
+    "unclear": [
+      {
+        "text": "క్షమించండి, బాగా వినపడలేదు. మరోసారి చెప్పగలరా?",
+        "emotion": "neutral"
+      },
+      {
+        "text": "కొంచెం స్పష్టంగా మళ్లీ చెబుతారా?",
+        "emotion": "neutral"
+      }
+    ]
+  }
+}

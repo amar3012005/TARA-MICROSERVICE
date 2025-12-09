@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TARA LiveKit Client</title>
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <style>
+        body { 
+            font-family: sans-serif; 
+            display: flex; 
+            flex-direction: column; 
+            align-items: center; 
+            justify-content: center; 
+            min-height: 100vh; 
+            margin: 0; 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            text-align: center;
+            max-width: 600px;
+            width: 90%;
+        }
+        h1 { margin-top: 0; color: #667eea; }
+        #status { 
+            margin-top: 20px; 
+            padding: 15px; 
+            border-radius: 5px; 
+            background: #f8f9fa; 
+            border-left: 4px solid #667eea;
+            min-height: 20px;
+            text-align: left;
+            font-family: monospace;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+        }
+        button { 
+            padding: 12px 30px; 
+            font-size: 16px; 
+            cursor: pointer; 
+            background: #667eea; 
+            color: white; 
+            border: none; 
+            border-radius: 5px;
+            transition: background 0.3s;
+        }
+        button:hover:not(:disabled) { background: #5568d3; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #transcript { 
+            margin-top: 20px; 
+            padding: 15px; 
+            background: #f8f9fa; 
+            border-radius: 5px;
+            min-height: 50px;
+            text-align: left;
+        }
+        .audio-container {
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 TARA Voice Agent</h1>
+        <button id="connectBtn">Connect & Speak</button>
+        <div id="status">Status: Disconnected</div>
+        <div id="transcript" style="display: none;">
+            <strong>Transcript:</strong><br>
+            <span id="transcriptText">Waiting for speech...</span>
+        </div>
+        <div class="audio-container" id="audioContainer"></div>
+    </div>
+
+    <script>
+        const connectBtn = document.getElementById('connectBtn');
+        const statusDiv = document.getElementById('status');
+        const transcriptDiv = document.getElementById('transcript');
+        const transcriptText = document.getElementById('transcriptText');
+        const audioContainer = document.getElementById('audioContainer');
+        let room;
+        let audioElements = [];
+
+        function log(message, isError = false) {
+            const timestamp = new Date().toLocaleTimeString();
+            const msg = `[${timestamp}] ${message}`;
+            console.log(msg);
+            statusDiv.textContent += msg + '\n';
+            statusDiv.scrollTop = statusDiv.scrollHeight;
+            if (isError) {
+                statusDiv.style.borderLeftColor = '#dc3545';
+            }
+        }
+
+        async function connect() {
+            connectBtn.disabled = true;
+            statusDiv.textContent = ''; // Clear logs
+            log("Starting connection process...");
+
+            try {
+                // 1. Get Token
+                log("Fetching access token...");
+                const response = await fetch('/token');
+                if (!response.ok) {
+                    throw new Error(`Token request failed: ${response.statusText}`);
+                }
+                const data = await response.json();
+                const token = data.token;
+                const url = "ws://" + window.location.hostname + ":7880";
+                
+                log(`Token received. Connecting to LiveKit server at ${url}...`);
+
+                // 2. Connect to Room
+                room = new LivekitClient.Room({
+                    adaptiveStream: true,
+                    dynacast: true,
+                    videoCaptureDefaults: {
+                        resolution: LivekitClient.VideoPresets.h720.resolution,
+                    },
+                });
+
+                // Set up event handlers
+                room.on(LivekitClient.RoomEvent.SignalConnected, () => {
+                    log("Signal connection established.");
+                });
+
+                room.on(LivekitClient.RoomEvent.Connected, () => {
+                    log("Room connected successfully!");
+                });
+
+                room.on(LivekitClient.RoomEvent.Reconnecting, () => {
+                    log("Reconnecting to room...");
+                });
+
+                room.on(LivekitClient.RoomEvent.Reconnected, () => {
+                    log("Reconnected to room.");
+                });
+
+                room.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
+                    log(`Disconnected: ${reason}`);
+                    connectBtn.disabled = false;
+                    audioElements.forEach(el => el.remove());
+                    audioElements = [];
+                });
+
+                room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+                    if (track.kind === LivekitClient.Track.Kind.Audio) {
+                        log(`Audio track subscribed from: ${participant.identity}`);
+                        const element = track.attach();
+                        // element.style.display = 'none'; // Keep visible for debugging if needed
+                        audioContainer.appendChild(element);
+                        audioElements.push(element);
+                        element.play().catch(e => log(`Autoplay failed: ${e.message}`, true));
+                        log("Audio playback started.");
+                    }
+                });
+
+                room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+                    log(`Track unsubscribed: ${track.kind}`);
+                });
+                
+                room.on(LivekitClient.RoomEvent.LocalTrackPublished, (publication, participant) => {
+                    log(`Local track published: ${publication.kind} (${publication.trackSid})`);
+                });
+                
+                room.on(LivekitClient.RoomEvent.LocalTrackUnpublished, (publication, participant) => {
+                    log(`Local track unpublished: ${publication.kind}`);
+                });
+                
+                room.on(LivekitClient.RoomEvent.MediaDevicesError, (e) => {
+                    log(`Media Device Error: ${e.message}`, true);
+                });
+
+                // Connect
+                await room.connect(url, token);
+                log("Room connection awaited.");
+
+                // 3. Publish Microphone
+                log("Requesting microphone access...");
+                try {
+                    await room.localParticipant.setMicrophoneEnabled(true);
+                    log("Microphone enabled and published! Speak now...");
+                    transcriptDiv.style.display = 'block';
+                } catch (micError) {
+                    log(`Microphone error: ${micError.message}`, true);
+                    log("Please ensure microphone permissions are granted and you are using HTTPS or localhost.");
+                    throw micError;
+                }
+
+            } catch (error) {
+                console.error("Connection error:", error);
+                log(`Error: ${error.message}`, true);
+                connectBtn.disabled = false;
+            }
+        }
+
+        async function disconnect() {
+            if (room) {
+                log("Disconnecting...");
+                await room.disconnect();
+            }
+        }
+
+        connectBtn.addEventListener('click', () => {
+            if (room && room.state === LivekitClient.ConnectionState.Connected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        });
+
+        // Update button text based on connection state
+        setInterval(() => {
+            if (room && room.state === LivekitClient.ConnectionState.Connected) {
+                connectBtn.textContent = "Disconnect";
+            } else {
+                connectBtn.textContent = "Connect & Speak";
+            }
+        }, 500);
+    </script>
+</body>
+</html>
