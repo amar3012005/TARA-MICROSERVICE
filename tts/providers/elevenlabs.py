@@ -189,7 +189,7 @@ class ElevenLabsTTSProvider:
         
         Args:
             text: Text to synthesize
-            voice: ElevenLabs voice ID (e.g., "21m00Tcm4TlvDq8ikWAM" for Rachel)
+            voice: ElevenLabs voice ID (e.g., "AnvlJBAqSLDzEevYr9Ap" for Rachel)
             language: Ignored (ElevenLabs auto-detects language)
             emotion: Ignored (ElevenLabs doesn't support emotion)
             **kwargs: Additional parameters (stability, similarity_boost override config)
@@ -326,7 +326,7 @@ class ElevenLabsTTSProvider:
         
         Example:
             {
-                "21m00Tcm4TlvDq8ikWAM": {
+                "AnvlJBAqSLDzEevYr9Ap": {
                     "name": "Rachel",
                     "language": "en",
                     "gender": "female",

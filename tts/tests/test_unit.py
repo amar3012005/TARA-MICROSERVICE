@@ -143,7 +143,7 @@ class TestTTSConfig:
     def test_elevenlabs_voice_default(self):
         """Test ElevenLabs voice defaults to Rachel."""
         config = TTSConfig()
-        assert config.elevenlabs_voice == "21m00Tcm4TlvDq8ikWAM"
+        assert config.elevenlabs_voice == "AnvlJBAqSLDzEevYr9Ap"
 
 
 @pytest.mark.unit

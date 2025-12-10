@@ -52,8 +52,8 @@ class TTSConfig:
     
     # ElevenLabs TTS (REMOVED - keeping only LemonFox)
     # elevenlabs_api_key: Optional[str] = None
-    # elevenlabs_voice: str = "21m00Tcm4TlvDq8ikWAM"
-    # elevenlabs_model: str = "eleven_multilingual_v2"
+    # elevenlabs_voice: str = "AnvlJBAqSLDzEevYr9Ap"
+    # elevenlabs_model: str = " eleven_turbo_v2_5"
     # elevenlabs_stability: float = 0.5
     # elevenlabs_similarity_boost: float = 0.75
     
@@ -89,7 +89,7 @@ class TTSConfig:
             - GOOGLE_TTS_VOICE: Google voice name (default: en-US-Neural2-F)
             - ELEVENLABS_API_KEY: ElevenLabs API key
             - ELEVENLABS_VOICE_ID: ElevenLabs voice ID
-            - ELEVENLABS_MODEL: ElevenLabs model (default: eleven_multilingual_v2)
+            - ELEVENLABS_MODEL: ElevenLabs model (default:  eleven_turbo_v2_5)
             - LEIBNIZ_TTS_GEMINI_MODEL: Gemini model (default: gemini-2.5-flash-preview-tts)
             - LEIBNIZ_TTS_GEMINI_VOICE: Gemini voice character (default: Callirrhoe)
             - LEIBNIZ_TTS_GEMINI_EMOTION_SUPPORT: Enable emotion prompts (default: true)
@@ -131,8 +131,8 @@ class TTSConfig:
             
             # ElevenLabs TTS (REMOVED)
             # elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY"),
-            # elevenlabs_voice=os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
-            # elevenlabs_model=os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2"),
+            # elevenlabs_voice=os.getenv("ELEVENLABS_VOICE_ID", "AnvlJBAqSLDzEevYr9Ap"),
+            # elevenlabs_model=os.getenv("ELEVENLABS_MODEL", " eleven_turbo_v2_5"),
             # elevenlabs_stability=float(os.getenv("ELEVENLABS_STABILITY", "0.5")),
             # elevenlabs_similarity_boost=float(os.getenv("ELEVENLABS_SIMILARITY_BOOST", "0.75")),
             

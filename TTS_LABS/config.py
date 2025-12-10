@@ -2,7 +2,7 @@
 TTS_LABS Configuration
 
 Configuration dataclass for ElevenLabs TTS streaming service.
-Optimized for ultra-low latency with eleven_flash_v2_5 model.
+Optimized for ultra-low latency with eleven_turbo_v2_5 model.
 """
 
 import os
@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 class TTSLabsConfig:
     """Configuration for TTS_LABS microservice with ElevenLabs settings"""
     
-    # ElevenLabs API Configuration
+    # ElevenLabs API Configuration - No hardcoded defaults, must be set via environment
     elevenlabs_api_key: str = os.getenv("ELEVENLABS_API_KEY", "")
-    elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel voice
-    elevenlabs_model_id: str = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5")
+    elevenlabs_voice_id: str = os.getenv("ELEVENLABS_VOICE_ID", "")  # Configurable via environment/docker-compose
+    elevenlabs_model_id: str = os.getenv("ELEVENLABS_MODEL_ID", "").strip()  # Configurable via environment/docker-compose
     
     # Latency Optimization (0-4, higher = lower latency but potentially lower quality)
     # 0: default, 1: normal, 2: strong, 3: max, 4: max + no text normalizer
@@ -81,8 +81,8 @@ class TTSLabsConfig:
         """Load configuration from environment variables"""
         return TTSLabsConfig(
             elevenlabs_api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-            elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
-            elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5"),
+            elevenlabs_voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),  # No hardcoded default
+            elevenlabs_model_id=os.getenv("ELEVENLABS_MODEL_ID", "").strip(),  # No hardcoded default
             optimize_streaming_latency=int(os.getenv("ELEVENLABS_LATENCY_OPTIMIZATION", "4")),
             output_format=os.getenv("ELEVENLABS_OUTPUT_FORMAT", "pcm_24000"),
             stability=float(os.getenv("ELEVENLABS_STABILITY", "0.5")),
@@ -109,20 +109,35 @@ class TTSLabsConfig:
     def __post_init__(self):
         """Validate configuration"""
         if not self.elevenlabs_api_key:
-            logger.warning("ELEVENLABS_API_KEY not set - service will not function properly")
-        
+            raise ValueError("ELEVENLABS_API_KEY environment variable is required")
+
+        if not self.elevenlabs_voice_id:
+            raise ValueError("ELEVENLABS_VOICE_ID environment variable is required")
+
+        if not self.elevenlabs_model_id:
+            raise ValueError("ELEVENLABS_MODEL_ID environment variable is required")
+
+        # Validate voice ID format (ElevenLabs voice IDs are typically 22-25 characters)
+        if len(self.elevenlabs_voice_id) < 20:
+            logger.warning(f"Voice ID '{self.elevenlabs_voice_id}' seems unusually short. ElevenLabs voice IDs are typically 22+ characters.")
+
+        # Validate model ID
+        valid_models = ["eleven_monolingual_v1", "eleven_multilingual_v1", "eleven_multilingual_v2", "eleven_turbo_v2", "eleven_turbo_v2_5"]
+        if self.elevenlabs_model_id not in valid_models:
+            logger.warning(f"Model '{self.elevenlabs_model_id}' is not a known ElevenLabs model. Valid models: {valid_models}")
+
         if self.optimize_streaming_latency < 0 or self.optimize_streaming_latency > 4:
             raise ValueError(f"Invalid optimize_streaming_latency: {self.optimize_streaming_latency} (must be 0-4)")
-        
+
         if self.queue_max_size <= 0:
             raise ValueError(f"Invalid queue_max_size: {self.queue_max_size}")
-        
+
         if self.inter_sentence_gap_ms < 0:
             raise ValueError(f"Invalid inter_sentence_gap_ms: {self.inter_sentence_gap_ms}")
-        
+
         if self.fastrtc_chunk_duration_ms <= 0:
             raise ValueError(f"Invalid fastrtc_chunk_duration_ms: {self.fastrtc_chunk_duration_ms}")
-        
+
         logger.info(
             f"TTS_LABS Config: model={self.elevenlabs_model_id}, voice={self.elevenlabs_voice_id}, "
             f"latency_opt={self.optimize_streaming_latency}, format={self.output_format}, "

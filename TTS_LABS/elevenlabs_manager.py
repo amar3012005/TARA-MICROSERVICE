@@ -2,9 +2,14 @@
 ElevenLabs WebSocket Manager for Ultra-Low Latency Streaming
 
 Implements bidirectional WebSocket streaming using the ElevenLabs stream-input API.
-Optimized for <150ms first chunk latency with eleven_flash_v2_5 model.
+Optimized for <150ms first chunk latency with eleven_turbo_v2_5 model.
 
 Reference: https://elevenlabs.io/docs/api-reference/text-to-speech/stream-input
+
+This module provides:
+1. stream_text_to_audio() - Stateless function for streaming text -> audio
+2. ElevenLabsStreamManager - Class wrapper for backward compatibility
+3. ElevenLabsProvider - High-level provider for HTTP synthesis
 """
 
 import asyncio
@@ -12,7 +17,7 @@ import base64
 import json
 import logging
 import time
-from typing import Optional, Callable, Dict, Any, AsyncGenerator
+from typing import Optional, Callable, Dict, Any, AsyncGenerator, Union
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -22,290 +27,186 @@ from .config import TTSLabsConfig
 logger = logging.getLogger(__name__)
 
 
-class ElevenLabsStreamManager:
-    """
-    Manages WebSocket connection to ElevenLabs stream-input API.
-    
-    Features:
-    - Bidirectional streaming: send text chunks, receive audio chunks
-    - Ultra-low latency with try_trigger_generation
-    - Automatic reconnection on failure
-    - PCM audio output for minimal decoding overhead
-    
-    Protocol:
-    1. Connect to wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input
-    2. Send BOS (Beginning of Stream) message with voice settings
-    3. Send text chunks as they arrive from RAG
-    4. Optionally send try_trigger_generation to flush buffer early
-    5. Send EOS (End of Stream) to signal completion
-    6. Receive audio chunks as they're generated
-    """
-    
-    def __init__(self, config: TTSLabsConfig):
-        """
-        Initialize ElevenLabs stream manager.
-        
-        Args:
-            config: TTSLabsConfig with API key and settings
-        """
-        self.config = config
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.is_connected = False
-        self.is_streaming = False
-        
-        # Audio callback for streaming output
-        self.audio_callback: Optional[Callable[[bytes, int, Dict[str, Any]], Any]] = None
-        
-        # Performance metrics
-        self.first_chunk_time: Optional[float] = None
-        self.chunks_received = 0
-        self.total_audio_bytes = 0
-        self.stream_start_time: Optional[float] = None
-        self.last_latency_ms: Optional[float] = None
-        
-        # Reconnection state
-        self.reconnect_count = 0
-        
-        logger.info(f"ElevenLabs StreamManager initialized")
-        logger.info(f"  Model: {config.elevenlabs_model_id}")
-        logger.info(f"  Voice: {config.elevenlabs_voice_id}")
-        logger.info(f"  Latency optimization: {config.optimize_streaming_latency}")
-        logger.info(f"  Output format: {config.output_format}")
-    
-    async def connect(self) -> bool:
-        """
-        Establish WebSocket connection to ElevenLabs.
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
-        if not self.config.elevenlabs_api_key:
-            logger.error("ELEVENLABS_API_KEY not configured")
-            return False
-        
-        try:
-            ws_url = self.config.get_websocket_url()
-            
-            # Add API key to headers
-            headers = {
-                "xi-api-key": self.config.elevenlabs_api_key
-            }
-            
-            logger.info(f"Connecting to ElevenLabs WebSocket...")
-            logger.debug(f"URL: {ws_url}")
-            
-            self.ws = await asyncio.wait_for(
-                websockets.connect(
-                    ws_url,
-                    additional_headers=headers,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5
-                ),
-                timeout=self.config.websocket_timeout
-            )
-            
-            self.is_connected = True
-            self.reconnect_count = 0
-            
-            logger.info("ElevenLabs WebSocket connected")
-            return True
-            
-        except asyncio.TimeoutError:
-            logger.error(f"WebSocket connection timeout ({self.config.websocket_timeout}s)")
-            return False
-        except Exception as e:
-            logger.error(f"WebSocket connection failed: {e}")
-            return False
-    
-    async def disconnect(self):
-        """Close WebSocket connection."""
-        if self.ws:
-            try:
-                await self.ws.close()
-            except Exception as e:
-                logger.warning(f"Error closing WebSocket: {e}")
-            finally:
-                self.ws = None
-                self.is_connected = False
-                self.is_streaming = False
-        
-        logger.info("ElevenLabs WebSocket disconnected")
-    
-    async def send_bos(self, text: str = "") -> bool:
-        """
-        Send Beginning of Stream (BOS) message.
-        
-        This initializes the stream with voice settings.
-        Optionally includes initial text for faster first chunk.
-        
-        Args:
-            text: Optional initial text to include with BOS
-            
-        Returns:
-            True if sent successfully
-        """
-        if not self.ws or not self.is_connected:
-            logger.error("Cannot send BOS: not connected")
-            return False
-        
-        try:
-            # More aggressive chunk_length_schedule to favor earlier first chunk.
-            # According to ElevenLabs docs, the first value controls how many
-            # characters must be buffered before audio generation begins.
-            # We lower this from the default [120, 160, 250, 290] to start
-            # generating after ~50 characters while keeping later chunks similar.
-            generation_config = {
-                "chunk_length_schedule": [50, 120, 250, 290]
-            }
+# =============================================================================
+# Stateless Streaming Function (Recommended)
+# =============================================================================
 
-            bos_message = {
-                "text": text if text else " ",  # Space is required if no text
-                "voice_settings": self.config.get_voice_settings(),
-                "xi_api_key": self.config.elevenlabs_api_key,
-                "generation_config": generation_config,
-            }
-            
-            # Add try_trigger_generation for faster first chunk when we have
-            # real text (not just the prewarm space). This hints ElevenLabs
-            # to flush the current buffer immediately rather than waiting
-            # strictly on chunk_length_schedule.
-            if self.config.try_trigger_generation and text:
-                bos_message["try_trigger_generation"] = True
-            
-            await self.ws.send(json.dumps(bos_message))
-            
-            self.is_streaming = True
-            self.stream_start_time = time.time()
-            self.first_chunk_time = None
-            self.chunks_received = 0
-            self.total_audio_bytes = 0
-            
-            logger.info(f"BOS sent with {len(text)} chars initial text")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to send BOS: {e}")
-            return False
+async def stream_text_to_audio(
+    config: TTSLabsConfig,
+    text_iterator: Union[AsyncGenerator[str, None], list[str], str],
+    audio_callback: Callable[[bytes, int, Dict[str, Any]], Any],
+) -> Dict[str, Any]:
+    """
+    Stream text to audio using ElevenLabs WebSocket API.
     
-    async def send_text_chunk(self, text: str, flush: bool = False) -> bool:
-        """
-        Send a text chunk for synthesis.
-        
-        Args:
-            text: Text chunk to synthesize
-            flush: If True, trigger generation immediately (lower latency)
-            
-        Returns:
-            True if sent successfully
-        """
-        if not self.ws or not self.is_connected:
-            logger.error("Cannot send text: not connected")
-            return False
-        
-        if not self.is_streaming:
-            logger.warning("Stream not started, sending BOS first")
-            await self.send_bos(text)
-            return True
+    This is the main entry point for streaming synthesis. It creates a fresh
+    WebSocket connection, sends text chunks as they arrive, and invokes the
+    audio callback for each received audio chunk. The connection is guaranteed
+    to be cleaned up after completion.
+    
+    Protocol (per ElevenLabs docs):
+    1. Connect to wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input
+    2. Send BOS message with voice settings and optional initial text
+    3. Send text chunks as {"text": "...", "try_trigger_generation": true}
+    4. Send EOS as {"text": ""}
+    5. Receive audio chunks until isFinal=true
+    
+    Args:
+        config: TTSLabsConfig with API key and settings
+        text_iterator: Async generator, list, or string of text to synthesize
+        audio_callback: Callback invoked for each audio chunk:
+                       callback(audio_bytes, sample_rate, metadata)
+    
+    Returns:
+        Stats dict with:
+        - chunks_received: Number of audio chunks
+        - total_audio_bytes: Total bytes of audio received
+        - first_chunk_latency_ms: Time to first audio chunk
+        - total_time_ms: Total synthesis time
+        - error: Error message if any
+    """
+    if not config.elevenlabs_api_key:
+        logger.error("ELEVENLABS_API_KEY not configured")
+        return {"error": "API key not configured"}
+    
+    # Normalize text_iterator to async generator
+    if isinstance(text_iterator, str):
+        async def _str_gen():
+            yield text_iterator
+        text_iter = _str_gen()
+    elif isinstance(text_iterator, list):
+        async def _list_gen():
+            for item in text_iterator:
+                yield item
+        text_iter = _list_gen()
+    else:
+        text_iter = text_iterator
+    
+    # Build WebSocket URL
+    ws_url = config.get_websocket_url()
+    headers = {"xi-api-key": config.elevenlabs_api_key}
+    
+    # Stats tracking
+    stats = {
+        "chunks_received": 0,
+        "total_audio_bytes": 0,
+        "first_chunk_latency_ms": None,
+        "total_time_ms": 0,
+    }
+    start_time = time.time()
+    first_chunk_time: Optional[float] = None
+    stream_start_time: Optional[float] = None
+    
+    # Shared state for concurrent tasks
+    send_complete = asyncio.Event()
+    receive_error: Optional[str] = None
+    
+    async def send_text(ws):
+        """Send text chunks to ElevenLabs."""
+        nonlocal stream_start_time
+        first_text = True
         
         try:
-            message = {
-                "text": text
-            }
+            async for text_chunk in text_iter:
+                if not text_chunk:
+                    continue
+                
+                if first_text:
+                    # BOS message with voice settings and initial text
+                    bos_message = {
+                        "text": text_chunk,
+                        "voice_settings": config.get_voice_settings(),
+                        "xi_api_key": config.elevenlabs_api_key,
+                        "generation_config": {
+                            # Lower first value = faster first chunk (default is 120)
+                            "chunk_length_schedule": [50, 120, 250, 290]
+                        },
+                    }
+                    if config.try_trigger_generation:
+                        bos_message["try_trigger_generation"] = True
+                    
+                    await ws.send(json.dumps(bos_message))
+                    stream_start_time = time.time()
+                    logger.info(f"BOS sent with {len(text_chunk)} chars initial text")
+                    first_text = False
+                else:
+                    # Subsequent text chunks
+                    message = {"text": text_chunk}
+                    if config.try_trigger_generation:
+                        message["try_trigger_generation"] = True
+                    await ws.send(json.dumps(message))
+                    logger.debug(f"Sent text chunk: {len(text_chunk)} chars")
             
-            # try_trigger_generation flushes the buffer for lower latency
-            if flush or self.config.try_trigger_generation:
-                message["try_trigger_generation"] = True
-            
-            await self.ws.send(json.dumps(message))
-            logger.debug(f"Sent text chunk: {len(text)} chars (flush={flush})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to send text chunk: {e}")
-            return False
-    
-    async def send_eos(self) -> bool:
-        """
-        Send End of Stream (EOS) message.
-        
-        This signals the server to finalize and send any remaining audio.
-        
-        Returns:
-            True if sent successfully
-        """
-        if not self.ws or not self.is_connected:
-            return False
-        
-        try:
-            eos_message = {
-                "text": ""  # Empty text signals EOS
-            }
-            
-            await self.ws.send(json.dumps(eos_message))
+            # EOS message (empty text)
+            await ws.send(json.dumps({"text": ""}))
             logger.info("EOS sent")
-            return True
             
         except Exception as e:
-            logger.error(f"Failed to send EOS: {e}")
-            return False
+            logger.error(f"Error sending text: {e}")
+        finally:
+            send_complete.set()
     
-    async def receive_audio(self) -> AsyncGenerator[tuple[bytes, Dict[str, Any]], None]:
-        """
-        Receive audio chunks from ElevenLabs.
-        
-        Yields:
-            Tuple of (audio_bytes, metadata_dict)
-        """
-        if not self.ws or not self.is_connected:
-            logger.error("Cannot receive audio: not connected")
-            return
+    async def receive_audio(ws):
+        """Receive audio chunks from ElevenLabs."""
+        nonlocal first_chunk_time, receive_error
         
         try:
-            async for message in self.ws:
+            async for message in ws:
                 try:
                     data = json.loads(message)
                     
-                    # Check for audio data
-                    if "audio" in data:
-                        audio_b64 = data["audio"]
-                        if audio_b64:
-                            audio_bytes = base64.b64decode(audio_b64)
-                            self.chunks_received += 1
-                            self.total_audio_bytes += len(audio_bytes)
-                            
-                            # Track first chunk latency
-                            if self.first_chunk_time is None and self.stream_start_time:
-                                self.first_chunk_time = time.time()
-                                latency_ms = (self.first_chunk_time - self.stream_start_time) * 1000
-                                self.last_latency_ms = latency_ms
-                                
-                                if latency_ms < 150:
-                                    logger.info(f"ULTRA-FAST FIRST CHUNK: {latency_ms:.0f}ms (TARGET MET)")
-                                elif latency_ms < 300:
-                                    logger.info(f"Fast first chunk: {latency_ms:.0f}ms")
-                                else:
-                                    logger.warning(f"Slow first chunk: {latency_ms:.0f}ms (target: <150ms)")
-                            
-                            metadata = {
-                                "chunk_index": self.chunks_received,
-                                "is_final": data.get("isFinal", False),
-                                "alignment": data.get("alignment"),
-                                "normalizedAlignment": data.get("normalizedAlignment"),
-                                "sample_rate": self.config.sample_rate,
-                                "format": self.config.output_format
-                            }
-                            
-                            yield audio_bytes, metadata
-                    
-                    # Check for final message
-                    if data.get("isFinal"):
-                        logger.info(f"Stream complete: {self.chunks_received} chunks, {self.total_audio_bytes} bytes")
+                    # Check for error first
+                    if "error" in data:
+                        error_msg = data["error"]
+                        logger.error(f"ElevenLabs error: {error_msg}")
+                        receive_error = error_msg
                         break
                     
-                    # Check for error
-                    if "error" in data:
-                        logger.error(f"ElevenLabs error: {data['error']}")
+                    # Process audio data
+                    if "audio" in data and data["audio"]:
+                        audio_bytes = base64.b64decode(data["audio"])
+                        stats["chunks_received"] += 1
+                        stats["total_audio_bytes"] += len(audio_bytes)
+                        
+                        # Track first chunk latency
+                        if first_chunk_time is None and stream_start_time:
+                            first_chunk_time = time.time()
+                            latency_ms = (first_chunk_time - stream_start_time) * 1000
+                            stats["first_chunk_latency_ms"] = latency_ms
+                            
+                            if latency_ms < 150:
+                                logger.info(f"⚡ ULTRA-FAST FIRST CHUNK: {latency_ms:.0f}ms")
+                            elif latency_ms < 300:
+                                logger.info(f"✅ Fast first chunk: {latency_ms:.0f}ms")
+                            else:
+                                logger.warning(f"⚠️ Slow first chunk: {latency_ms:.0f}ms (target: <150ms)")
+                        
+                        # Build metadata
+                        metadata = {
+                            "chunk_index": stats["chunks_received"],
+                            "is_final": data.get("isFinal", False),
+                            "alignment": data.get("alignment"),
+                            "normalizedAlignment": data.get("normalizedAlignment"),
+                            "sample_rate": config.sample_rate,
+                            "format": config.output_format,
+                        }
+                        
+                        # Invoke callback
+                        try:
+                            result = audio_callback(audio_bytes, config.sample_rate, metadata)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as e:
+                            logger.error(f"Audio callback error: {e}")
+                        
+                        # Check for final chunk
+                        if data.get("isFinal"):
+                            logger.info(f"✅ Stream complete: {stats['chunks_received']} chunks, {stats['total_audio_bytes']} bytes")
+                            break
+                    
+                    # Final message without audio
+                    elif data.get("isFinal"):
+                        logger.info(f"✅ Stream complete (no audio in final): {stats['chunks_received']} chunks")
                         break
                         
                 except json.JSONDecodeError as e:
@@ -313,13 +214,95 @@ class ElevenLabsStreamManager:
                     continue
                     
         except ConnectionClosed as e:
-            logger.warning(f"WebSocket closed: {e}")
-        except WebSocketException as e:
-            logger.error(f"WebSocket error: {e}")
+            if e.code == 1000:
+                logger.info(f"WebSocket closed normally (code={e.code})")
+            else:
+                logger.warning(f"WebSocket closed: code={e.code}, reason={e.reason}")
+        except asyncio.CancelledError:
+            logger.info("Audio receive cancelled")
+            raise
         except Exception as e:
             logger.error(f"Error receiving audio: {e}")
-        finally:
-            self.is_streaming = False
+            receive_error = str(e)
+    
+    # Main connection logic
+    try:
+        logger.info(f"Connecting to ElevenLabs WebSocket...")
+        
+        async with websockets.connect(
+            ws_url,
+            additional_headers=headers,
+            ping_interval=20,      # Keep-alive ping every 20s
+            ping_timeout=10,       # Wait 10s for pong
+            close_timeout=5,       # Wait 5s for close handshake
+            max_size=10_000_000,   # Allow large audio messages (10MB)
+            max_queue=64,          # Buffer up to 64 messages
+        ) as ws:
+            logger.info("ElevenLabs WebSocket connected")
+            
+            # Run send and receive concurrently
+            send_task = asyncio.create_task(send_text(ws))
+            receive_task = asyncio.create_task(receive_audio(ws))
+            
+            # Wait for both to complete
+            await asyncio.gather(send_task, receive_task)
+            
+    except asyncio.TimeoutError:
+        logger.error(f"WebSocket connection timeout")
+        stats["error"] = "Connection timeout"
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        stats["error"] = str(e)
+    finally:
+        stats["total_time_ms"] = (time.time() - start_time) * 1000
+        if receive_error:
+            stats["error"] = receive_error
+    
+    return stats
+
+
+# =============================================================================
+# Class-based wrapper (Backward Compatibility)
+# =============================================================================
+
+class ElevenLabsStreamManager:
+    """
+    Manages WebSocket connection to ElevenLabs stream-input API.
+    
+    This class wraps the stateless stream_text_to_audio() function for
+    backward compatibility with existing code.
+    
+    For new code, prefer using stream_text_to_audio() directly.
+    """
+    
+    def __init__(self, config: TTSLabsConfig):
+        """Initialize ElevenLabs stream manager."""
+        self.config = config
+        self.is_connected = False
+        self.is_streaming = False
+        
+        # Performance metrics (populated after synthesis)
+        self.first_chunk_time: Optional[float] = None
+        self.chunks_received = 0
+        self.total_audio_bytes = 0
+        self.last_latency_ms: Optional[float] = None
+        
+        logger.info(f"ElevenLabs StreamManager initialized")
+        logger.info(f"  Model: {config.elevenlabs_model_id.strip()}")
+        logger.info(f"  Voice: {config.elevenlabs_voice_id}")
+        logger.info(f"  Latency optimization: {config.optimize_streaming_latency}")
+        logger.info(f"  Output format: {config.output_format}")
+    
+    async def connect(self) -> bool:
+        """Mark as ready (connection is per-stream now)."""
+        self.is_connected = True
+        return True
+    
+    async def disconnect(self):
+        """Mark as disconnected."""
+        self.is_connected = False
+        self.is_streaming = False
+        logger.info("ElevenLabs StreamManager disconnected")
     
     async def synthesize_stream(
         self,
@@ -329,96 +312,34 @@ class ElevenLabsStreamManager:
         """
         Stream text from generator and receive audio chunks.
         
-        This is the main entry point for continuous streaming synthesis.
-        Text chunks from the generator are sent to ElevenLabs as they arrive,
-        and audio chunks are delivered via the callback as they're received.
-        
-        Args:
-            text_generator: Async generator yielding text chunks
-            audio_callback: Callback for audio chunks (bytes, sample_rate, metadata)
-            
-        Returns:
-            Stats dict with latency and chunk info
+        Delegates to the stateless stream_text_to_audio() function.
         """
-        self.audio_callback = audio_callback
+        self.is_streaming = True
         
-        # Connect if not already connected
-        if not self.is_connected:
-            if not await self.connect():
-                return {"error": "Connection failed"}
+        # Default callback that does nothing
+        def noop_callback(audio_bytes, sample_rate, metadata):
+            pass
         
-        stats = {
-            "chunks_received": 0,
-            "total_audio_bytes": 0,
-            "first_chunk_latency_ms": None,
-            "total_time_ms": 0
-        }
-        
-        start_time = time.time()
-        first_text = True
+        callback = audio_callback or noop_callback
         
         try:
-            # Start receiver task
-            receive_task = asyncio.create_task(self._receive_and_callback())
+            stats = await stream_text_to_audio(self.config, text_generator, callback)
             
-            # Send text chunks as they arrive
-            async for text_chunk in text_generator:
-                if not text_chunk:
-                    continue
-                
-                if first_text:
-                    # Send BOS with first text chunk for fastest first audio
-                    await self.send_bos(text_chunk)
-                    first_text = False
-                else:
-                    # Send subsequent chunks with flush for low latency
-                    await self.send_text_chunk(text_chunk, flush=True)
+            # Update metrics from stats
+            self.chunks_received = stats.get("chunks_received", 0)
+            self.total_audio_bytes = stats.get("total_audio_bytes", 0)
+            self.last_latency_ms = stats.get("first_chunk_latency_ms")
             
-            # Send EOS to finalize
-            await self.send_eos()
-            
-            # Wait for receiver to complete
-            await receive_task
-            
-        except Exception as e:
-            logger.error(f"Synthesis stream error: {e}")
-            stats["error"] = str(e)
+            return stats
         finally:
-            stats["chunks_received"] = self.chunks_received
-            stats["total_audio_bytes"] = self.total_audio_bytes
-            stats["first_chunk_latency_ms"] = self.last_latency_ms
-            stats["total_time_ms"] = (time.time() - start_time) * 1000
-        
-        return stats
-    
-    async def _receive_and_callback(self):
-        """Internal method to receive audio and invoke callback."""
-        async for audio_bytes, metadata in self.receive_audio():
-            if self.audio_callback:
-                try:
-                    result = self.audio_callback(audio_bytes, self.config.sample_rate, metadata)
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception as e:
-                    logger.error(f"Audio callback error: {e}")
+            self.is_streaming = False
     
     async def synthesize_text(
         self,
         text: str,
         audio_callback: Optional[Callable[[bytes, int, Dict[str, Any]], Any]] = None
     ) -> Dict[str, Any]:
-        """
-        Synthesize a single text string.
-        
-        Convenience method for non-streaming use cases.
-        
-        Args:
-            text: Full text to synthesize
-            audio_callback: Callback for audio chunks
-            
-        Returns:
-            Stats dict
-        """
+        """Synthesize a single text string."""
         async def text_gen():
             yield text
         
@@ -432,34 +353,32 @@ class ElevenLabsStreamManager:
             "chunks_received": self.chunks_received,
             "total_audio_bytes": self.total_audio_bytes,
             "first_chunk_latency_ms": self.last_latency_ms,
-            "reconnect_count": self.reconnect_count
         }
 
+
+# =============================================================================
+# High-level Provider (for HTTP synthesis)
+# =============================================================================
 
 class ElevenLabsProvider:
     """
     High-level provider interface for ElevenLabs TTS.
     
-    Manages connection lifecycle and provides simple synthesize() method.
-    Compatible with the orchestrator's TTS service interface.
+    Provides a simple synthesize() method that collects all audio chunks
+    and returns the complete audio bytes. Used by the HTTP endpoint.
     """
     
     def __init__(self, config: TTSLabsConfig):
         """Initialize provider."""
         self.config = config
-        self.manager: Optional[ElevenLabsStreamManager] = None
         self._lock = asyncio.Lock()
     
     async def warmup(self):
-        """Pre-warm the connection."""
-        logger.info("Warming up ElevenLabs connection...")
-        
-        async with self._lock:
-            self.manager = ElevenLabsStreamManager(self.config)
-            if await self.manager.connect():
-                logger.info("ElevenLabs connection pre-warmed")
-            else:
-                logger.warning("ElevenLabs warmup failed")
+        """
+        Pre-warm is a no-op now since each synthesis uses a fresh connection.
+        Kept for backward compatibility.
+        """
+        logger.info("ElevenLabs provider ready (warmup is no-op)")
     
     async def synthesize(
         self,
@@ -478,30 +397,28 @@ class ElevenLabsProvider:
         Returns:
             Audio bytes (PCM or MP3 depending on config)
         """
-        audio_chunks = []
+        audio_chunks: list[bytes] = []
         
-        async def collect_audio(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
+        def collect_audio(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
             audio_chunks.append(audio_bytes)
         
         async with self._lock:
-            if not self.manager:
-                self.manager = ElevenLabsStreamManager(self.config)
-            
-            # Override voice if provided
+            # Use custom voice if provided
             if voice and voice != self.config.elevenlabs_voice_id:
-                # Create new manager with different voice
                 temp_config = TTSLabsConfig.from_env()
                 temp_config.elevenlabs_voice_id = voice
-                temp_manager = ElevenLabsStreamManager(temp_config)
-                await temp_manager.synthesize_text(text, collect_audio)
-                await temp_manager.disconnect()
+                config = temp_config
             else:
-                await self.manager.synthesize_text(text, collect_audio)
+                config = self.config
+            
+            stats = await stream_text_to_audio(config, text, collect_audio)
+            
+            if stats.get("error"):
+                logger.error(f"Synthesis failed: {stats['error']}")
+                return b""
         
-        return b''.join(audio_chunks)
+        return b"".join(audio_chunks)
     
     async def close(self):
-        """Close provider and cleanup resources."""
-        if self.manager:
-            await self.manager.disconnect()
-            self.manager = None
+        """Close provider (no-op, connections are per-stream)."""
+        pass

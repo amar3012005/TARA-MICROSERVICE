@@ -47,8 +47,8 @@ def tts_config():
         google_voice="en-US-Neural2-F",
         # ElevenLabs settings (optional)
         elevenlabs_api_key=None,
-        elevenlabs_voice="21m00Tcm4TlvDq8ikWAM",
-        elevenlabs_model="eleven_multilingual_v2",
+        elevenlabs_voice="AnvlJBAqSLDzEevYr9Ap",
+        elevenlabs_model=" eleven_turbo_v2_5",
         elevenlabs_stability=0.5,
         elevenlabs_similarity_boost=0.75,
         # Gemini settings (optional)
@@ -147,7 +147,7 @@ def mock_elevenlabs_provider():
     mock.synthesize = AsyncMock(return_value=b'RIFF....WAV')
     mock.stream_synthesize = AsyncMock()
     mock.get_available_voices = MagicMock(return_value={
-        "21m00Tcm4TlvDq8ikWAM": {
+        "AnvlJBAqSLDzEevYr9Ap": {
             "name": "Rachel",
             "language": "en",
             "gender": "female",

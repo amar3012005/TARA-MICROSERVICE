@@ -97,7 +97,7 @@ class SarvamStreamingProvider:
         self,
         api_key: str,
         speaker: str = "anushka",
-        language: str = "en-IN",
+        language: str = "te-IN",
         model: str = "bulbul:v2",
         pitch: float = 0.0,
         pace: float = 1.0,

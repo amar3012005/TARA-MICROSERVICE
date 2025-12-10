@@ -102,7 +102,7 @@ class TTSProvider(Protocol):
         
         Examples:
             Google: {"en-US-Neural2-F": {"name": "Female Neural 2", ...}}
-            ElevenLabs: {"21m00Tcm4TlvDq8ikWAM": {"name": "Rachel", ...}}
+            ElevenLabs: {"AnvlJBAqSLDzEevYr9Ap": {"name": "Rachel", ...}}
             Gemini: {"Callirrhoe": {"name": "Callirrhoe (female)", ...}}
         """
         ...

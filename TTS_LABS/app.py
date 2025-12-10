@@ -2,7 +2,7 @@
 TTS_LABS Streaming Microservice FastAPI Application
 
 WebSocket-based TTS streaming service using ElevenLabs stream-input API.
-Optimized for ultra-low latency (<150ms first audio chunk) with eleven_flash_v2_5.
+Optimized for ultra-low latency (<150ms first audio chunk) with eleven_turbo_v2_5.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, Set
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from .config import TTSLabsConfig
 from .sentence_splitter import split_into_sentences
-from .elevenlabs_manager import ElevenLabsProvider, ElevenLabsStreamManager
+from .elevenlabs_manager import ElevenLabsProvider, ElevenLabsStreamManager, stream_text_to_audio
 from .audio_cache import AudioCache
 
 import numpy as np
@@ -75,117 +75,338 @@ except ImportError:
     logger.warning("FastRTC not available - UI preview disabled")
 
 
+class StreamState:
+    """
+    FIX #4: Track stream lifecycle to prevent orphaned handlers.
+    
+    Centralizes stream management to ensure:
+    - Proper cleanup on disconnect
+    - No orphaned tasks
+    - Graceful error recovery
+    """
+    
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.created_at = time.time()
+        self.stream_manager: Optional[ElevenLabsStreamManager] = None
+        self.receiver_task: Optional[asyncio.Task] = None
+        self.is_streaming = False
+        self.lock = asyncio.Lock()
+        self.audio_chunks_received = 0
+    
+    async def cleanup(self):
+        """Gracefully cleanup all resources."""
+        async with self.lock:
+            # Cancel receiver task if still running
+            if self.receiver_task and not self.receiver_task.done():
+                logger.debug(f"Cancelling receiver for {self.session_id}")
+                self.receiver_task.cancel()
+                try:
+                    await asyncio.wait_for(self.receiver_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            
+            # Disconnect stream manager
+            if self.stream_manager and self.stream_manager.is_connected:
+                logger.debug(f"Disconnecting stream manager for {self.session_id}")
+                await self.stream_manager.disconnect()
+            
+            self.is_streaming = False
+            logger.info(f"✅ Cleaned up {self.session_id} ({self.audio_chunks_received} chunks)")
+
+
+# Global tracking of active streams
+active_streams: Dict[str, StreamState] = {}
+
+
 class FastRTCTTSHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object):
-    """FastRTC handler for TTS audio streaming to browser."""
-    
-    active_instances = set()
-    
-    def __init__(self, redis_client=None):
+    """
+    FastRTC AsyncStreamHandler that streams TTS audio to browser.
+
+    DESIGN (matching Sarvam TTS):
+    - Queue stores full audio chunks (sentences / large segments), not tiny frames
+    - emit() slices those chunks into real-time frames (40ms by default)
+    - No per-frame queue overflow; streaming feels continuous as soon as first chunk arrives
+    """
+
+    # Registry of active handler instances
+    active_instances: Set["FastRTCTTSHandler"] = set()
+    default_chunk_duration_ms: int = 40
+    default_min_buffer_chunks: int = 1  # Start playing as soon as audio arrives
+
+    def __init__(
+        self,
+        tts_queue=None,
+        redis_client=None,
+        chunk_duration_ms: Optional[int] = None,
+        min_buffer_chunks: Optional[int] = None,
+    ):
         if FASTRTC_AVAILABLE:
             super().__init__()
+
+        self.tts_queue = tts_queue
         self.redis_client = redis_client
         self.session_id = f"fastrtc_tts_{int(time.time())}"
         self._started = False
         self._sample_rate = 24000
-        self._audio_queue = asyncio.Queue()
-        self._remainder = b""
-        self._lock = asyncio.Lock()
-        self._chunk_size = 960  # 40ms at 24kHz
-        # Instrumentation flags for latency diagnostics
-        self._first_audio_logged = False
-        self._first_emit_logged = False
-        
+
+        # Streaming parameters and buffers
+        self._chunk_duration_ms: Optional[int] = None
+        self._chunk_size_samples: Optional[int] = None
+        self._min_buffer_chunks: Optional[int] = None
+        self._buffer_warmed: bool = False
+
+        self._configure_stream_parameters(
+            chunk_duration_ms=chunk_duration_ms,
+            min_buffer_chunks=min_buffer_chunks,
+        )
+
+        # Queue of full audio chunks (np.int16 arrays) to be sliced in emit()
+        self._audio_output_queue: asyncio.Queue = asyncio.Queue()
+        self._current_audio_chunk: Optional[Tuple[np.ndarray, int]] = None
+        self._chunk_position: int = 0
+        self._playback_end_time: float = 0.0
+
+        logger.info("🔊 FastRTC TTS Handler initialized")
+        logger.info(f"   Handler instance: {id(self)}")
+        logger.info(f"   Session ID: {self.session_id}")
+
+    def _configure_stream_parameters(
+        self,
+        chunk_duration_ms: Optional[int] = None,
+        min_buffer_chunks: Optional[int] = None,
+    ) -> None:
+        """Configure streaming parameters such as chunk duration and buffering."""
+        resolved_chunk_ms = (
+            chunk_duration_ms
+            if chunk_duration_ms is not None
+            else FastRTCTTSHandler.default_chunk_duration_ms
+        )
+        resolved_buffer_chunks = (
+            min_buffer_chunks
+            if min_buffer_chunks is not None
+            else FastRTCTTSHandler.default_min_buffer_chunks
+        )
+
+        self._chunk_duration_ms = max(5, int(resolved_chunk_ms))
+        self._min_buffer_chunks = max(1, int(resolved_buffer_chunks))
+        self._chunk_size_samples = max(
+            1, int(self._sample_rate * (self._chunk_duration_ms / 1000.0))
+        )
+
     async def start_up(self):
+        """Called when WebRTC stream starts."""
         self._started = True
+        self._audio_output_queue = asyncio.Queue()
+        self._current_audio_chunk = None
+        self._chunk_position = 0
+        self._buffer_warmed = False
+
+        # Register this instance
         FastRTCTTSHandler.active_instances.add(self)
-        logger.info(f"FastRTC TTS stream started: {self.session_id}")
-        
-        # Publish connection event
-        if self.redis_client:
+
+        logger.info("=" * 70)
+        logger.info(f"🔌 FastRTC Stream STARTED | Session: {self.session_id}")
+        logger.info(f"   Active instances: {len(FastRTCTTSHandler.active_instances)}")
+        logger.info("=" * 70)
+        logger.info("🚀 FastRTC TTS stream started")
+        logger.info(f"   Handler instance: {id(self)} | Session: {self.session_id}")
+        logger.info(f"   Active instances: {len(FastRTCTTSHandler.active_instances)}")
+        logger.info(
+            f"   Chunk duration: {self._chunk_duration_ms}ms | "
+            f"Min buffer chunks: {self._min_buffer_chunks}"
+        )
+        logger.info("=" * 70)
+
+        if not self.tts_queue:
+            logger.info(
+                "ℹ️ TTS queue not directly injected - waiting for broadcast audio"
+            )
+        else:
+            logger.info("✅ TTS queue ready | Ready for audio streaming")
+            logger.info("📊 Flow: Text → TTS Queue → FastRTC → Browser Speakers")
+
+        await self._publish_connection_event()
+
+    async def receive(self, audio) -> None:
+        """
+        Required by AsyncStreamHandler interface; not used for TTS output.
+        """
+        return  # TTS is output-only
+
+    async def emit(self) -> Tuple[int, np.ndarray]:
+        """
+        Emit audio chunks to browser for playback.
+
+        Behaviour:
+        - Uses a small internal buffer (min_buffer_chunks) before starting playback
+        - Then slices current audio chunk into frames of size _chunk_size_samples
+        """
+        # If FastRTC is not available, just return silence
+        if not FASTRTC_AVAILABLE or not self._started:
+            silence = np.zeros(self._chunk_size_samples or 1, dtype=np.int16)
+            await asyncio.sleep((self._chunk_duration_ms or 40) / 1000.0)
+            return self._sample_rate, silence
+
+        silence_chunk = np.zeros(self._chunk_size_samples, dtype=np.int16)
+        sleep_interval = self._chunk_duration_ms / 1000.0
+
+        if self._audio_output_queue.empty() and self._current_audio_chunk is None:
+            await asyncio.sleep(sleep_interval)
+            return self._sample_rate, silence_chunk
+
+        # Buffer warming: wait until we have enough audio to start playback
+        if not self._buffer_warmed:
+            buffered_chunks = self._audio_output_queue.qsize()
+            if self._current_audio_chunk is not None:
+                buffered_chunks += 1
+
+            if buffered_chunks < self._min_buffer_chunks:
+                await asyncio.sleep(sleep_interval)
+                return self._sample_rate, silence_chunk
+
+            self._buffer_warmed = True
+
+        # Process current chunk or get next one
+        if self._current_audio_chunk is None:
             try:
-                payload = json.dumps({
-                    "session_id": self.session_id,
-                    "timestamp": time.time(),
-                    "event": "tts_connected",
-                    "source": "tts_labs_fastrtc"
-                })
-                await self.redis_client.publish("leibniz:events:tts:connected", payload)
-            except Exception as e:
-                logger.warning(f"Failed to publish TTS connection event: {e}")
-    
-    async def receive(self, audio):
-        pass  # TTS is output-only
-    
-    async def emit(self):
-        """Emit audio chunks to the browser."""
+                self._current_audio_chunk = self._audio_output_queue.get_nowait()
+                self._chunk_position = 0
+            except asyncio.QueueEmpty:
+                await asyncio.sleep(sleep_interval)
+                return self._sample_rate, silence_chunk
+
+        if self._current_audio_chunk is not None:
+            audio_data, sample_rate = self._current_audio_chunk
+
+            # Ensure audio_data is numpy array
+            if not isinstance(audio_data, np.ndarray):
+                audio_data = np.array(audio_data, dtype=np.int16)
+
+            # Get next frame from current audio
+            remaining = len(audio_data) - self._chunk_position
+            if remaining > 0:
+                take_samples = min(self._chunk_size_samples, remaining)
+                chunk = audio_data[
+                    self._chunk_position : self._chunk_position + take_samples
+                ]
+                self._chunk_position += take_samples
+
+                # Ensure 1D array (FastRTC handles 1D as mono)
+                if chunk.ndim > 1:
+                    chunk = chunk.flatten()
+
+                # Ensure int16
+                if chunk.dtype != np.int16:
+                    chunk = chunk.astype(np.int16)
+
+                return sample_rate, chunk
+            else:
+                # Current chunk finished, get next
+                self._current_audio_chunk = None
+                self._chunk_position = 0
+
+        await asyncio.sleep(sleep_interval)
+        return self._sample_rate, silence_chunk
+
+    async def add_audio(self, audio_bytes: bytes, sample_rate: int) -> None:
+        """
+        Add a full audio chunk to the output queue for streaming.
+
+        Unlike the previous implementation, we do NOT split into 960-sample
+        frames here. We store the full chunk and let emit() slice it, which
+        avoids queue explosions and matches Sarvam's behaviour.
+        """
+        if not self._started or not audio_bytes:
+            return
+
         try:
-            # Wait briefly for audio data to reduce latency vs sending silence
-            # But don't block too long to keep stream alive
-            sample_rate, audio_data = await asyncio.wait_for(self._audio_queue.get(), timeout=0.02)
+            # Convert bytes to numpy array (int16)
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
 
-            # Log first non-silence emission for this FastRTC session
-            if not self._first_emit_logged:
-                self._first_emit_logged = True
-                logger.info(
-                    "FastRTC first non-silence emit for %s at %.3f (queue_size=%d, chunk_samples=%d)",
-                    self.session_id,
-                    time.time(),
-                    self._audio_queue.qsize(),
-                    len(audio_data),
-                )
-            return (sample_rate, audio_data)
-        except (asyncio.TimeoutError, asyncio.QueueEmpty):
-            # Send silence if no audio available
-            silence = np.zeros(self._chunk_size, dtype=np.int16)
-            return (self._sample_rate, silence)
-    
-    async def add_audio(self, audio_bytes: bytes, sample_rate: int):
-        """Add audio data to the queue, chunking it correctly."""
-        async with self._lock:
-            # Log first arrival of audio bytes from ElevenLabs for this FastRTC session
-            if not self._first_audio_logged and audio_bytes:
-                self._first_audio_logged = True
-                logger.info(
-                    "FastRTC first audio bytes received for %s at %.3f (bytes=%d, sample_rate=%d)",
-                    self.session_id,
-                    time.time(),
-                    len(audio_bytes),
-                    sample_rate,
-                )
+            # Track when this audio chunk will finish playing
+            duration_s = len(audio_bytes) / (sample_rate * 2)  # int16 = 2 bytes/sample
+            self._playback_end_time = time.time() + duration_s
 
-            # Combine with any remainder from previous chunks
-            data = self._remainder + audio_bytes
-            
-            # Calculate bytes per chunk (16-bit = 2 bytes per sample)
-            chunk_len_bytes = self._chunk_size * 2
-            
-            # Process full chunks
-            cursor = 0
-            while cursor + chunk_len_bytes <= len(data):
-                chunk = data[cursor : cursor + chunk_len_bytes]
-                # Create numpy array from bytes (copy to ensure safety)
-                audio_array = np.frombuffer(chunk, dtype=np.int16).copy()
-                self._audio_queue.put_nowait((self._sample_rate, audio_array))
-                cursor += chunk_len_bytes
-            
-            # Save remainder
-            self._remainder = data[cursor:]
-    
+            # Add to queue as int16 (unbounded queue, async put)
+            await self._audio_output_queue.put((audio_int16, sample_rate))
+        except Exception as e:
+            logger.error(f"Error adding audio chunk: {e}")
+
     @classmethod
-    async def broadcast_audio(cls, audio_bytes: bytes, sample_rate: int):
+    async def broadcast_audio(cls, audio_bytes: bytes, sample_rate: int) -> None:
+        """
+        Broadcast audio to all active FastRTC handler instances.
+        """
+        if not cls.active_instances:
+            logger.debug("No active FastRTC instances to broadcast to")
+            return
+
         for instance in cls.active_instances:
             try:
                 await instance.add_audio(audio_bytes, sample_rate)
             except Exception as e:
-                logger.error(f"Broadcast error: {e}")
-    
-    async def shutdown(self):
-        FastRTCTTSHandler.active_instances.discard(self)
+                logger.error(f"Failed to broadcast to instance {id(instance)}: {e}")
+
+    async def shutdown(self) -> None:
+        """Cleanup resources when stream closes."""
+        if self in FastRTCTTSHandler.active_instances:
+            FastRTCTTSHandler.active_instances.remove(self)
+
+        logger.info("=" * 70)
+        logger.info("🛑 FastRTC TTS stream shutting down...")
+        logger.info(f"   Handler instance: {id(self)} | Started: {self._started}")
+        logger.info(
+            f"   Remaining instances: {len(FastRTCTTSHandler.active_instances)}"
+        )
+        logger.info("=" * 70)
+
         self._started = False
-        logger.info(f"FastRTC TTS stream closed: {self.session_id}")
-    
-    def copy(self):
-        return FastRTCTTSHandler(redis_client=self.redis_client)
+        self._current_audio_chunk = None
+        self._chunk_position = 0
+        self._buffer_warmed = False
+
+        # Clear queue
+        while not self._audio_output_queue.empty():
+            try:
+                self._audio_output_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        logger.info("✅ FastRTC TTS stream closed")
+
+    def copy(self) -> "FastRTCTTSHandler":
+        """Create a copy of this handler for FastRTC."""
+        return FastRTCTTSHandler(
+            tts_queue=self.tts_queue,
+            redis_client=self.redis_client,
+            chunk_duration_ms=self._chunk_duration_ms,
+            min_buffer_chunks=self._min_buffer_chunks,
+        )
+
+    async def _publish_connection_event(self) -> None:
+        """Publish FastRTC connection event to Redis for orchestrator coordination."""
+        if not self.redis_client:
+            logger.warning(
+                "⚠️ Redis client unavailable - cannot publish TTS connection event"
+            )
+            return
+
+        payload = json.dumps(
+            {
+                "session_id": self.session_id,
+                "timestamp": time.time(),
+                "event": "tts_connected",
+                "source": "tts_labs_fastrtc",
+            }
+        )
+        channel = "leibniz:events:tts:connected"
+
+        try:
+            await self.redis_client.publish(channel, payload)
+            logger.info(f"📡 Published TTS connection event → {channel}")
+        except Exception as exc:
+            logger.warning(f"⚠️ Failed to publish TTS connection event: {exc}")
 
 
 @asynccontextmanager
@@ -359,6 +580,8 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
     Compatible with the orchestrator's TTS service interface.
     Supports both sentence-based synthesis and continuous streaming.
     
+    FIX #4: Uses StreamState for proper lifecycle tracking.
+    
     Message protocol:
     Client -> Server:
         {"type": "synthesize", "text": "...", "emotion": "helpful"}
@@ -379,6 +602,10 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
     
     logger.info(f"🔌 WebSocket session established: {session_id}")
     
+    # ✅ FIX 4.4: Use StreamState for lifecycle tracking
+    stream_state = StreamState(session_id)
+    active_streams[session_id] = stream_state
+    
     # Send connection confirmation
     await websocket.send_json({
         "type": "connected",
@@ -397,7 +624,7 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
         await websocket.close()
         return
     
-    # Continuous stream state
+    # Continuous stream state (use stream_state for tracking, local vars for convenience)
     stream_manager: Optional[ElevenLabsStreamManager] = None
     text_queue: Optional[asyncio.Queue] = None
     receiver_task: Optional[asyncio.Task] = None
@@ -582,6 +809,9 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                     """Receive audio and send to WebSocket."""
                     nonlocal stream_manager
                     async for audio_bytes, metadata in stream_manager.receive_audio():
+                        # Track audio chunks received
+                        stream_state.audio_chunks_received += 1
+                        
                         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
                         await websocket.send_json({
                             "type": "audio",
@@ -597,6 +827,7 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                     # Ultra-fast path: connection already open, send BOS with text now
                     await stream_manager.send_bos(text)
                     receiver_task = asyncio.create_task(stream_receiver())
+                    stream_state.is_streaming = True
                     logger.info(f"🚀 Started stream (pre-warmed) for {session_id}")
                     
                 elif stream_manager is not None and stream_manager.is_streaming:
@@ -611,6 +842,7 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
                     if await stream_manager.connect():
                         await stream_manager.send_bos(text)
                         receiver_task = asyncio.create_task(stream_receiver())
+                        stream_state.is_streaming = True
                         logger.info(f"🎤 Started continuous stream (cold) for {session_id}")
                     else:
                         await websocket.send_json({
@@ -621,26 +853,50 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
             
             # =================================================================
             # STREAM_END: End continuous stream
+            # FIX #3: Proper Async Task Completion & Cleanup
             # =================================================================
             elif msg_type == "stream_end":
-                if stream_manager:
+                logger.debug(f"Stream end requested for {session_id}")
+                
+                # ✅ FIX 3.1: Proper EOS sending with grace period
+                if stream_manager and stream_manager.is_connected:
+                    logger.debug(f"Sending EOS to finalize stream")
                     await stream_manager.send_eos()
                     
-                    # Wait for receiver to complete
-                    if receiver_task:
+                    # Give ElevenLabs time to finish and send isFinal
+                    await asyncio.sleep(0.5)  # 500ms grace period
+                
+                # ✅ FIX 3.2: Proper receiver task completion with longer timeout
+                if receiver_task:
+                    try:
+                        logger.debug(f"Waiting for receiver (max 15s)")
+                        # Wait longer for graceful completion
+                        await asyncio.wait_for(receiver_task, timeout=15.0)  # Was: 10.0
+                        logger.info(f"✅ Receiver completed gracefully")
+                    except asyncio.TimeoutError:
+                        logger.warning(f"⚠️ Receiver timeout, forcing shutdown")
+                        receiver_task.cancel()
                         try:
-                            await asyncio.wait_for(receiver_task, timeout=10.0)
-                        except asyncio.TimeoutError:
-                            receiver_task.cancel()
-                    
+                            # Give it 2 seconds to handle cancellation
+                            await asyncio.wait_for(receiver_task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            logger.debug(f"Receiver stopped")
+                    except Exception as e:
+                        logger.error(f"❌ Receiver error: {e}")
+                
+                # ✅ FIX 3.3: Ensure proper disconnect
+                if stream_manager and stream_manager.is_connected:
+                    logger.debug(f"Disconnecting stream manager")
                     await stream_manager.disconnect()
-                    stream_manager = None
-                    receiver_task = None
-                    
-                    await websocket.send_json({
-                        "type": "stream_complete",
-                        "message": "Continuous stream ended"
-                    })
+                
+                stream_manager = None
+                receiver_task = None
+                
+                await websocket.send_json({
+                    "type": "stream_complete",
+                    "message": "Continuous stream ended",
+                    "timestamp": time.time()
+                })
             
             # =================================================================
             # CANCEL: Cancel current synthesis
@@ -685,14 +941,23 @@ async def stream_tts(websocket: WebSocket, session_id: str = Query(...)):
         except Exception:
             pass
     finally:
-        # Cleanup
-        if stream_manager:
-            await stream_manager.disconnect()
-        if receiver_task and not receiver_task.done():
-            receiver_task.cancel()
+        # ✅ FIX 4.5: Cleanup via StreamState for proper resource management
+        logger.debug(f"Cleaning up session {session_id}")
         
+        # Update stream_state with current references for cleanup
+        stream_state.stream_manager = stream_manager
+        stream_state.receiver_task = receiver_task
+        
+        # Graceful cleanup
+        await stream_state.cleanup()
+        
+        # Remove from active streams
+        if session_id in active_streams:
+            del active_streams[session_id]
         if session_id in active_sessions:
             del active_sessions[session_id]
+        
+        logger.info(f"✅ Session cleaned: {session_id}")
 
 
 # HTTP Endpoints
@@ -722,31 +987,39 @@ async def synthesize_text(request: SynthesizeRequest):
                 error="No valid sentences found"
             )
         
-        # Synthesize all sentences
-        all_audio_chunks = []
-        
-        stream_mgr = ElevenLabsStreamManager(config)
+        # Collect audio chunks
+        all_audio_chunks: list[bytes] = []
         
         async def collect_audio(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
             nonlocal first_chunk_time
             all_audio_chunks.append(audio_bytes)
             if first_chunk_time is None:
                 first_chunk_time = time.time()
-            await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
+            # Broadcast to FastRTC preview UI
+            try:
+                await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
+            except Exception as e:
+                logger.debug(f"FastRTC broadcast failed (non-fatal): {e}")
         
-        for sentence in sentences:
-            await stream_mgr.synthesize_text(sentence, collect_audio)
+        # Use stateless stream_text_to_audio for clean connection lifecycle
+        # Join sentences with space to send as one continuous text
+        full_text = " ".join(sentences)
         
-        await stream_mgr.disconnect()
+        stats = await stream_text_to_audio(config, full_text, collect_audio)
+        
+        if stats.get("error"):
+            logger.error(f"Streaming failed: {stats['error']}")
+            return SynthesizeResponse(
+                success=False,
+                error=f"Streaming failed: {stats['error']}"
+            )
         
         # Concatenate audio
         combined_audio = b''.join(all_audio_chunks)
         duration_ms = len(combined_audio) / (config.sample_rate * 2) * 1000
         
         # Calculate latency
-        first_chunk_latency_ms = None
-        if first_chunk_time:
-            first_chunk_latency_ms = (first_chunk_time - start_time) * 1000
+        first_chunk_latency_ms = stats.get("first_chunk_latency_ms")
         
         # Encode as base64
         audio_b64 = base64.b64encode(combined_audio).decode('utf-8')

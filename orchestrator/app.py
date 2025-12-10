@@ -15,6 +15,7 @@ import logging
 import os
 import time
 import base64
+import audioop
 from contextlib import asynccontextmanager
 from typing import Dict, Any, Optional, AsyncGenerator
 
@@ -25,6 +26,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPExceptio
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+
+# Optional FastRTC/Gradio UI for unified audio streaming
+try:
+    import gradio as gr
+    from fastrtc import Stream
+
+    FASTRTC_UI_AVAILABLE = True
+except ImportError:  # pragma: no cover - degraded mode without FastRTC UI
+    gr = None
+    Stream = None
+    FASTRTC_UI_AVAILABLE = False
 
 from leibniz_agent.services.orchestrator.config import OrchestratorConfig, TARA_INTRO_GREETING, DEFAULT_INTRO_GREETING
 from leibniz_agent.services.orchestrator.state_manager import StateManager, State
@@ -268,24 +280,27 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
     logger.info("✅ StateManager Orchestrator Ready")
     logger.info("=" * 70)
-    logger.info("📋 SERVICE LINKS:")
-    logger.info(f"   🔗 STT FastRTC UI: {STT_GRADIO_URL}")
-    logger.info(f"   🔗 TTS FastRTC UI: {TTS_GRADIO_URL}")
-    logger.info(f"   🔗 Orchestrator API: http://localhost:{os.getenv('PORT', '8004')}")
-    logger.info("=" * 70)
-    logger.info("⏳ WAITING FOR CONNECTIONS:")
-    logger.info(f"   1. Open STT FastRTC UI in browser: {STT_GRADIO_URL}")
-    logger.info(f"   2. Open TTS FastRTC UI in browser: {TTS_GRADIO_URL}")
-    logger.info("   3. Connections will be detected automatically via Redis events")
-    logger.info("   4. Once both STT and TTS connect, workflow will be ready")
-    logger.info(f"   5. Send POST /start to trigger: curl -X POST http://localhost:{os.getenv('PORT', '8004')}/start")
-    logger.info("=" * 70)
     
-    # Wait for STT and TTS connections (non-blocking - connections happen via Redis events)
+    # Determine the unified FastRTC URL
+    orchestrator_port = os.getenv('ORCHESTRATOR_PORT', os.getenv('PORT', '5204'))
+    unified_fastrtc_url = f"http://localhost:{orchestrator_port}/fastrtc"
+    orchestrator_api_url = f"http://localhost:{orchestrator_port}"
+    
+    logger.info("📋 SERVICE LINKS:")
+    logger.info(f"   🎯 UNIFIED FastRTC UI (RECOMMENDED): {unified_fastrtc_url}")
+    logger.info(f"   🔗 Orchestrator API: {orchestrator_api_url}")
+    logger.info(f"   🔗 STT FastRTC UI (standalone): {STT_GRADIO_URL}")
+    logger.info(f"   🔗 TTS FastRTC UI (standalone): {TTS_GRADIO_URL}")
     logger.info("=" * 70)
-    logger.info("⏳ WAITING FOR CONNECTIONS:")
-    logger.info("   Connections will be detected automatically via Redis events")
-    logger.info("   Once both STT and TTS connect, workflow will be ready")
+    logger.info("🚀 QUICK START:")
+    logger.info(f"   1. Open Unified FastRTC UI in browser: {unified_fastrtc_url}")
+    logger.info(f"   2. Click 'Record' to connect (handles both STT + TTS)")
+    logger.info(f"   3. Send POST /start to trigger: curl -X POST {orchestrator_api_url}/start")
+    logger.info("=" * 70)
+    logger.info("⏳ ALTERNATIVE (Separate UIs):")
+    logger.info(f"   1. Open STT FastRTC UI: {STT_GRADIO_URL}")
+    logger.info(f"   2. Open TTS FastRTC UI: {TTS_GRADIO_URL}")
+    logger.info("   3. Connections will be detected automatically via Redis events")
     logger.info("=" * 70)
     
     yield
@@ -335,6 +350,103 @@ try:
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 except Exception as e:
     logger.warning(f"Could not mount static files: {e}")
+
+
+# ============================================================================
+# Unified FastRTC Gradio UI (single connection for STT + TTS)
+# ============================================================================
+
+unified_fastrtc_stream = None
+_unified_handler = None  # Global reference for state broadcasting
+
+# Import UnifiedFastRTCHandler (may fail if dependencies missing)
+try:
+    from .unified_fastrtc import UnifiedFastRTCHandler, create_unified_handler
+    UNIFIED_FASTRTC_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"⚠️ UnifiedFastRTCHandler not available: {e}")
+    UnifiedFastRTCHandler = None
+    create_unified_handler = None
+    UNIFIED_FASTRTC_AVAILABLE = False
+
+
+async def broadcast_orchestrator_state(state_value: str) -> None:
+    """
+    Broadcast orchestrator state to all UnifiedFastRTCHandler instances.
+    
+    This enables state-aware input gating (mute mic during THINKING/SPEAKING).
+    
+    Args:
+        state_value: State string value (e.g., "listening", "speaking")
+    """
+    if not UNIFIED_FASTRTC_AVAILABLE or UnifiedFastRTCHandler is None:
+        return
+    
+    try:
+        await UnifiedFastRTCHandler.broadcast_state_change(state_value)
+    except Exception as e:
+        logger.debug(f"State broadcast error: {e}")
+
+
+# Forward declarations for callbacks (defined below, after routing helpers)
+async def _unified_on_stt_transcript(
+    fastrtc_session_id: str,
+    text: str,
+    is_final: bool,
+) -> None:
+    """Callback from UnifiedFastRTCHandler when STT text is available."""
+    # Implementation is below - this is just for reference
+    pass  # Actual implementation replaces this
+
+
+async def _unified_on_connection_change(
+    fastrtc_session_id: str,
+    connected: bool,
+) -> None:
+    """Callback when a Unified FastRTC browser client connects or disconnects."""
+    # Implementation is below - this is just for reference
+    pass  # Actual implementation replaces this
+
+
+def _setup_unified_fastrtc():
+    """
+    Lazy setup of UnifiedFastRTC UI after callbacks are defined.
+    Called at the end of module initialization.
+    """
+    global unified_fastrtc_stream, _unified_handler, app
+    
+    if not UNIFIED_FASTRTC_AVAILABLE or not FASTRTC_UI_AVAILABLE:
+        logger.warning("FastRTC / Gradio not available - unified UI disabled")
+        return
+    
+    try:
+        # Create handler
+        _unified_handler = create_unified_handler()
+        
+        # Note: Callbacks are registered after they're defined (see bottom of file)
+        
+        unified_fastrtc_stream = Stream(
+            handler=_unified_handler,
+            modality="audio",
+            mode="send-receive",
+            ui_args={
+                "title": "Leibniz Unified Voice Interface",
+                "description": (
+                    "Single FastRTC connection for ultra-low latency STT + TTS. "
+                    "Connect your microphone and speakers here. "
+                    "Use the /start API on the orchestrator to trigger the intro."
+                ),
+            },
+        )
+        
+        # Mount Gradio UI on the main FastAPI app
+        app = gr.mount_gradio_app(app, unified_fastrtc_stream.ui, path="/fastrtc")
+        logger.info("✅ Unified FastRTC UI mounted at /fastrtc")
+        
+    except Exception as e:
+        unified_fastrtc_stream = None
+        _unified_handler = None
+        logger.warning(f"⚠️ Failed to initialize unified FastRTC UI: {e}")
 
 
 @app.get("/")
@@ -621,6 +733,10 @@ async def stream_audio_file(
                     chunk_size = 4096  # 4KB chunks
                     total_bytes = 0
                     
+                    # Resampling state for audioop
+                    resample_state = None
+                    target_rate = 24000
+                    
                     while True:
                         audio_data = wav_file.readframes(chunk_size // sample_width)
                         if not audio_data:
@@ -643,6 +759,31 @@ async def stream_audio_file(
                                 await websocket.send_bytes(audio_data)
                             except Exception as ws_err:
                                 logger.debug(f"Could not forward audio to client: {ws_err}")
+                        
+                        # Broadcast to Unified FastRTC (CRITICAL FIX for auto-sessions)
+                        try:
+                            if UNIFIED_FASTRTC_AVAILABLE and UnifiedFastRTCHandler:
+                                # Resample if necessary (e.g. 22050Hz -> 24000Hz)
+                                broadcast_data = audio_data
+                                broadcast_rate = sample_rate
+                                
+                                if sample_rate != target_rate and sample_width == 2:
+                                    try:
+                                        broadcast_data, resample_state = audioop.ratecv(
+                                            audio_data, 
+                                            sample_width, 
+                                            1, 
+                                            sample_rate, 
+                                            target_rate, 
+                                            resample_state
+                                        )
+                                        broadcast_rate = target_rate
+                                    except Exception as e:
+                                        logger.warning(f"Resampling failed: {e}")
+                                
+                                await UnifiedFastRTCHandler.broadcast_audio(broadcast_data, broadcast_rate)
+                        except Exception as e:
+                            logger.debug(f"Failed to broadcast audio file chunk: {e}")
                         
                         # Small delay to simulate streaming
                         await asyncio.sleep(0.01)
@@ -753,19 +894,29 @@ async def stream_tts_audio(
                             logger.info(f"📢 Sentence {sentence_count} starting: {data.get('text', '')[:50]}...")
                         
                         elif msg_type == "audio":
-                            # Forward audio chunk to client (if WebSocket exists)
-                            # For auto-created sessions, audio goes directly to TTS FastRTC UI
-                            if websocket:
-                                audio_b64 = data.get("data", "")
-                                if audio_b64:
-                                    audio_bytes = base64.b64decode(audio_b64)
+                            # Forward audio chunk to WebSocket client (if exists)
+                            audio_b64 = data.get("data", "")
+                            sample_rate = data.get("sample_rate", config.tts_sample_rate if hasattr(config, "tts_sample_rate") else 24000)  # type: ignore[assignment]
+
+                            if audio_b64:
+                                audio_bytes = base64.b64decode(audio_b64)
+
+                                # 1) Send to any connected orchestrator WebSocket client
+                                if websocket:
                                     try:
                                         await websocket.send_bytes(audio_bytes)
                                     except Exception as ws_err:
                                         logger.debug(f"Could not forward audio to client: {ws_err}")
-                            else:
-                                # Auto-created session - audio streams directly to TTS FastRTC UI
-                                logger.debug(f"📡 Audio streaming to TTS FastRTC UI (no client WebSocket)")
+
+                                # 2) Broadcast to all Unified FastRTC sessions (primary audio path)
+                                try:
+                                    from .unified_fastrtc import UnifiedFastRTCHandler  # Local import to avoid circulars
+
+                                    await UnifiedFastRTCHandler.broadcast_audio(
+                                        audio_bytes, sample_rate
+                                    )
+                                except Exception as broadcast_err:
+                                    logger.debug(f"Could not broadcast audio to Unified FastRTC: {broadcast_err}")
                         
                         elif msg_type == "sentence_playing":
                             # Track when sentence is playing in browser
@@ -804,6 +955,7 @@ async def stream_tts_audio(
                 # TTS complete - transition to IDLE (unless skipping for fillers)
                 if not skip_state_transition:
                     await state_mgr.transition(State.IDLE, "tts_complete", {})
+                    await broadcast_orchestrator_state(State.IDLE.value)  # Open mic
                     state_mgr.context.turn_number += 1
                     state_mgr.context.text_buffer = []  # Clear buffer for next turn
                     await state_mgr.save_state()
@@ -985,6 +1137,7 @@ async def start_intro_sequence(session_id: str):
     try:
         # Transition to SPEAKING state for intro
         await state_mgr.transition(State.SPEAKING, "intro_start", {"text": INTRO_GREETING})
+        await broadcast_orchestrator_state(State.SPEAKING.value)  # Gate mic
         
         if websocket:
             await send_service_status(
@@ -1003,8 +1156,12 @@ async def start_intro_sequence(session_id: str):
         # Play intro via TTS
         await play_intro_greeting(session_id, websocket, state_mgr)
         
+        # Reset timeout timer explicitly after intro finishes
+        state_mgr.context.last_activity_time = time.time()
+        
         # Transition to LISTENING state - now waiting for user speech
         await state_mgr.transition(State.LISTENING, "intro_complete", {})
+        await broadcast_orchestrator_state(State.LISTENING.value)  # Open mic
         
         if websocket:
             try:
@@ -1079,6 +1236,7 @@ async def monitor_timeouts():
                     # Transition to SPEAKING for timeout message
                     try:
                         await state_mgr.transition(State.SPEAKING, "timeout_detected", {})
+                        await broadcast_orchestrator_state(State.SPEAKING.value)  # Gate mic
                         
                         # Play timeout dialogue
                         await stream_tts_audio(
@@ -1092,6 +1250,7 @@ async def monitor_timeouts():
                         
                         # Transition back to LISTENING and reset activity time
                         await state_mgr.transition(State.LISTENING, "timeout_complete", {})
+                        await broadcast_orchestrator_state(State.LISTENING.value)  # Open mic
                         state_mgr.context.last_activity_time = time.time()  # Reset timeout timer
                         
                         if websocket:
@@ -1163,80 +1322,14 @@ async def listen_to_redis_events():
                             logger.info(f"   Is Final: {is_final}")
                             logger.info("=" * 70)
                             
-                            # Route STT events to ALL active sessions in LISTENING state
-                            # (STT session ID is different from WebSocket session ID)
-                            routed = False
-                            # Use list() to create a copy of items to avoid "dictionary changed size during iteration"
-                            for ws_session_id, session_data in list(active_sessions.items()):
-                                state_mgr = session_data.get("state_mgr")
-                                websocket = session_data.get("websocket")
-                                workflow_started = session_data.get("workflow_started", False)
-                                
-                                if not workflow_started:
-                                    logger.debug(f"Skipping session {ws_session_id}: workflow not started")
-                                    continue
-                                
-                                # ═══════════════════════════════════════════════════════════════
-                                # CRITICAL: Ignore STT while agent is SPEAKING (TARA mode)
-                                # This prevents transcription interference during TTS playback
-                                # ═══════════════════════════════════════════════════════════════
-                                if state_mgr and state_mgr.state == State.SPEAKING:
-                                    if config.ignore_stt_while_speaking:
-                                        logger.info(f"🔇 IGNORING STT - Agent is SPEAKING (session: {ws_session_id})")
-                                        logger.debug(f"   Text ignored: {text[:50]}...")
-                                        continue  # Skip this session - agent is speaking
-                                
-                                if state_mgr and state_mgr.state == State.LISTENING:
-                                     logger.info(f"🎯 Routing STT to session: {ws_session_id}")
-                                     # Process final transcripts to trigger the pipeline
-                                     # Works for both WebSocket and auto-created sessions
-                                     if is_final:
-                                         await handle_stt_event(ws_session_id, text, websocket, state_mgr)
-                                     else:
-                                         # ═══════════════════════════════════════════════════
-                                         # INCREMENTAL BUFFERING: Pre-fetch documents on partial STT
-                                         # This hides retrieval latency by fetching while user speaks
-                                         # ═══════════════════════════════════════════════════
-                                         if config.tara_mode and config.rag_service_url:
-                                             # Fire-and-forget buffering (don't await)
-                                             asyncio.create_task(buffer_rag_incremental(
-                                                 text=text,
-                                                 session_id=ws_session_id,
-                                                 rag_url=config.rag_service_url,
-                                                 language=config.response_language,
-                                                 organization=config.organization_name
-                                             ))
-                                             logger.debug(f"📦 Incremental buffer triggered for: {text[:30]}...")
-                                         
-                                         # ═══════════════════════════════════════════════════
-                                         # ELEVENLABS PREWARM: Pre-warm TTS connection on VAD
-                                         # This hides TTS connection latency by connecting early
-                                         # ═══════════════════════════════════════════════════
-                                         if config.use_elevenlabs_tts and config.elevenlabs_prewarm_on_vad:
-                                             if ws_session_id not in eleven_tts_clients:
-                                                 # Fire-and-forget prewarm (don't await)
-                                                 asyncio.create_task(prewarm_elevenlabs_tts(ws_session_id))
-                                                 logger.debug(f"⚡ ElevenLabs prewarm triggered for: {ws_session_id}")
-                                         
-                                         # Notify client if WebSocket exists
-                                         if websocket:
-                                             try:
-                                                 await websocket.send_json({
-                                                     "type": "stt_partial",
-                                                     "text": text,
-                                                     "session_id": ws_session_id
-                                                 })
-                                             except:
-                                                 pass
-                                         else:
-                                             logger.debug(f"📝 Partial STT: {text[:50]}...")
-                                     routed = True
-                                else:
-                                    if state_mgr:
-                                        logger.debug(f"Skipping session {ws_session_id}: state={state_mgr.state.value}")
-                            
+                            # Route STT events using shared routing logic
+                            routed = await route_stt_text_to_active_sessions(
+                                text=text,
+                                is_final=is_final,
+                                event_session_id=event_session_id,
+                            )
                             if not routed:
-                                logger.warning(f"⚠️ No active LISTENING sessions to route STT event")
+                                logger.warning("⚠️ No active LISTENING sessions to route STT event")
                     elif channel in ("leibniz:events:stt:connected", "leibniz:events:tts:connected"):
                         service = "stt" if channel.endswith("stt:connected") else "tts"
                         await handle_service_connection(service, event_data)
@@ -1253,6 +1346,182 @@ async def listen_to_redis_events():
     except Exception as e:
         logger.error(f"❌ Redis event listener error: {e}", exc_info=True)
 
+
+async def route_stt_text_to_active_sessions(
+    text: str,
+    is_final: bool,
+    event_session_id: str = "",
+) -> bool:
+    """
+    Route STT text (from Redis or Unified FastRTC) to active orchestrator sessions.
+
+    This centralizes the logic so both Redis-based STT and the unified FastRTC
+    handler behave identically.
+    """
+    routed = False
+
+    # Use list() to create a copy of items to avoid "dictionary changed size during iteration"
+    for ws_session_id, session_data in list(active_sessions.items()):
+        state_mgr = session_data.get("state_mgr")
+        websocket = session_data.get("websocket")
+        workflow_started = session_data.get("workflow_started", False)
+
+        if not workflow_started:
+            logger.debug(f"Skipping session {ws_session_id}: workflow not started")
+            continue
+
+        # Ignore STT while agent is speaking (TARA mode)
+        if state_mgr and state_mgr.state == State.SPEAKING:
+            if config and config.ignore_stt_while_speaking:
+                logger.info(
+                    f"🔇 IGNORING STT - Agent is SPEAKING (session: {ws_session_id})"
+                )
+                logger.debug(f"   Text ignored: {text[:50]}...")
+                continue
+
+        if state_mgr and state_mgr.state == State.LISTENING:
+            logger.info(f"🎯 Routing STT to session: {ws_session_id}")
+            # Process final transcripts to trigger the pipeline
+            # Works for both WebSocket and auto-created sessions
+            if is_final:
+                await handle_stt_event(ws_session_id, text, websocket, state_mgr)
+            else:
+                # Incremental buffering for RAG
+                if config and config.tara_mode and config.rag_service_url:
+                    asyncio.create_task(
+                        buffer_rag_incremental(
+                            text=text,
+                            session_id=ws_session_id,
+                            rag_url=config.rag_service_url,
+                            language=config.response_language,
+                            organization=config.organization_name,
+                        )
+                    )
+                    logger.debug(
+                        f"📦 Incremental buffer triggered for: {text[:30]}..."
+                    )
+
+                # ElevenLabs prewarm for ultra-low latency
+                if (
+                    config
+                    and config.use_elevenlabs_tts
+                    and config.elevenlabs_prewarm_on_vad
+                ):
+                    if ws_session_id not in eleven_tts_clients:
+                        asyncio.create_task(prewarm_elevenlabs_tts(ws_session_id))
+                        logger.debug(
+                            f"⚡ ElevenLabs prewarm triggered for: {ws_session_id}"
+                        )
+
+                # Notify client if WebSocket exists
+                if websocket:
+                    try:
+                        await websocket.send_json(
+                            {
+                                "type": "stt_partial",
+                                "text": text,
+                                "session_id": ws_session_id,
+                            }
+                        )
+                    except Exception:
+                        pass
+                else:
+                    logger.debug(f"📝 Partial STT: {text[:50]}...")
+
+            routed = True
+        else:
+            if state_mgr:
+                logger.debug(
+                    f"Skipping session {ws_session_id}: state={state_mgr.state.value}"
+                )
+
+    return routed
+
+
+# ============================================================================
+# Unified FastRTC callbacks (STT + connection events)
+# These are the ACTUAL implementations - registered at module load time
+# ============================================================================
+
+async def _unified_on_stt_transcript_impl(
+    fastrtc_session_id: str,
+    text: str,
+    is_final: bool,
+) -> None:
+    """
+    Callback from UnifiedFastRTCHandler when STT text is available.
+
+    We simply reuse the same routing logic as Redis-based STT so that
+    orchestrator behaviour is identical irrespective of STT source.
+    """
+    if not text:
+        return
+
+    logger.info("=" * 70)
+    logger.info("📨 Received STT event from Unified FastRTC")
+    logger.info(f"   FastRTC Session: {fastrtc_session_id}")
+    logger.info(f"   Text: {text[:100]}...")
+    logger.info(f"   Is Final: {is_final}")
+    logger.info("=" * 70)
+
+    await route_stt_text_to_active_sessions(
+        text=text,
+        is_final=is_final,
+        event_session_id=fastrtc_session_id,
+    )
+
+
+async def _unified_on_connection_change_impl(
+    fastrtc_session_id: str,
+    connected: bool,
+) -> None:
+    """
+    Callback when a Unified FastRTC browser client connects or disconnects.
+
+    We treat this as both STT and TTS being available for the orchestrator,
+    so the workflow can become READY without separate FastRTC UIs.
+    """
+    global service_connections
+
+    if connected:
+        timestamp = time.time()
+        service_connections["stt"] = {
+            "connected": True,
+            "session_id": fastrtc_session_id,
+            "timestamp": timestamp,
+        }
+        service_connections["tts"] = {
+            "connected": True,
+            "session_id": fastrtc_session_id,
+            "timestamp": timestamp,
+        }
+        logger.info("=" * 70)
+        logger.info(f"🔌 Unified FastRTC connected | session: {fastrtc_session_id}")
+        logger.info("   Marking STT and TTS as connected")
+        logger.info("=" * 70)
+    else:
+        service_connections["stt"]["connected"] = False
+        service_connections["tts"]["connected"] = False
+        logger.info("=" * 70)
+        logger.info(f"🔌 Unified FastRTC disconnected | session: {fastrtc_session_id}")
+        logger.info("   Marking STT and TTS as disconnected")
+        logger.info("=" * 70)
+
+    # Notify all orchestrator sessions and recompute workflow readiness
+    await broadcast_service_status(
+        "Unified FastRTC connected" if connected else "Unified FastRTC disconnected"
+    )
+    await check_and_start_workflow("unified_fastrtc_connected" if connected else "unified_fastrtc_disconnected")
+
+
+# Register callbacks and setup UI now that implementations are defined
+if UNIFIED_FASTRTC_AVAILABLE and UnifiedFastRTCHandler is not None:
+    UnifiedFastRTCHandler.on_stt_transcript = _unified_on_stt_transcript_impl
+    UnifiedFastRTCHandler.on_connection_change = _unified_on_connection_change_impl
+    logger.info("✅ Unified FastRTC callbacks registered")
+
+# Setup the FastRTC UI (must be after callbacks are registered)
+_setup_unified_fastrtc()
 
 async def prewarm_elevenlabs_tts(session_id: str) -> bool:
     """
@@ -1414,13 +1683,15 @@ async def stream_tts_from_generator(
     if use_elevenlabs_direct:
         # ═══════════════════════════════════════════════════════════════════
         # ELEVENLABS DIRECT MODE: Use pre-warmed ElevenLabs client
-        # Bypasses standard TTS WebSocket for ultra-low latency
+        # Matches sarvam's behavior EXACTLY: forward audio immediately as it arrives
         # ═══════════════════════════════════════════════════════════════════
         logger.info("⚡ Using ELEVENLABS DIRECT streaming mode (pre-warmed)")
         client = eleven_tts_clients[session_id]
         
         try:
             first_audio_sent = False
+            chunks_sent = 0
+            total_bytes_sent = 0
             
             async def on_first_audio(latency_ms: float):
                 nonlocal first_audio_sent
@@ -1436,25 +1707,34 @@ async def stream_tts_from_generator(
                         except Exception:
                             pass
             
-            # Stream text to audio and forward immediately to browser
-            chunks_sent = 0
-            total_bytes_sent = 0
-            
+            # Stream text to audio and forward IMMEDIATELY (exactly like sarvam's audio_callback)
+            # No buffering, no queuing - forward as soon as we receive each chunk
             async for audio_bytes, metadata in client.stream_text_to_audio(generator, on_first_audio):
-                # Forward audio to WebSocket client IMMEDIATELY (no buffering)
+                # Forward audio to WebSocket client IMMEDIATELY (matches sarvam's pattern exactly)
+                # This is the same pattern as sarvam's audio_callback function
+                chunk_received_time = time.time()
+                
                 if websocket:
                     try:
+                        # Send audio bytes directly (same as sarvam after base64 decode)
                         await websocket.send_bytes(audio_bytes)
                         chunks_sent += 1
                         total_bytes_sent += len(audio_bytes)
-                        logger.debug(f"📤 Forwarded audio chunk {chunks_sent}: {len(audio_bytes)} bytes")
+                        forward_time = time.time()
+                        logger.info(f"📤 Forwarded audio chunk {chunks_sent}: {len(audio_bytes)} bytes (forwarded in {(forward_time - chunk_received_time)*1000:.1f}ms)")
                     except Exception as e:
-                        logger.warning(f"Could not forward audio to client: {e}")
-                        # Don't break, continue forwarding remaining chunks
+                        logger.error(f"❌ Could not forward audio to client: {e}")
+                        # Don't break, continue forwarding remaining chunks (like sarvam)
+                else:
+                    logger.warning("⚠️ No WebSocket connection to forward audio to")
                 
                 # Log progress
                 if metadata.get("is_final"):
                     logger.info(f"✅ ElevenLabs stream complete (forwarded {chunks_sent} chunks, {total_bytes_sent} bytes)")
+            
+            # Keep connection open briefly to ensure all chunks are forwarded
+            # Matches sarvam's pattern: allow time for final chunks to arrive
+            await asyncio.sleep(0.5)
             
             # Get metrics
             metrics = client.get_metrics()
@@ -1644,6 +1924,7 @@ async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSo
         
         # Update state to THINKING
         await state_mgr.transition(State.THINKING, "stt_received", {"text": text})
+        await broadcast_orchestrator_state(State.THINKING.value)  # Gate mic during processing
         
         # Handle unclear / empty text with a dedicated prompt
         if not text.strip():
@@ -1760,6 +2041,7 @@ async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSo
         
         # Transition to SPEAKING immediately as we start streaming
         await state_mgr.transition(State.SPEAKING, "streaming_started", {})
+        await broadcast_orchestrator_state(State.SPEAKING.value)  # Gate mic during TTS
         
         # Stream TTS from the generator
         if generator:
@@ -1770,6 +2052,7 @@ async def handle_stt_event(session_id: str, text: str, websocket: Optional[WebSo
         
         # Transition back to LISTENING (or IDLE)
         await state_mgr.transition(State.LISTENING, "interaction_complete", {})
+        await broadcast_orchestrator_state(State.LISTENING.value)  # Open mic for next turn
         
     except Exception as e:
         logger.error(f"❌ Error in handle_stt_event: {e}", exc_info=True)
@@ -1912,6 +2195,17 @@ async def get_status():
             "turn_number": state_mgr.context.turn_number if state_mgr else 0
         }
     
+    # Get UnifiedFastRTC handler states
+    unified_fastrtc_states = {}
+    if UNIFIED_FASTRTC_AVAILABLE and UnifiedFastRTCHandler is not None:
+        try:
+            unified_fastrtc_states = UnifiedFastRTCHandler.get_all_states()
+        except Exception as e:
+            unified_fastrtc_states = {"error": str(e)}
+    
+    # Get the unified URL
+    unified_url = f"http://localhost:{os.getenv('ORCHESTRATOR_PORT', '5204')}/fastrtc"
+    
     return {
         "workflow_ready": workflow_ready,
         "workflow_triggered": workflow_triggered,
@@ -1933,7 +2227,13 @@ async def get_status():
             }
         },
         "active_sessions": session_states,
+        "unified_fastrtc": {
+            "available": UNIFIED_FASTRTC_AVAILABLE,
+            "url": unified_url,
+            "active_handlers": unified_fastrtc_states
+        },
         "gradio_urls": {
+            "unified": unified_url,
             "stt": STT_GRADIO_URL,
             "tts": TTS_GRADIO_URL
         }

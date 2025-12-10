@@ -1,19 +1,20 @@
 # TTS Streaming Microservice
 
-Independent TTS microservice with WebSocket-based parallel queue streaming, sentence-level chunking, and LemonFox API integration.
+Independent TTS microservice with WebSocket-based parallel queue streaming, sentence-level chunking, and Sarvam AI integration. Optimized for TARA mode with Telugu language support for TASK organization.
 
 ## Features
 
 - **WebSocket Streaming**: Real-time bidirectional audio streaming
 - **Sentence-level Chunking**: Automatic text splitting with abbreviation protection
 - **2-Slot Pipeline**: Parallel synthesis (synthesize N+1 while playing N)
-- **LemonFox Provider**: Hardcoded API endpoint with emotion-to-speed mapping
+- **Sarvam AI Provider**: Multi-language TTS with Telugu support for TARA mode
 - **MD5 Caching**: Audio caching with LRU cleanup and TTL enforcement
+- **TARA Mode**: Telugu language support for TASK customer service agent
 
 ## Architecture
 
 ```
-Client (WebSocket) --> TTS Service (Port 8005)
+Client (WebSocket) --> TTS Service (Port 8025)
                           |
                           +--> Sentence Splitter
                           |        |
@@ -21,7 +22,7 @@ Client (WebSocket) --> TTS Service (Port 8005)
                           |        |
                           +--> Parallel Synthesizer (2-slot pipeline)
                           |        |
-                          +--> LemonFox API (hardcoded)
+                          +--> Sarvam AI API (te-IN for TARA mode)
                           |        |
                           +--> Audio Cache (MD5 keys)
 ```

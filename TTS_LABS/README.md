@@ -1,6 +1,6 @@
 # TTS_LABS - ElevenLabs Ultra-Low Latency TTS Microservice
 
-Ultra-low latency text-to-speech streaming service using ElevenLabs WebSocket API with the `eleven_flash_v2_5` model.
+Ultra-low latency text-to-speech streaming service using ElevenLabs WebSocket API. Configurable voice and model selection via environment variables.
 
 ## Features
 
@@ -14,9 +14,32 @@ Ultra-low latency text-to-speech streaming service using ElevenLabs WebSocket AP
 
 | Metric | Target | Achieved |
 |--------|--------|----------|
-| First Chunk Latency | < 150ms | 75-150ms |
-| Model | eleven_flash_v2_5 | ✅ |
-| Output Format | PCM 24kHz | ✅ |
+| First Chunk Latency | < 150ms | 75-150ms* |
+| Model | Configurable | Via ELEVENLABS_MODEL_ID |
+| Output Format | Configurable | Via ELEVENLABS_OUTPUT_FORMAT |
+
+*Latency depends on selected model and network conditions
+
+## Configuration
+
+TTS_LABS is fully configurable via environment variables. No hardcoded defaults - all voice and model settings must be provided externally.
+
+### Required Environment Variables
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `ELEVENLABS_API_KEY` | Your ElevenLabs API key | `sk_...` |
+| `ELEVENLABS_VOICE_ID` | Voice ID from ElevenLabs dashboard | `21m00Tcm4TlvDq8ikWAM` |
+| `ELEVENLABS_MODEL_ID` | TTS model to use | `eleven_turbo_v2_5` |
+
+### Optional Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ELEVENLABS_LATENCY_OPTIMIZATION` | `4` | Latency vs quality (0-4) |
+| `ELEVENLABS_OUTPUT_FORMAT` | `pcm_24000` | Audio format |
+| `ELEVENLABS_STABILITY` | `0.5` | Voice stability (0.0-1.0) |
+| `ELEVENLABS_SIMILARITY_BOOST` | `0.75` | Voice similarity (0.0-1.0) |
 
 ## Quick Start
 
@@ -24,7 +47,8 @@ Ultra-low latency text-to-speech streaming service using ElevenLabs WebSocket AP
 
 ```bash
 export ELEVENLABS_API_KEY="your-api-key-here"
-export ELEVENLABS_VOICE_ID="21m00Tcm4TlvDq8ikWAM"  # Rachel voice
+export ELEVENLABS_VOICE_ID="your_voice_id_here"  # Get from ElevenLabs dashboard
+export ELEVENLABS_MODEL_ID="eleven_turbo_v2_5"   # Or other model
 ```
 
 ### 2. Run with Docker Compose
@@ -70,7 +94,7 @@ Connect with `?session_id=<your-session-id>`
 ```json
 {
   "text": "Hello, how can I help you today?",
-  "voice": "21m00Tcm4TlvDq8ikWAM"
+  "voice": "your_configured_voice_id"
 }
 ```
 
@@ -83,8 +107,8 @@ Returns service status, model info, and latency optimization level.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ELEVENLABS_API_KEY` | (required) | ElevenLabs API key |
-| `ELEVENLABS_VOICE_ID` | `21m00Tcm4TlvDq8ikWAM` | Voice ID (Rachel) |
-| `ELEVENLABS_MODEL_ID` | `eleven_flash_v2_5` | TTS model |
+| `ELEVENLABS_VOICE_ID` | *Required* | Voice ID from ElevenLabs dashboard |
+| `ELEVENLABS_MODEL_ID` | *Required* | TTS model (eleven_turbo_v2_5, eleven_multilingual_v2, etc.) |
 | `ELEVENLABS_LATENCY_OPTIMIZATION` | `4` | Latency level (0-4) |
 | `ELEVENLABS_OUTPUT_FORMAT` | `pcm_24000` | Audio format |
 | `ELEVENLABS_STABILITY` | `0.5` | Voice stability |
@@ -122,7 +146,7 @@ TTS_STREAMING_MODE=continuous
 
 ## Pricing
 
-ElevenLabs eleven_flash_v2_5 (Scale Plan): **0.5 credits/char** (~$0.09/min)
+ElevenLabs pricing varies by model and voice. Check ElevenLabs dashboard for current rates.
 
 ## Troubleshooting
 

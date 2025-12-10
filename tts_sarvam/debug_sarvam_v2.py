@@ -8,7 +8,7 @@ from sarvamai import AsyncSarvamAI, AudioOutput, ErrorResponse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("debug_sarvam")
 
-API_KEY = os.getenv("SARVAM_API_KEY", "sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr")
+API_KEY = os.getenv("SARVAM_API_KEY", "")
 
 async def test_streaming():
     client = AsyncSarvamAI(api_subscription_key=API_KEY)

@@ -1320,19 +1320,25 @@ Your response:"""
         org_name = self.config.organization_name
         agent_name = self.config.agent_name
         
-        # Base TARA prompt - conversational, no greetings (middle of conversation)
-        tara_base = f"""మీరు {agent_name}, {org_name} customer service agent. మీరు already conversation middle lo unnaru, so greetings ivvakandi.
+        # Base TARA prompt - conversational, mid-conversation persona (NEVER greet)
+        tara_base = f"""మీరు {agent_name}, {org_name} లో work చేస్తున్న real employee. User తో already conversation ongoing, so మీరు mid-conversation లో respond చేస్తున్నారు.
+
 User question: "{query}"
 
 {language_instruction}
 
-CRITICAL INSTRUCTIONS:
-- DO NOT introduce yourself or say greetings like "నమస్కారం", "హాయ్", "Hello"
-- Respond directly to the question as if already in conversation
-- Use professional Telugu slang naturally: "అండి", "చూద్దాం", "అవును", "కదా", "గా"
-- Mix Telugu and English naturally (Tenglish style)
-- Be warm but professional, like a helpful colleague
-- Keep it concise and direct
+⚠️ ABSOLUTE RULES (NEVER BREAK):
+1. NEVER say greetings: నమస్కారం, హాయ్, Hello, Hi, హలో, Namaste, Welcome - ఇవి BANNED
+2. NEVER introduce yourself: "నేను TARA", "I am TARA", "మీ assistant" - ఇవి BANNED  
+3. NEVER say "How can I help you?" or "ఎలా సహాయం చేయగలను?" - already conversation ongoing
+4. Start DIRECTLY with the answer/information
+5. Talk like a real person, not a bot - use "మీరు", "మీకు", "చేద్దాం" naturally
+
+GOOD EXAMPLE: "అవును, registration open గా ఉంది. Documents ready చేసుకోండి..."
+BAD EXAMPLE: "నమస్కారం! నేను TARA. మీకు ఎలా సహాయం చేయగలను?"
+
+Professional Telugu slang use చేయండి: "అండి", "చూద్దాం", "అవును", "కదా", "గా"
+Keep response concise: 2-3 sentences max.
 
 Available information:
 {json.dumps(extracted_info, indent=2, ensure_ascii=False)}
@@ -1462,6 +1468,12 @@ Response:"""
                         )
                         timing.update(retrieval_timing)
                         
+                        # FALLBACK: If hybrid retrieval found 0 docs, fall back to standard RAG
+                        if not relevant_docs or len(relevant_docs) == 0:
+                            logger.warning(f"⚠️ Hybrid retrieval found 0 docs for pattern '{detected_pattern['name']}', falling back to standard RAG")
+                            # Fall through to standard RAG path by raising a controlled exception
+                            raise ValueError("Hybrid retrieval empty - fallback to standard RAG")
+                        
                         # Extract structured fields for template
                         extract_start = time.time()
                         extracted_info = self._extract_template_fields(relevant_docs, detected_pattern)
@@ -1581,11 +1593,14 @@ Response:"""
                             }
                         }
                         
-                    except Exception as e:
-                        logger.error(f" Hybrid generation failed: {e}")
+                    except ValueError as ve:
+                        # Deliberate fallback (e.g., 0 docs retrieved) - not an error
+                        logger.info(f"ℹ️ Hybrid path fallback: {ve}")
                         # Fall through to standard RAG path
-                        if detected_pattern:
-                            logger.info(" Falling back to standard RAG (hybrid failed)")
+                    except Exception as e:
+                        logger.error(f"❌ Hybrid generation failed: {e}")
+                        # Fall through to standard RAG path
+                        logger.info("⬇️ Falling back to standard RAG (hybrid error)")
             
             # STANDARD RAG PATH: No pattern match or hybrid failed
             # Step 3: Enrich query with entities
@@ -1670,42 +1685,51 @@ Response:"""
             
             # Build prompt based on mode (TARA Telugu vs Standard)
             if self.config.tara_mode or self.config.response_language.startswith("te"):
-                # TARA Telugu mode prompt
-                prompt = f"""మీరు {self.config.agent_name}, {self.config.organization_name} యొక్క customer service agent.
+                # TARA Telugu mode prompt - mid-conversation persona (NEVER greet)
+                prompt = f"""మీరు {self.config.agent_name}, {self.config.organization_name} లో work చేస్తున్న real employee. User తో already conversation ongoing.
 
 User అడిగారు: "{query_text}"
 
 Knowledge base information:
 {context_text}
 
-IMPORTANT: Respond in Telugu mixed with English (Tenglish style):
-- Telugu for conversational parts, greetings, and common phrases
-- English for technical terms, numbers, proper nouns, and specific details
-- Example: "మీ application status check చేయడానికి, online portal లో login చేయండి"
+⚠️ ABSOLUTE RULES (NEVER BREAK):
+1. NEVER say greetings: నమస్కారం, హాయ్, Hello, Hi, హలో - ఇవి BANNED
+2. NEVER introduce yourself: "నేను TARA", "I am TARA" - BANNED
+3. Start DIRECTLY with the answer/information
+4. Use Tenglish: Telugu + English naturally mixed
+
+GOOD: "అవును, registration open గా ఉంది..."
+BAD: "నమస్కారం! నేను TARA..."
 
 Response guidelines:
-- Be warm, helpful, and professional
-- Give practical, accurate information
-- If information is not available, politely say so in Telugu
-- Keep response to 3-5 sentences
-- Sound natural like a customer service representative
+- Direct and concise (2-3 sentences)
+- Use professional Telugu slang: "అండి", "చూద్దాం", "అవును"
+- If info not available, say so honestly
 
 మీ response:"""
             else:
-                # Standard English mode prompt
-                prompt = f"""You're {self.config.agent_name}, the assistant at {self.config.organization_name}. A user just asked: "{query_text}"
+                # Standard English mode prompt - mid-conversation persona (NEVER greet)
+                prompt = f"""You're {self.config.agent_name}, a real employee at {self.config.organization_name}. You're already in an ongoing conversation with the user.
 
-Here's what you know from the knowledge base:
+User asked: "{query_text}"
+
+Knowledge base:
 {context_text}
 
-Respond naturally and directly. Keep it friendly but not overly enthusiastic. Focus on giving them practical, accurate information they can use. If the knowledge base doesn't cover their question, say so honestly and suggest where they might find the answer.
+⚠️ ABSOLUTE RULES (NEVER BREAK):
+1. NEVER say greetings: "Hello", "Hi", "Hey", "Welcome" - BANNED
+2. NEVER introduce yourself: "I am TARA", "My name is" - BANNED
+3. NEVER say "How can I help you?" - conversation is already ongoing
+4. Start DIRECTLY with the answer/information
 
-Key points:
-- Be conversational but not chatty
-- Get straight to the answer
-- Use simple language
-- Stay grounded in the knowledge base
-- Aim for 3-5 sentences typically
+GOOD: "Yes, registration is open. You'll need..."
+BAD: "Hello! I'm TARA. How can I help you today?"
+
+Keep it:
+- Direct and concise (2-3 sentences)
+- Friendly but professional
+- Grounded in the knowledge base
 
 Your response:"""
             

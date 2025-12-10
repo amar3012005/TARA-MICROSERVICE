@@ -324,22 +324,13 @@ class ElevenLabsTTSClient:
             # Start text sending task
             text_generator_task = asyncio.create_task(send_text_chunks())
             
-            # Continuously yield audio chunks as they arrive (don't wait for text chunks)
+            # Continuously yield audio chunks IMMEDIATELY as they arrive (matches sarvam's immediate forwarding)
+            # No delays, no timeouts - yield as soon as audio arrives
+            text_done = False
             try:
                 while True:
-                    # Wait for audio with timeout to check if text generator is done
-                    try:
-                        audio_bytes, metadata = await asyncio.wait_for(
-                            audio_queue.get(),
-                            timeout=0.1  # Short timeout to check text task
-                        )
-                    except asyncio.TimeoutError:
-                        # Check if text generator is done
-                        if text_generator_task.done():
-                            # Text sending complete, break to send stream_end
-                            break
-                        # Text still sending, continue waiting for audio
-                        continue
+                    # Wait for audio chunk (no timeout - yield immediately when it arrives)
+                    audio_bytes, metadata = await audio_queue.get()
                     
                     if audio_bytes is None:
                         if metadata.get("error"):
@@ -371,7 +362,13 @@ class ElevenLabsTTSClient:
                             except Exception:
                                 pass
                     
+                    # Yield immediately (matches sarvam's immediate forwarding pattern)
                     yield audio_bytes, metadata
+                    
+                    # Check if text generator is done (non-blocking check)
+                    if not text_done and text_generator_task.done():
+                        text_done = True
+                        logger.debug("Text generator completed, continuing to receive audio chunks")
                     
             finally:
                 # Wait for text generator to finish

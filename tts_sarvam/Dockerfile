@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
-## SARVAM API - sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr
+## SARVAM API - Configure SARVAM_API_KEY environment variable
 # Copy artifacts and code
 WORKDIR /app
 COPY --from=builder /root/.local /root/.local
@@ -38,10 +38,12 @@ RUN mkdir -p /app/leibniz_agent/services && \
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
-# Configure env vars and ports
-ENV SARVAM_API_KEY="sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr"
+# Configure env vars and ports - no hardcoded keys
 ENV TTS_STREAMING_PORT=8025
 ENV LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
+# TARA mode defaults - Telugu language for TASK organization
+ENV LEIBNIZ_SARVAM_LANGUAGE=te-IN
+ENV LEIBNIZ_TTS_LANGUAGE_CODE=te-IN
 EXPOSE 8025
 
 # Add HEALTHCHECK

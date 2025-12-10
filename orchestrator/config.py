@@ -7,7 +7,7 @@ Supports TARA mode for Telugu TASK organization customer service agent.
 
 import os
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
@@ -83,10 +83,10 @@ class OrchestratorConfig:
     
     # Dialogue Manager Configuration
     timeout_seconds: int = int(os.getenv("TIMEOUT_SECONDS", "10"))  # 10 seconds timeout for no response
-    exit_keywords: List[str] = os.getenv(
+    exit_keywords: List[str] = field(default_factory=lambda: os.getenv(
         "EXIT_KEYWORDS", 
         "bye,exit,quit,goodbye,see you,thank you,thanks,stop,end"
-    ).split(",")  # Keywords that trigger exit dialogue
+    ).split(","))  # Keywords that trigger exit dialogue
     
     # Latency targets (ms)
     intent_timeout_ms: int = int(os.getenv("INTENT_TIMEOUT_MS", "100"))

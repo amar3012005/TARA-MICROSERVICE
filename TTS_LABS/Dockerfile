@@ -39,10 +39,8 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Configure env vars and ports
-# ElevenLabs API key should be passed via environment
-ENV ELEVENLABS_API_KEY=""
-ENV ELEVENLABS_VOICE_ID="21m00Tcm4TlvDq8ikWAM"
-ENV ELEVENLABS_MODEL_ID="eleven_flash_v2_5"
+# ElevenLabs configuration should be passed via docker-compose environment variables
+# No hardcoded defaults - must be set externally for proper configuration
 ENV TTS_LABS_PORT=8006
 ENV LEIBNIZ_TTS_CACHE_DIR=/app/audio_cache
 EXPOSE 8006

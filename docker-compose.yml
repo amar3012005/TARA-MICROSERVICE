@@ -303,7 +303,7 @@ services:
 
   # =========================================================================
   # TTS_LABS - ElevenLabs Ultra-Low Latency TTS Service
-  # Uses eleven_flash_v2_5 model with WebSocket stream-input for <150ms TTFA
+  # Uses  eleven_turbo_v2_5 model with WebSocket stream-input for <150ms TTFA
   # To use: Set TTS_SERVICE_URL=http://tts-labs-service:8006 in orchestrator
   # =========================================================================
   tts-labs-service:
@@ -320,8 +320,8 @@ services:
       - PYTHONUNBUFFERED=1
       # ElevenLabs API Configuration
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-YOUR_ELEVENLABS_API_KEY_HERE}
-      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-21m00Tcm4TlvDq8ikWAM}
-      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_flash_v2_5}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-AnvlJBAqSLDzEevYr9Ap}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:- eleven_turbo_v2_5}
       - ELEVENLABS_LATENCY_OPTIMIZATION=${ELEVENLABS_LATENCY_OPTIMIZATION:-4}
       - ELEVENLABS_OUTPUT_FORMAT=${ELEVENLABS_OUTPUT_FORMAT:-pcm_24000}
       # Voice settings

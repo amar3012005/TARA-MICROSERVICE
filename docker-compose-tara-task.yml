@@ -50,7 +50,14 @@ services:
       - LEIBNIZ_REDIS_DB=0
       - INTENT_SERVICE_URL=http://localhost:8002
       - RAG_SERVICE_URL=http://tara-task-rag:8003
-      - STT_SERVICE_URL=http://tara-task-stt-vad:8001
+      # STT Service Selection: stt-vad (Gemini) or stt-sarvam (Sarvam Streaming)
+      # Set USE_SARVAM_STT=true to use Sarvam STT, false for Gemini STT
+      - USE_SARVAM_STT=${USE_SARVAM_STT:-false}
+      # Default STT URL (can be overridden by STT_SERVICE_URL env var)
+      - STT_SERVICE_URL=${STT_SERVICE_URL:-http://tara-task-stt-vad:8001}
+      # Individual STT service URLs for orchestrator selection
+      - STT_SARVAM_URL=http://tara-task-stt-sarvam:8001
+      - STT_VAD_URL=http://tara-task-stt-vad:8001
       - TTS_SERVICE_URL=${TTS_SERVICE_URL:-http://tara-task-tts-sarvam:8025}
       - TTS_STREAMING_MODE=${TTS_STREAMING_MODE:-continuous}
       # ElevenLabs TTS Direct Streaming Configuration
@@ -74,6 +81,7 @@ services:
       - SESSION_TTL_SECONDS=3600
       - MAX_CONCURRENT_SESSIONS=1000
       - PORT=8004
+      - ORCHESTRATOR_PORT=2004  # External port for unified FastRTC URL
       - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
       - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-secret}
       - LIVEKIT_URL=http://livekit:7880
@@ -118,7 +126,7 @@ services:
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
       - DOCKER_ENVIRONMENT=true
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyAebmHUweveB2h7jUkJdOeZAyHHLIq3Y7E}
     depends_on:
       redis:
         condition: service_healthy
@@ -138,7 +146,8 @@ services:
       - "com.tara.service=stt-vad"
 
   # ============================================================================
-  # Speech-to-Text: STT Sarvam Service (Alternative STT Provider)
+  # Speech-to-Text: STT Sarvam Service (Sarvam AI Streaming STT)
+  # Ultra-low latency streaming STT with partial transcript support for RAG
   # ============================================================================
   stt-sarvam:
     build:
@@ -146,22 +155,75 @@ services:
       dockerfile: stt_sarvam/Dockerfile
     container_name: tara-task-stt-sarvam
     ports:
-      - "2002:8001"   # API
-      - "2013:8001"   # FastRTC (mapped to API port)
+      - "2002:8001"   # API + WebSocket
+      - "2013:8001"   # FastRTC UI (mapped to API port)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
+      # Python configuration
       - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      
+      # Service configuration
       - STT_VAD_HOST=0.0.0.0
       - STT_VAD_PORT=8001
       - FAST_RTC_PORT=7860
+      - DOCKER_ENVIRONMENT=true
+      
+      # Redis configuration
       - REDIS_HOST=tara-task-redis
       - REDIS_PORT=6379
       - LEIBNIZ_REDIS_HOST=tara-task-redis
       - LEIBNIZ_REDIS_PORT=6379
       - LEIBNIZ_REDIS_DB=0
-      - DOCKER_ENVIRONMENT=true
-      - SARVAM_API_SUBSCRIPTION_KEY=${SARVAM_API_SUBSCRIPTION_KEY:-}
+      
+      # Sarvam API Configuration
+      # Note: Code expects SARVAM_API_SUBSCRIPTION_KEY (not SARVAM_API_KEY)
+      - SARVAM_API_SUBSCRIPTION_KEY=${SARVAM_API_SUBSCRIPTION_KEY:-sk_2d8w6udi_gaPItmPcCEsf3CoON7RBzqPr}
+      - SARVAM_API_ENDPOINT=${SARVAM_API_ENDPOINT:-}
+      
+      # Sarvam Streaming STT Configuration
+      - LEIBNIZ_VAD_MODEL=${LEIBNIZ_VAD_MODEL:-saarika:v2.5}
+      - LEIBNIZ_VAD_LANGUAGE=${LEIBNIZ_VAD_LANGUAGE:-unknown}
+      - LEIBNIZ_VAD_ENABLE_LANGUAGE_DETECTION=${LEIBNIZ_VAD_ENABLE_LANGUAGE_DETECTION:-true}
+      - LEIBNIZ_VAD_SAMPLE_RATE=${LEIBNIZ_VAD_SAMPLE_RATE:-16000}
+      - LEIBNIZ_VAD_CHANNELS=${LEIBNIZ_VAD_CHANNELS:-1}
+      
+      # Sarvam Streaming Parameters (Ultra-low latency)
+      - SARVAM_HIGH_VAD_SENSITIVITY=${SARVAM_HIGH_VAD_SENSITIVITY:-true}
+      - SARVAM_VAD_SIGNALS=${SARVAM_VAD_SIGNALS:-true}
+      
+      # Timeout configuration
+      - LEIBNIZ_VAD_TIMEOUT_INITIAL=${LEIBNIZ_VAD_TIMEOUT_INITIAL:-20.0}
+      - LEIBNIZ_VAD_TIMEOUT_RETRY=${LEIBNIZ_VAD_TIMEOUT_RETRY:-10.0}
+      - LEIBNIZ_VAD_TIMEOUT_MAX=${LEIBNIZ_VAD_TIMEOUT_MAX:-30.0}
+      - LEIBNIZ_VAD_TIMEOUT_START=${LEIBNIZ_VAD_TIMEOUT_START:-20.0}
+      
+      # Granular timeout configuration
+      - LEIBNIZ_VAD_TIMEOUT_GREETING=${LEIBNIZ_VAD_TIMEOUT_GREETING:-25.0}
+      - LEIBNIZ_VAD_TIMEOUT_DECISION=${LEIBNIZ_VAD_TIMEOUT_DECISION:-30.0}
+      - LEIBNIZ_VAD_TIMEOUT_COMPLEX=${LEIBNIZ_VAD_TIMEOUT_COMPLEX:-35.0}
+      - LEIBNIZ_VAD_TIMEOUT_POST_SERVICE=${LEIBNIZ_VAD_TIMEOUT_POST_SERVICE:-20.0}
+      
+      # VAD and silence detection (legacy, mostly unused with server-side VAD)
+      - LEIBNIZ_VAD_SILENCE_TIMEOUT=${LEIBNIZ_VAD_SILENCE_TIMEOUT:-1.5}
+      - LEIBNIZ_VAD_MIN_SPEECH_MS=${LEIBNIZ_VAD_MIN_SPEECH_MS:-350}
+      - LEIBNIZ_VAD_MAX_BUFFER_MS=${LEIBNIZ_VAD_MAX_BUFFER_MS:-6000}
+      - LEIBNIZ_VAD_PARTIAL_FLUSH_MS=${LEIBNIZ_VAD_PARTIAL_FLUSH_MS:-3500}
+      
+      # Session management
+      - LEIBNIZ_VAD_SESSION_TIMEOUT=${LEIBNIZ_VAD_SESSION_TIMEOUT:-600.0}
+      - LEIBNIZ_VAD_MAX_SESSION_DURATION=${LEIBNIZ_VAD_MAX_SESSION_DURATION:-600.0}
+      
+      # Logging configuration
+      - LEIBNIZ_VAD_VERBOSE=${LEIBNIZ_VAD_VERBOSE:-false}
+      - LEIBNIZ_VAD_LOG_AUDIO_CALLBACKS=${LEIBNIZ_VAD_LOG_AUDIO_CALLBACKS:-false}
+      - LEIBNIZ_VAD_LOG_TIMEOUT_CHECKS=${LEIBNIZ_VAD_LOG_TIMEOUT_CHECKS:-false}
+      - LEIBNIZ_VAD_LOG_STATE_TRANSITIONS=${LEIBNIZ_VAD_LOG_STATE_TRANSITIONS:-true}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # Response settings
+      - LEIBNIZ_VAD_RESPONSE_MODALITY=${LEIBNIZ_VAD_RESPONSE_MODALITY:-TEXT}
     depends_on:
       redis:
         condition: service_healthy
@@ -174,11 +236,18 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health', timeout=5)"]
       interval: 30s
       timeout: 10s
-      start_period: 30s
+      start_period: 40s
       retries: 3
     labels:
       - "com.tara.project=tara-task"
       - "com.tara.service=stt-sarvam"
+      - "com.tara.role=speech-to-text"
+      - "com.tara.provider=sarvam"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "2"
 
   # ============================================================================
   # RAG: Knowledge Base Service
@@ -194,7 +263,7 @@ services:
       - tara_task_rag_index_v2:/app/index
     environment:
       - PYTHONUNBUFFERED=1
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyBPo3uwLjYxJ1ApfhqXLM2YHlefg-GTPMw}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-AIzaSyAebmHUweveB2h7jUkJdOeZAyHHLIq3Y7E}
       - GEMINI_MODEL=gemini-2.0-flash-lite
       - LEIBNIZ_REDIS_HOST=tara-task-redis
       - LEIBNIZ_REDIS_PORT=6379
@@ -274,7 +343,7 @@ services:
 # =========================================================================
   # ============================================================================
   # TTS_LABS: ElevenLabs Ultra-Low Latency TTS Service
-  # Uses eleven_flash_v2_5 model with WebSocket stream-input for <150ms TTFA
+  # Uses eleven_turbo_v2_5 model with WebSocket stream-input for <150ms TTFA
   # =========================================================================
   tts-labs:
     build:
@@ -289,8 +358,8 @@ services:
       - PYTHONUNBUFFERED=1
       # ElevenLabs API Configuration
       - ELEVENLABS_API_KEY=${ELEVENLABS_API_KEY:-sk_b52c643178d624ed09d8b52da3554ee7ff3096d02e55299b}
-      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-21m00Tcm4TlvDq8ikWAM}
-      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_flash_v2_5}
+      - ELEVENLABS_VOICE_ID=${ELEVENLABS_VOICE_ID:-AnvlJBAqSLDzEevYr9Ap}
+      - ELEVENLABS_MODEL_ID=${ELEVENLABS_MODEL_ID:-eleven_turbo_v2_5}
       - ELEVENLABS_LATENCY_OPTIMIZATION=${ELEVENLABS_LATENCY_OPTIMIZATION:-4}
       - ELEVENLABS_OUTPUT_FORMAT=${ELEVENLABS_OUTPUT_FORMAT:-pcm_24000}
       # Voice settings

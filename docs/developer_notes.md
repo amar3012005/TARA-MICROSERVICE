@@ -185,3 +185,58 @@ This tests:
 **Issue: Prewarm timeout**
 - Increase `ELEVENLABS_TTS_URL` network timeout
 - Check network connectivity between orchestrator and `tts-labs`
+
+
+
+#### PRE-FILLED PHRASES 
+
+What I’ve done
+Created a generator script: orchestrator/generate_dialogue_audio_sarvam.py
+Reads orchestrator/assets/dialogues_te.json / dialogues_en.json.
+For every entry with an audio_file, calls TTS Sarvam at http://localhost:2005/api/v1/synthesize.
+Decodes the base64 PCM and saves proper WAV files under orchestrator/assets/audio/….
+Skips files that already exist (unless --overwrite is passed).
+Ran it for Telugu (TARA) dialogues (since that’s the active mode now):
+cd /home/prometheus/leibniz_agent/TARA-MICROSERVICEpython3 -m orchestrator.generate_dialogue_audio_sarvam --lang te
+Output (all successful):
+intro.wav
+exit.wav
+exit_alt.wav
+filler_thinking.wav
+filler_moment.wav
+timeout.wav
+timeout_alt.wav
+These now match the audio_file names used in dialogues_te.json, so the DialogueManager will pick them up and play pre‑synthesized audio instead of going to live TTS.
+How you can regenerate or add languages
+Regenerate Telugu (overwrite existing):
+python3 -m orchestrator.generate_dialogue_audio_sarvam --lang te --overwrite
+Generate English dialogue audio (note: shares some filenames, so only do this if you intend to use English mode or adjust names):
+python3 -m orchestrator.generate_dialogue_audio_sarvam --lang en
+As long as the TTS Sarvam container is running (mapped to localhost:2005), this script will generate all required WAVs for the dialogue manager.
+
+
+Comparison: tts_sarvam vs TTS_LABS
+No, they do NOT have the same endpoint architecture.
+While both expose a WebSocket at /api/v1/stream, their internal handling of input is fundamentally different. This dictates how the Orchestrator must treat them.
+Feature	TTS_LABS (ElevenLabs)	tts_sarvam (Sarvam AI)
+Input Type	Token Streaming (stream_chunk)	Full Sentences (synthesize)
+Buffering	Internal (Handled by ElevenLabs API)	External Required (Orchestrator must buffer)
+Orchestrator Role	"Dead Pipe" (Pass-through)	"Smart Assembler" (Buffer tokens → Sentences)
+Latency Strategy	Send tokens immediately	Buffer until punctuation/size limit
+Why tts_sarvam is different
+In tts_sarvam/app.py, the WebSocket handler only accepts the synthesize message type. When it receives text, it immediately runs split_into_sentences(text):
+# tts_sarvam/app.pyif msg_type == "synthesize":    # ...    # Split into sentences IMMEDIATELY    sentences = split_into_sentences(text)    # ...    # Enqueue complete sentences for synthesis    await queue.enqueue_sentences(sentences, ...)
+If you sent a stream of raw tokens (e.g., "Hello", " ", "how", " ", "are") to tts_sarvam, it would try to treat each token as a separate sentence, resulting in disjointed audio with long pauses between every word.
+Conclusion & Recommendation
+You need a Hybrid Approach in the Orchestrator:
+For TTS_LABS (ElevenLabs):
+Disable SmartBuffer.
+Stream chunks directly from RAG/LLM to the WebSocket (stream_chunk message).
+Result: Ultra-low latency (~250ms).
+For tts_sarvam (Sarvam AI):
+Keep SmartBuffer Active.
+Accumulate tokens in the Orchestrator until you have a complete sentence (or ~5-10 words).
+Send the completed sentence to tts_sarvam (synthesize message).
+Result: Slightly higher latency (~800ms-1s) but correct human prosody.
+Do not use the "dead pipe" strategy for tts_sarvam
+**, or it will break the audio quality.
