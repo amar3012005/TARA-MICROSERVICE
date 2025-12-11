@@ -40,9 +40,10 @@ class FastRTCSTTHandler(AsyncStreamHandler):
         self._chunk_count = 0
         self._started = False
         
-        # Audio buffering for 100ms chunks (16kHz * 2 bytes * 0.1s = 3200 bytes)
+        # Audio buffering for ultra-low latency (50ms chunks for real-time streaming)
+        # 16kHz * 2 bytes * 0.05s = 1600 bytes (reduced from 100ms/3200 bytes)
         self._audio_buffer = bytearray()
-        self._buffer_limit = 3200
+        self._buffer_limit = 1600  # 50ms chunks for lower latency
         
         logger.info("🎙️ FastRTC STT Handler initialized (Sarvam Saarika)")
         logger.info(f"   Handler instance: {id(self)}")
@@ -151,10 +152,11 @@ class FastRTCSTTHandler(AsyncStreamHandler):
             
             audio_bytes = audio_int16.tobytes()
             
-            # Buffer chunks
+            # Buffer chunks for ultra-low latency (50ms)
             self._audio_buffer.extend(audio_bytes)
             
-            # Send when buffer limit reached (100ms)
+            # Send when buffer limit reached (50ms for real-time streaming)
+            # This matches stt_vad behavior for minimal latency
             if len(self._audio_buffer) >= self._buffer_limit:
                 chunk_to_send = bytes(self._audio_buffer) # Create copy
                 self._audio_buffer.clear() # Reset buffer
@@ -164,7 +166,7 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                     # Auto-register if not already registered
                     await self.vad_manager.register_session(self.session_id, self._transcript_callback)
                 
-                # Send directly to VADManager (non-blocking)
+                # Send directly to VADManager (non-blocking for real-time)
                 await self.vad_manager.stream_audio(
                     session_id=self.session_id,
                     audio_chunk=chunk_to_send
@@ -173,7 +175,7 @@ class FastRTCSTTHandler(AsyncStreamHandler):
                 self._chunk_count += 1
                 
                 if self._chunk_count == 1:
-                    logger.info(f"✅ First buffered chunk sent | Size: {len(chunk_to_send)} bytes | 16000Hz")
+                    logger.info(f"✅ First buffered chunk sent | Size: {len(chunk_to_send)} bytes | 16000Hz | 50ms buffer")
                 # Removed frequent chunk logging - only log transcripts now
                 
         except Exception as e:

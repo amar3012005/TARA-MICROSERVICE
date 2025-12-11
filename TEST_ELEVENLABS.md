@@ -197,3 +197,6 @@ When streaming starts:
 2. Monitor latency in production
 3. Adjust `chunk_length_schedule` in `TTS_LABS/elevenlabs_manager.py` if needed
 4. Fine-tune prewarm timing based on VAD detection patterns
+
+
+

@@ -109,6 +109,10 @@ class VADManager:
                 "speech_active": False,  # Track if speech is currently detected
                 "chunks_sent": 0,
                 "bytes_sent": 0,
+                "last_flush_time": 0.0,  # Track last flush for periodic flushing
+                "current_request_id": None,  # Track current request_id for accumulation
+                "accumulated_transcript": "",  # Accumulate transcripts for same request_id
+                "pending_transcripts": [],  # Queue of transcripts waiting for finalization
             }
             
             logger.info(f"✅ Session {session_id} registered | Ready for streaming")
@@ -169,6 +173,17 @@ class VADManager:
             session_data["bytes_sent"] = session_data.get("bytes_sent", 0) + len(audio_chunk)
             self._total_chunks_processed += 1
             self._total_bytes_processed += len(audio_chunk)
+            
+            # Periodic flush for real-time processing (every 500ms during speech)
+            # This forces Sarvam to process and return transcripts more frequently
+            now = time.time()
+            last_flush = session_data.get("last_flush_time", 0.0)
+            if session_data.get("speech_active", False) and (now - last_flush) > 0.5:
+                try:
+                    await session_data["client"].flush()
+                    session_data["last_flush_time"] = now
+                except Exception as e:
+                    logger.debug(f"Flush error (non-critical): {e}")
         
         return success
 
@@ -230,30 +245,59 @@ class VADManager:
         msg_dict = self._parse_message_to_dict(message)
         msg_type = msg_dict.get("type")
         
+        # Debug: Log message structure
+        logger.debug(f"📋 Parsed message for {session_id}: type={msg_type}, keys={list(msg_dict.keys())}")
+        
         # Get session data for state tracking
         session_data = self.sessions.get(session_id, {})
         
-        # Handle VAD signals
-        if msg_type == "speech_start":
-            logger.info(f"🎤 Speech detected [{session_id}]")
-            if session_data:
-                session_data["speech_active"] = True
-                session_data["transcript_buffer"] = []  # Reset buffer on new speech
-            return
+        # Handle Sarvam message types
+        # Sarvam sends: type="events" with signal_type, or type="data" with transcript
         
-        elif msg_type == "speech_end":
-            logger.info(f"🔇 Speech ended [{session_id}]")
-            if session_data:
-                session_data["speech_active"] = False
-            return
+        if msg_type == "events":
+            # Handle VAD events: START_SPEECH, END_SPEECH
+            data = msg_dict.get("data", {})
+            signal_type = data.get("signal_type") if isinstance(data, dict) else getattr(data, 'signal_type', None)
+            
+            if signal_type == "START_SPEECH":
+                logger.info(f"🎤 Speech detected [{session_id}]")
+                if session_data:
+                    session_data["speech_active"] = True
+                    session_data["transcript_buffer"] = []  # Reset buffer on new speech
+                    session_data["current_request_id"] = None  # Reset request tracking
+                    session_data["accumulated_transcript"] = ""  # Reset accumulation
+                    session_data["pending_transcripts"] = []  # Clear pending
+                return
+            elif signal_type == "END_SPEECH":
+                logger.info(f"🔇 Speech ended [{session_id}]")
+                if session_data:
+                    session_data["speech_active"] = False
+                    # Finalize any accumulated transcript after speech ends
+                    if session_data.get("accumulated_transcript"):
+                        await self._finalize_transcript(
+                            session_id,
+                            session_data["accumulated_transcript"],
+                            callback,
+                            session_data
+                        )
+                        session_data["accumulated_transcript"] = ""
+                        session_data["current_request_id"] = None
+                return
+            else:
+                logger.debug(f"📋 Unknown event signal_type: {signal_type}")
+                return
         
-        # Handle transcript messages
+        elif msg_type == "data":
+            # Handle transcript data - extract from nested data structure
+            await self._process_transcript(session_id, message, msg_dict, callback, session_data)
+        
         elif msg_type == "transcript" or self._has_transcript_content(message, msg_dict):
+            # Fallback for other transcript formats
             await self._process_transcript(session_id, message, msg_dict, callback, session_data)
         
         else:
             # Unknown message type - log for debugging
-            logger.debug(f"📋 Unknown message type: {msg_type} | {type(message).__name__}")
+            logger.debug(f"📋 Unknown message type: {msg_type} | Message: {msg_dict} | Type: {type(message).__name__}")
     
     def _parse_message_to_dict(self, message: Any) -> dict:
         """
@@ -267,23 +311,44 @@ class VADManager:
         """
         # Try Pydantic v2 model_dump first
         if hasattr(message, 'model_dump'):
-            return message.model_dump()
+            try:
+                return message.model_dump()
+            except Exception as e:
+                logger.debug(f"model_dump failed: {e}")
+        
         # Then Pydantic v1 dict
-        elif hasattr(message, 'dict') and callable(message.dict):
-            return message.dict()
+        if hasattr(message, 'dict') and callable(message.dict):
+            try:
+                return message.dict()
+            except Exception as e:
+                logger.debug(f"dict() failed: {e}")
+        
         # Plain dict
-        elif isinstance(message, dict):
+        if isinstance(message, dict):
             return message
+        
         # Object with __dict__ (but not a class)
-        elif hasattr(message, '__dict__') and not isinstance(message, type):
-            return dict(message.__dict__)
-        else:
-            # Try to extract known attributes
-            result = {}
-            for attr in ['type', 'text', 'transcript', 'is_final', 'confidence']:
-                if hasattr(message, attr):
-                    result[attr] = getattr(message, attr)
-            return result
+        if hasattr(message, '__dict__') and not isinstance(message, type):
+            try:
+                return dict(message.__dict__)
+            except Exception as e:
+                logger.debug(f"__dict__ access failed: {e}")
+        
+        # Try to extract known attributes
+        result = {}
+        for attr in ['type', 'text', 'transcript', 'is_final', 'confidence', 'data', 'message']:
+            if hasattr(message, attr):
+                try:
+                    value = getattr(message, attr)
+                    result[attr] = value
+                except Exception as e:
+                    logger.debug(f"Failed to get attribute {attr}: {e}")
+        
+        # If still empty, try to get string representation
+        if not result:
+            logger.warning(f"⚠️ Could not parse message: {type(message).__name__} | {repr(message)[:200]}")
+        
+        return result
     
     def _has_transcript_content(self, message: Any, msg_dict: dict) -> bool:
         """Check if message contains transcript content."""
@@ -309,14 +374,31 @@ class VADManager:
         Process transcript message and publish to Redis.
         
         Handles both partial (interim) and final transcripts.
+        Sarvam sends transcripts in type="data" with nested data.transcript
         """
-        # Extract text from various possible fields
-        text = (
-            msg_dict.get("text") or
-            msg_dict.get("transcript") or
-            getattr(message, 'text', None) or
-            getattr(message, 'transcript', None)
-        )
+        # Extract text from Sarvam's nested structure: type="data", data.transcript
+        data = msg_dict.get("data", {})
+        
+        # Handle nested data structure (Sarvam format)
+        request_id = None
+        if isinstance(data, dict):
+            text = data.get("transcript") or data.get("text")
+            language_code = data.get("language_code")
+            request_id = data.get("request_id")
+        else:
+            # Try direct attributes if data is an object
+            text = getattr(data, 'transcript', None) or getattr(data, 'text', None)
+            language_code = getattr(data, 'language_code', None)
+            request_id = getattr(data, 'request_id', None)
+        
+        # Fallback to top-level fields
+        if not text:
+            text = (
+                msg_dict.get("text") or
+                msg_dict.get("transcript") or
+                getattr(message, 'text', None) or
+                getattr(message, 'transcript', None)
+            )
         
         if not text:
             logger.debug(f"📋 Empty transcript message: {type(message).__name__}")
@@ -329,32 +411,77 @@ class VADManager:
         if not text:
             return
         
-        # Determine if this is a final transcript
-        # Sarvam API: 'transcript' type = final after speech_end
-        # Some SDKs may include 'is_final' field
+        # Accumulate transcripts by request_id for accuracy
+        # Sarvam sends incremental updates with same request_id that need to be merged
         msg_type = msg_dict.get("type")
-        is_final = (
-            msg_type == "transcript" or
-            msg_dict.get("is_final", False) or
-            getattr(message, 'is_final', False)
-        )
         
-        # Check for duplicate partial (avoid spam)
-        if not is_final and session_data:
-            last_partial = session_data.get("last_partial", "")
-            if text == last_partial:
-                return  # Skip duplicate
-            session_data["last_partial"] = text
+        if session_data:
+            current_request_id = session_data.get("current_request_id")
+            accumulated = session_data.get("accumulated_transcript", "")
+            
+            # If this is a new request_id, start fresh accumulation
+            if request_id and request_id != current_request_id:
+                session_data["current_request_id"] = request_id
+                session_data["accumulated_transcript"] = text
+                accumulated = text
+                logger.debug(f"🆕 New request_id: {request_id[:30]}... | Starting accumulation")
+            elif request_id == current_request_id:
+                # Same request_id - accumulate/merge transcripts intelligently
+                # Sarvam sends incremental updates, use the longest/most complete one
+                if len(text) > len(accumulated):
+                    # New text is longer, likely more complete
+                    session_data["accumulated_transcript"] = text
+                    accumulated = text
+                    logger.debug(f"📈 Updated transcript (longer): '{text[:50]}...'")
+                elif text != accumulated and text not in accumulated:
+                    # Different text, might be continuation - merge intelligently
+                    # Check if new text starts where old ends
+                    if accumulated.endswith(text[:10]) or text.startswith(accumulated[-10:]):
+                        # Overlapping, use the longer one
+                        session_data["accumulated_transcript"] = text if len(text) > len(accumulated) else accumulated
+                    else:
+                        # Different parts, merge
+                        session_data["accumulated_transcript"] = accumulated + " " + text
+                    accumulated = session_data["accumulated_transcript"]
+                    logger.debug(f"🔗 Merged transcript: '{accumulated[:50]}...'")
+            else:
+                # No request_id tracking, use text as-is
+                accumulated = text
+            
+            # Use accumulated transcript
+            text = accumulated.strip()
+        
+        # Determine if this is final (only after END_SPEECH)
+        # Don't mark as final if speech is still active
+        is_final = False
+        if session_data:
+            # Only finalize if speech has ended (END_SPEECH was received)
+            if not session_data.get("speech_active", False) and request_id:
+                # Speech ended, this is the final transcript for this request
+                is_final = True
+            else:
+                # Speech still active, this is a partial/interim update
+                is_final = False
         
         # Normalize text
         normalized_text = text
         if self.config.language_code.startswith("en"):
             normalized_text = normalize_english_transcript(text)
         
+        # Check for duplicate (avoid spam)
+        if session_data:
+            last_partial = session_data.get("last_partial", "")
+            if normalized_text == last_partial and not is_final:
+                return  # Skip duplicate partial
+            if not is_final:
+                session_data["last_partial"] = normalized_text
+        
         # Log transcript
         status = "✅ FINAL" if is_final else "🔄 PARTIAL"
+        lang_info = f" | Language: {language_code}" if language_code else ""
+        req_info = f" | RequestID: {request_id[:20]}..." if request_id else ""
         logger.info("=" * 70)
-        logger.info(f"📝 [{status}] Transcript | Session: {session_id}")
+        logger.info(f"📝 [{status}] Transcript | Session: {session_id}{lang_info}{req_info}")
         logger.info(f"   Text: '{normalized_text[:150]}'")
         logger.info("=" * 70)
         
@@ -374,8 +501,50 @@ class VADManager:
             self.capture_count += 1
             if session_data:
                 session_data["last_partial"] = ""  # Reset on final
+                session_data["accumulated_transcript"] = ""  # Clear accumulation
+                session_data["current_request_id"] = None  # Reset request tracking
         else:
             self.partial_count += 1
+    
+    async def _finalize_transcript(
+        self,
+        session_id: str,
+        text: str,
+        callback: StreamingCallback,
+        session_data: dict
+    ):
+        """
+        Finalize and emit accumulated transcript after speech ends.
+        
+        This ensures we only send the complete, accurate transcript after
+        all incremental updates have been accumulated.
+        """
+        if not text or not text.strip():
+            return
+        
+        # Normalize text
+        normalized_text = text.strip()
+        if self.config.language_code.startswith("en"):
+            normalized_text = normalize_english_transcript(text)
+        
+        logger.info("=" * 70)
+        logger.info(f"📝 [✅ FINAL] Complete Accumulated Transcript | Session: {session_id}")
+        logger.info(f"   Text: '{normalized_text[:150]}'")
+        logger.info("=" * 70)
+        
+        # Invoke callback
+        if callback:
+            try:
+                callback(normalized_text, True)
+            except Exception as e:
+                logger.error(f"Final callback error: {e}")
+        
+        # Publish to Redis
+        if self.redis_client:
+            await self._publish_to_redis(session_id, normalized_text, True)
+        
+        # Update metrics
+        self.capture_count += 1
 
     async def _publish_to_redis(self, session_id: str, text: str, is_final: bool = True):
         """

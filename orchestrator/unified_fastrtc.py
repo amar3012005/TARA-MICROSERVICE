@@ -45,6 +45,22 @@ except ImportError:
     WEBSOCKETS_AVAILABLE = False
     WebSocketClientProtocol = None
 
+# Event-driven architecture imports
+try:
+    from leibniz_agent.services.shared.events import VoiceEvent, EventTypes
+    from leibniz_agent.services.shared.event_broker import EventBroker
+    EVENTS_AVAILABLE = True
+except ImportError:
+    try:
+        from shared.events import VoiceEvent, EventTypes
+        from shared.event_broker import EventBroker
+        EVENTS_AVAILABLE = True
+    except ImportError:
+        EVENTS_AVAILABLE = False
+        VoiceEvent = None
+        EventTypes = None
+        EventBroker = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -154,6 +170,9 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
     # Class-level lock for thread-safe operations on active_instances
     _instances_lock: asyncio.Lock = None  # Initialized lazily
     
+    # Event broker for event-driven architecture (shared across instances)
+    event_broker: Optional["EventBroker"] = None
+    
     def __init__(
         self,
         stt_ws_url: str = "ws://localhost:8001/api/v1/transcribe/stream",
@@ -195,6 +214,8 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         self._stt_ws: Optional[WebSocketClientProtocol] = None
         self._stt_receive_task: Optional[asyncio.Task] = None
         self._stt_reconnect_task: Optional[asyncio.Task] = None
+        self._stt_keepalive_task: Optional[asyncio.Task] = None
+        self._keepalive_interval = 20.0  # Send keepalive every 20 seconds (before 30s timeout)
         self._stt_lock = asyncio.Lock()
         
         # Output state
@@ -203,6 +224,10 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         self._chunk_size_samples: int = 960  # ~40ms at 24kHz
         self._last_emit_time: float = 0.0
         
+        # Audio playback duration tracking (for FastRTC fallback when browser doesn't send events)
+        self.total_audio_duration_ms: float = 0.0
+        self.playback_start_time: Optional[float] = None
+        
         # Lifecycle
         self._started = False
         self._shutting_down = False
@@ -210,6 +235,12 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         logger.info(f"UnifiedFastRTCHandler initialized | session={self.session_id}")
         logger.info(f"  STT URL: {self.stt_ws_url}")
         logger.info(f"  Echo Gate: {self.echo_gate_enabled} (tail={self.echo_gate_tail_ms}ms)")
+        
+        # Verify STT URL points to stt_sarvam
+        if "stt-vad" not in self.stt_ws_url and "stt_sarvam" not in self.stt_ws_url and "tara-stt-vad" not in self.stt_ws_url:
+            logger.warning(f"⚠️ STT URL may not be stt_sarvam: {self.stt_ws_url}")
+        else:
+            logger.info(f"✅ STT URL verified: using stt_sarvam service")
     
     # =========================================================================
     # FastRTC Lifecycle Methods
@@ -412,31 +443,47 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         Returns:
             True if input should be blocked, False if input should be processed
         """
+        # Initialize last gate state tracking if needed
+        if not hasattr(self, '_last_gate_state'):
+            self._last_gate_state = None
+        
         # Layer 1: State-based gating (primary)
         # Only accept input in IDLE, LISTENING, or INTERRUPT states
         if not self.state.should_accept_input():
-            logger.debug(
-                f"[{self.session_id}] Gating input - state: {self.state.orchestrator_state.value}"
-            )
-            return True
+            should_gate = True
+            gate_reason = f"state: {self.state.orchestrator_state.value}"
+        else:
+            # Layer 2: Echo gating (backup, in case state hasn't updated yet)
+            if self.echo_gate_enabled:
+                # Gate if actively speaking (TTS audio in queue/playing)
+                if self.state.is_speaking:
+                    should_gate = True
+                    gate_reason = "TTS speaking"
+                # Gate for tail duration after speaking stops
+                elif self.state.last_audio_output_time > 0:
+                    elapsed_ms = (time.time() - self.state.last_audio_output_time) * 1000
+                    if elapsed_ms < self.echo_gate_tail_ms:
+                        should_gate = True
+                        gate_reason = f"echo tail ({elapsed_ms:.0f}ms < {self.echo_gate_tail_ms}ms)"
+                    else:
+                        should_gate = False
+                        gate_reason = None
+                else:
+                    should_gate = False
+                    gate_reason = None
+            else:
+                should_gate = False
+                gate_reason = None
         
-        # Layer 2: Echo gating (backup, in case state hasn't updated yet)
-        if self.echo_gate_enabled:
-            # Gate if actively speaking (TTS audio in queue/playing)
-            if self.state.is_speaking:
-                logger.debug(f"[{self.session_id}] Gating input - TTS speaking")
-                return True
-            
-            # Gate for tail duration after speaking stops
-            if self.state.last_audio_output_time > 0:
-                elapsed_ms = (time.time() - self.state.last_audio_output_time) * 1000
-                if elapsed_ms < self.echo_gate_tail_ms:
-                    logger.debug(
-                        f"[{self.session_id}] Gating input - echo tail ({elapsed_ms:.0f}ms < {self.echo_gate_tail_ms}ms)"
-                    )
-                    return True
+        # Log state changes for visibility
+        if self._last_gate_state != should_gate:
+            if should_gate:
+                logger.info(f"[{self.session_id}] Mic gating: GATED ({gate_reason}) (state: {self.state.orchestrator_state.value})")
+            else:
+                logger.info(f"[{self.session_id}] Mic gating: OPEN (state: {self.state.orchestrator_state.value})")
+            self._last_gate_state = should_gate
         
-        return False
+        return should_gate
     
     # =========================================================================
     # Audio Output (TTS -> Speaker)
@@ -520,19 +567,50 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
                 chunk = audio_data[:take_samples]
                 self._chunk_position = take_samples
                 
+                # Track if this is the start of playback
+                was_speaking = self.state.is_speaking
+                
                 # Update speaking state
                 self.state.is_speaking = True
                 self.state.last_audio_output_time = time.time()
                 self._last_emit_time = time.time()
+                
+                # Emit playback_started event if transitioning to speaking
+                if not was_speaking:
+                    # Reset duration tracking for new playback sequence
+                    self.total_audio_duration_ms = 0.0
+                    self.playback_start_time = time.time()
+                    asyncio.create_task(self.emit_playback_started(self._audio_out_queue.qsize() + 1))
                 
                 return (sample_rate, chunk)
                 
             except asyncio.QueueEmpty:
                 # No audio available - check if we should clear speaking state
                 if self.state.is_speaking:
-                    # Grace period before clearing speaking state
-                    if time.time() - self._last_emit_time > 0.1:
+                    # Use calculated audio duration instead of 100ms grace period
+                    # This is a fallback for FastRTC when browser doesn't send playback_done events
+                    if self.playback_start_time and self.total_audio_duration_ms > 0:
+                        expected_end_time = self.playback_start_time + (self.total_audio_duration_ms / 1000)
+                        current_time = time.time()
+                        
+                        # Wait for expected duration + 200ms buffer for processing/network delays
+                        if current_time >= expected_end_time + 0.2:
+                            self.state.is_speaking = False
+                            actual_duration_ms = (current_time - self.playback_start_time) * 1000
+                            
+                            # Emit playback_done event (fallback for FastRTC)
+                            asyncio.create_task(self.emit_playback_done(
+                                total_chunks=self.state.chunks_received,
+                                duration_ms=actual_duration_ms
+                            ))
+                            
+                            # Reset tracking for next audio sequence
+                            self.total_audio_duration_ms = 0.0
+                            self.playback_start_time = None
+                    elif time.time() - self._last_emit_time > 0.5:
+                        # Fallback: if no duration tracking, use 500ms grace period (longer than before)
                         self.state.is_speaking = False
+                        logger.debug(f"[{self.session_id}] Cleared speaking state (fallback grace period)")
                 
                 await asyncio.sleep(sleep_interval)
                 return (self.sample_rate_out, silence)
@@ -570,6 +648,15 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
             
             if audio_array.size == 0:
                 return
+            
+            # Calculate duration for this chunk (16-bit = 2 bytes per sample)
+            chunk_samples = len(audio_bytes) // 2
+            chunk_duration_ms = (chunk_samples / sample_rate) * 1000
+            self.total_audio_duration_ms += chunk_duration_ms
+            
+            # Track when playback starts (first chunk)
+            if self.playback_start_time is None:
+                self.playback_start_time = time.time()
             
             # Put in queue (drop oldest if full)
             try:
@@ -645,6 +732,20 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
                     OrchestratorState.IDLE,
                 )
                 
+                # Manage keepalive task based on state (schedule async cleanup if needed)
+                if new_state in (OrchestratorState.LISTENING, OrchestratorState.IDLE):
+                    # Start keepalive if not running
+                    if self._stt_keepalive_task is None or self._stt_keepalive_task.done():
+                        self._stt_keepalive_task = asyncio.create_task(self._stt_keepalive_loop())
+                        logger.debug(f"[{self.session_id}] STT keepalive task started")
+                else:
+                    # Stop keepalive during THINKING/SPEAKING (schedule async cancellation)
+                    if self._stt_keepalive_task and not self._stt_keepalive_task.done():
+                        self._stt_keepalive_task.cancel()
+                        # Schedule cleanup task (non-blocking)
+                        asyncio.create_task(self._cleanup_keepalive_task())
+                        logger.debug(f"[{self.session_id}] STT keepalive task cancellation scheduled")
+                
         except ValueError:
             logger.warning(f"[{self.session_id}] Unknown orchestrator state: {state_value}")
     
@@ -699,8 +800,130 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         return states
     
     # =========================================================================
+    # Event-Driven WebRTC Events
+    # =========================================================================
+    
+    @classmethod
+    def set_event_broker(cls, broker: "EventBroker"):
+        """Set the event broker for WebRTC event emission."""
+        cls.event_broker = broker
+        logger.info("EventBroker set for UnifiedFastRTCHandler")
+    
+    async def _emit_webrtc_event(self, event_type: str, payload: Dict[str, Any] = None):
+        """
+        Emit a WebRTC event to Redis Stream for orchestrator coordination.
+        
+        Args:
+            event_type: Type of event (playback_started, playback_done, barge_in)
+            payload: Additional event payload
+        """
+        if not EVENTS_AVAILABLE or not self.event_broker:
+            return
+        
+        try:
+            event = VoiceEvent(
+                event_type=event_type,
+                session_id=self.session_id,
+                source="unified_fastrtc",
+                payload=payload or {},
+                metadata={
+                    "orchestrator_state": self.state.orchestrator_state.value,
+                    "is_speaking": self.state.is_speaking,
+                    "queue_size": self._audio_out_queue.qsize() if self._audio_out_queue else 0
+                }
+            )
+            
+            stream_key = f"voice:webrtc:session:{self.session_id}"
+            await self.event_broker.publish(stream_key, event)
+            logger.debug(f"[{self.session_id}] Emitted {event_type} to {stream_key}")
+            
+        except Exception as e:
+            logger.error(f"[{self.session_id}] Failed to emit WebRTC event: {e}")
+    
+    async def emit_playback_started(self, chunk_count: int = 1):
+        """Emit playback_started event when TTS audio begins playing."""
+        await self._emit_webrtc_event(
+            EventTypes.PLAYBACK_STARTED if EVENTS_AVAILABLE else "voice.webrtc.playback_started",
+            payload={
+                "chunk_count": chunk_count,
+                "timestamp": time.time()
+            }
+        )
+    
+    async def emit_playback_done(self, total_chunks: int = 0, duration_ms: float = 0):
+        """Emit playback_done event when TTS audio finishes playing."""
+        await self._emit_webrtc_event(
+            EventTypes.PLAYBACK_DONE if EVENTS_AVAILABLE else "voice.webrtc.playback_done",
+            payload={
+                "total_chunks": total_chunks,
+                "duration_ms": duration_ms,
+                "timestamp": time.time()
+            }
+        )
+    
+    async def emit_barge_in(self, reason: str = "user_speaking"):
+        """
+        Emit barge_in event when user interrupts during TTS playback.
+        
+        This is critical for the orchestrator to transition to INTERRUPT state.
+        """
+        await self._emit_webrtc_event(
+            EventTypes.BARGE_IN if EVENTS_AVAILABLE else "voice.webrtc.barge_in",
+            payload={
+                "reason": reason,
+                "was_speaking": self.state.is_speaking,
+                "timestamp": time.time()
+            }
+        )
+        logger.info(f"[{self.session_id}] Barge-in event emitted: {reason}")
+    
+    @classmethod
+    async def broadcast_barge_in(cls, reason: str = "user_speaking"):
+        """Broadcast barge-in event to all active handler instances."""
+        if not cls.active_instances:
+            return
+        
+        for session_id, instance in list(cls.active_instances.items()):
+            try:
+                if instance is not None and instance.state.is_speaking:
+                    await instance.emit_barge_in(reason)
+            except Exception as e:
+                logger.error(f"Barge-in broadcast to {session_id} failed: {e}")
+    
+    # =========================================================================
     # STT WebSocket Management
     # =========================================================================
+    
+    def _is_websocket_valid(self, ws) -> bool:
+        """
+        Check if WebSocket is valid and ready for use.
+        
+        Returns True if WebSocket appears valid, False otherwise.
+        This is a best-effort check - the receive loop will handle actual connection issues.
+        """
+        if ws is None:
+            return False
+        
+        try:
+            # Check if it has required methods/attributes
+            if not hasattr(ws, 'recv'):
+                return False
+            
+            # Try to check closed status safely - if we can't determine, assume valid
+            # The receive loop will catch actual connection problems
+            if hasattr(ws, 'closed'):
+                try:
+                    # If closed property exists and is True, WebSocket is not valid
+                    if ws.closed:
+                        return False
+                except (AttributeError, RuntimeError):
+                    # If accessing closed raises, assume valid (let receive loop handle it)
+                    pass
+            
+            return True
+        except Exception:
+            # On any exception, assume invalid to be safe
+            return False
     
     async def _connect_stt(self):
         """Connect to STT service WebSocket with robust error handling."""
@@ -714,11 +937,11 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         
         async with self._stt_lock:
             # Check if already connected
-            if self._stt_ws is not None:
+            if self._is_websocket_valid(self._stt_ws):
                 try:
-                    if not self._stt_ws.closed:
+                    if hasattr(self._stt_ws, 'closed') and not self._stt_ws.closed:
                         return  # Already connected
-                except AttributeError:
+                except (AttributeError, RuntimeError):
                     # WebSocket object may be in invalid state
                     self._stt_ws = None
             
@@ -741,11 +964,16 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
                     timeout=15.0  # Connection timeout
                 )
                 
-                self.state.stt_connection_state = ConnectionState.CONNECTED
-                logger.info(f"[{self.session_id}] STT WebSocket connected")
+                # Verify WebSocket is ready using helper method
+                if not self._is_websocket_valid(self._stt_ws):
+                    logger.warning(f"[{self.session_id}] WebSocket validation failed after connection, but continuing")
+                    # Don't raise - let the receive loop handle any connection issues
                 
-                # Start receive task
-                if self._stt_receive_task is None or self._stt_receive_task.done():
+                self.state.stt_connection_state = ConnectionState.CONNECTED
+                logger.info(f"[{self.session_id}] STT WebSocket connected and validated")
+                
+                # Start receive task only if WebSocket is valid
+                if self._is_websocket_valid(self._stt_ws) and (self._stt_receive_task is None or self._stt_receive_task.done()):
                     self._stt_receive_task = asyncio.create_task(
                         self._stt_receive_loop(),
                         name=f"stt_receive_{self.session_id}"
@@ -785,6 +1013,19 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
             self._stt_lock = asyncio.Lock()
         
         async with self._stt_lock:
+            # Cancel keepalive task
+            if self._stt_keepalive_task is not None:
+                try:
+                    if not self._stt_keepalive_task.done():
+                        self._stt_keepalive_task.cancel()
+                        try:
+                            await asyncio.wait_for(self._stt_keepalive_task, timeout=2.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            pass
+                except Exception as e:
+                    logger.debug(f"[{self.session_id}] Error cancelling keepalive task: {e}")
+            self._stt_keepalive_task = None
+            
             # Cancel receive task
             if self._stt_receive_task is not None:
                 try:
@@ -906,26 +1147,39 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         """Background task to receive STT events with robust error handling."""
         logger.info(f"[{self.session_id}] STT receive loop started")
         
+        # Wait a tiny bit to ensure WebSocket is fully initialized
+        await asyncio.sleep(0.1)
+        
         # Capture local reference to avoid race conditions
         ws = self._stt_ws
         
         try:
             while not self._shutting_down:
-                # Check WebSocket is valid
-                if ws is None:
-                    logger.warning(f"[{self.session_id}] STT WebSocket is None, exiting receive loop")
-                    break
-                
-                try:
-                    # Accessing closed property on a potentially closed/None socket
-                    if ws.closed:
-                        logger.warning(f"[{self.session_id}] STT WebSocket closed, exiting receive loop")
-                        break
-                except AttributeError:
+                # Check WebSocket is valid using helper method
+                if not self._is_websocket_valid(self._stt_ws):
                     logger.warning(f"[{self.session_id}] STT WebSocket invalid, exiting receive loop")
                     break
                 
+                # Update local reference
+                ws = self._stt_ws
+                
+                # Check if WebSocket is closed
                 try:
+                    if hasattr(ws, 'closed') and ws.closed:
+                        logger.warning(f"[{self.session_id}] STT WebSocket closed, exiting receive loop")
+                        break
+                except (AttributeError, RuntimeError) as e:
+                    logger.debug(f"[{self.session_id}] Error checking WebSocket closed status: {e}")
+                    # Continue anyway - might be a false alarm
+                
+                try:
+                    # Use instance variable directly to avoid stale references
+                    if self._stt_ws is None or self._stt_ws != ws:
+                        ws = self._stt_ws
+                        if ws is None:
+                            logger.warning(f"[{self.session_id}] STT WebSocket became None, exiting receive loop")
+                            break
+                    
                     message = await asyncio.wait_for(
                         ws.recv(),
                         timeout=30.0
@@ -972,8 +1226,20 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
         
         finally:
             self.state.stt_connection_state = ConnectionState.DISCONNECTED
+            # Don't reconnect if:
+            # 1. Shutting down
+            # 2. Agent is SPEAKING (timeout expected)
+            # 3. In LISTENING/IDLE (timeout expected, keepalive should prevent but handle gracefully)
             if not self._shutting_down:
-                self._schedule_stt_reconnect()
+                if self.state.orchestrator_state == OrchestratorState.SPEAKING:
+                    logger.debug(f"[{self.session_id}] Skipping STT reconnect - agent is speaking")
+                elif self.state.orchestrator_state in (OrchestratorState.LISTENING, OrchestratorState.IDLE):
+                    # In LISTENING, timeout is expected - reconnect but with longer delay
+                    logger.debug(f"[{self.session_id}] STT timeout during LISTENING - reconnecting with delay")
+                    self._schedule_stt_reconnect(delay=5.0)  # Longer delay
+                else:
+                    # THINKING or other states - reconnect normally
+                    self._schedule_stt_reconnect()
     
     async def _handle_stt_message(self, data: Dict[str, Any]):
         """Handle incoming STT message."""
@@ -1000,7 +1266,14 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
             logger.info(f"STT service confirmed connection: {data.get('session_id')}")
         
         elif msg_type == "timeout":
-            logger.warning("STT session timeout")
+            # During LISTENING/IDLE, timeout is expected (no user speaking)
+            # During SPEAKING, timeout is expected (no audio input while agent talks)
+            if self.state.orchestrator_state in (OrchestratorState.LISTENING, OrchestratorState.IDLE, OrchestratorState.SPEAKING):
+                logger.debug(f"[{self.session_id}] STT timeout ignored - state: {self.state.orchestrator_state.value}")
+                return  # Don't trigger reconnect or VAD callback
+            
+            # Only treat as error in THINKING state (unexpected)
+            logger.warning(f"[{self.session_id}] STT session timeout (state: {self.state.orchestrator_state.value})")
             if UnifiedFastRTCHandler.on_vad_event:
                 try:
                     await self._safe_callback(
@@ -1028,6 +1301,35 @@ class UnifiedFastRTCHandler(AsyncStreamHandler if FASTRTC_AVAILABLE else object)
                 callback(*args)
         except Exception as e:
             logger.error(f"Callback error: {e}")
+    
+    async def _stt_keepalive_loop(self):
+        """Send periodic silent audio chunks to STT during LISTENING state to prevent timeout."""
+        while not self._shutting_down:
+            await asyncio.sleep(self._keepalive_interval)
+            
+            # Only send keepalive during LISTENING or IDLE states
+            if self.state.orchestrator_state in (OrchestratorState.LISTENING, OrchestratorState.IDLE):
+                if self._is_websocket_valid(self._stt_ws):
+                    # Send silent audio chunk (3200 bytes = ~100ms at 16kHz mono 16-bit)
+                    silent_chunk = b'\x00' * 3200
+                    try:
+                        await self._send_to_stt(silent_chunk)
+                        logger.debug(f"[{self.session_id}] Sent STT keepalive chunk")
+                    except Exception as e:
+                        logger.debug(f"[{self.session_id}] Keepalive send failed: {e}")
+            else:
+                # State changed, exit loop (will be restarted if needed)
+                logger.debug(f"[{self.session_id}] Keepalive loop exiting - state changed to {self.state.orchestrator_state.value}")
+                break
+    
+    async def _cleanup_keepalive_task(self):
+        """Clean up keepalive task after cancellation."""
+        if self._stt_keepalive_task:
+            try:
+                await asyncio.wait_for(self._stt_keepalive_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._stt_keepalive_task = None
 
 
 # Factory function for creating handler with config

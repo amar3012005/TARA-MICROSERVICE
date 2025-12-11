@@ -335,3 +335,6 @@ class DialogueManager:
         self._dialogue_cache[dialogue_type].append(asset)
         logger.info(f"Added custom {dialogue_type.value} dialogue: {asset.text[:50]}...")
 
+
+
+

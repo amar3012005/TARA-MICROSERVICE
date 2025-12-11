@@ -114,3 +114,6 @@ echo ""
 echo "🛑 Stop services:"
 echo "   docker --context desktop-linux compose -f docker-compose-tara-task.yml down"
 echo ""
+
+
+

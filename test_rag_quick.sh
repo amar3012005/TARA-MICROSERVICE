@@ -22,3 +22,6 @@ curl -w "\n\n⏱️  Time to First Byte: %{time_starttransfer}s\n⏱️  Total T
 echo ""
 echo "✅ Test complete!"
 
+
+
+

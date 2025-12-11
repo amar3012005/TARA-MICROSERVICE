@@ -42,10 +42,14 @@ logger = logging.getLogger(__name__)
 # Optional Redis support for orchestrator coordination
 try:
     from leibniz_agent.services.shared.redis_client import get_redis_client, ping_redis
+    from leibniz_agent.services.shared.events import VoiceEvent, EventTypes
+    from leibniz_agent.services.shared.event_broker import EventBroker
     REDIS_AVAILABLE = True
 except ImportError:
     try:
         from shared.redis_client import get_redis_client, ping_redis
+        from shared.events import VoiceEvent, EventTypes
+        from shared.event_broker import EventBroker
         REDIS_AVAILABLE = True
     except ImportError:
         REDIS_AVAILABLE = False
@@ -56,6 +60,11 @@ except ImportError:
 
         async def ping_redis(_client):
             return False
+        
+        # Stub classes when Redis not available
+        VoiceEvent = None
+        EventTypes = None
+        EventBroker = None
 
 # Global state
 config: Optional[TTSLabsConfig] = None
@@ -64,6 +73,7 @@ cache: Optional[AudioCache] = None
 active_sessions: Dict[str, Dict[str, Any]] = {}
 app_start_time: float = time.time()
 redis_client = None
+event_broker = None  # Event-driven architecture broker
 
 # FastRTC support (optional)
 try:
@@ -463,7 +473,7 @@ async def lifespan(app: FastAPI):
     
     # Connect to Redis (background)
     async def connect_redis_background():
-        global redis_client
+        global redis_client, event_broker
         if not REDIS_AVAILABLE:
             return
         
@@ -479,6 +489,16 @@ async def lifespan(app: FastAPI):
                 redis_client = await asyncio.wait_for(get_redis_client(), timeout=5.0)
                 await ping_redis(redis_client)
                 logger.info(f"✅ Redis connected (attempt {attempt + 1})")
+                
+                # Initialize event broker for event-driven architecture
+                if EventBroker is not None:
+                    event_broker = EventBroker(redis_client)
+                    logger.info("✅ Event broker initialized for TTS_LABS")
+                    
+                    # Start event consumer in background
+                    asyncio.create_task(_tts_event_consumer_loop())
+                    logger.info("✅ TTS event consumer started")
+                
                 return
             except Exception as e:
                 logger.warning(f"⚠️ Redis connection error (attempt {attempt + 1}/5): {e}")
@@ -549,6 +569,187 @@ if FASTRTC_AVAILABLE:
         logger.info("✅ FastRTC UI mounted at /fastrtc")
     except Exception as e:
         logger.warning(f"⚠️ FastRTC initialization failed: {e}")
+
+
+# =============================================================================
+# EVENT-DRIVEN TTS CONSUMER
+# =============================================================================
+
+async def _handle_tts_request_event(event: "VoiceEvent"):
+    """
+    Handle a TTS request event from Redis Stream.
+    
+    Synthesizes text using ElevenLabs and emits audio chunks back to 
+    session-specific stream.
+    
+    Event payload:
+        - text: str - Text to synthesize
+        - voice: str (optional) - Voice ID override
+        
+    Emits:
+        - EventTypes.TTS_CHUNK_READY - For each audio chunk
+        - EventTypes.TTS_COMPLETE - When synthesis is done
+    """
+    global event_broker, provider, config
+    
+    if not event_broker or not provider or not config:
+        logger.warning("TTS event handler called but broker/provider/config not ready")
+        return
+    
+    session_id = event.session_id
+    correlation_id = event.correlation_id
+    text = event.payload.get("text", "")
+    voice = event.payload.get("voice")
+    
+    if not text.strip():
+        logger.warning(f"Empty text in TTS request for session {session_id}")
+        return
+    
+    logger.info(f"🎤 [EVENT] TTS request for session {session_id}: {text[:50]}...")
+    
+    # Target stream for this session's TTS output
+    output_stream = f"voice:tts:session:{session_id}"
+    
+    synthesis_start = time.time()
+    first_chunk_time = None
+    chunk_index = 0
+    total_audio_bytes = 0
+    
+    try:
+        # Create stream manager for synthesis
+        stream_mgr = ElevenLabsStreamManager(config)
+        
+        async def send_audio_chunk(audio_bytes: bytes, sample_rate: int, metadata: Dict[str, Any]):
+            nonlocal first_chunk_time, chunk_index, total_audio_bytes
+            
+            if first_chunk_time is None:
+                first_chunk_time = time.time()
+                latency_ms = (first_chunk_time - synthesis_start) * 1000
+                logger.info(f"⚡ [EVENT] First TTS chunk latency: {latency_ms:.0f}ms")
+            
+            total_audio_bytes += len(audio_bytes)
+            
+            # Emit chunk ready event
+            chunk_event = VoiceEvent(
+                event_type=EventTypes.TTS_CHUNK_READY,
+                session_id=session_id,
+                source="tts_labs",
+                correlation_id=correlation_id,
+                payload={
+                    "audio_base64": base64.b64encode(audio_bytes).decode('utf-8'),
+                    "sample_rate": sample_rate,
+                    "chunk_index": chunk_index,
+                    "is_final": metadata.get("is_final", False),
+                    "provider": "elevenlabs"
+                },
+                metadata={
+                    "text_snippet": text[:30] if chunk_index == 0 else None
+                }
+            )
+            
+            await event_broker.publish(output_stream, chunk_event)
+            chunk_index += 1
+            
+            # Also broadcast to FastRTC if available
+            await FastRTCTTSHandler.broadcast_audio(audio_bytes, sample_rate)
+        
+        # Synthesize the text
+        await stream_mgr.synthesize_text(text, send_audio_chunk)
+        await stream_mgr.disconnect()
+        
+        # Emit completion event
+        total_duration_ms = (time.time() - synthesis_start) * 1000
+        audio_duration_ms = total_audio_bytes / (config.sample_rate * 2) * 1000 if total_audio_bytes > 0 else 0
+        
+        complete_event = VoiceEvent(
+            event_type=EventTypes.TTS_COMPLETE,
+            session_id=session_id,
+            source="tts_labs",
+            correlation_id=correlation_id,
+            payload={
+                "total_chunks": chunk_index,
+                "total_audio_bytes": total_audio_bytes,
+                "audio_duration_ms": audio_duration_ms,
+                "synthesis_duration_ms": total_duration_ms,
+                "provider": "elevenlabs"
+            }
+        )
+        await event_broker.publish(output_stream, complete_event)
+        
+        logger.info(f"✅ [EVENT] TTS complete for {session_id}: {chunk_index} chunks, {audio_duration_ms:.0f}ms audio")
+        
+    except Exception as e:
+        logger.error(f"❌ [EVENT] TTS synthesis error for {session_id}: {e}")
+        
+        # Emit error event
+        error_event = VoiceEvent(
+            event_type=EventTypes.ORCHESTRATOR_ERROR,
+            session_id=session_id,
+            source="tts_labs",
+            correlation_id=correlation_id,
+            payload={
+                "error": str(e),
+                "error_type": "tts_synthesis_error"
+            }
+        )
+        await event_broker.publish(output_stream, error_event)
+
+
+async def _tts_event_consumer_loop():
+    """
+    Background task that consumes TTS request events from Redis Streams.
+    
+    Listens to: voice:tts:requests (global request stream)
+    """
+    global event_broker, redis_client
+    
+    if not event_broker or not redis_client:
+        logger.warning("Event consumer cannot start - broker/redis not available")
+        return
+    
+    stream_key = "voice:tts:requests"
+    last_id = "0"  # Start from beginning on startup
+    
+    logger.info(f"🎧 TTS event consumer listening on: {stream_key}")
+    
+    while True:
+        try:
+            # Read from stream with blocking
+            result = await redis_client.xread(
+                streams={stream_key: last_id},
+                count=10,
+                block=1000  # 1 second blocking
+            )
+            
+            if not result:
+                continue
+            
+            for stream_name, messages in result:
+                for message_id, message_data in messages:
+                    last_id = message_id
+                    
+                    try:
+                        # Parse event from message
+                        event = VoiceEvent.from_redis_dict(message_data)
+                        
+                        # Handle TTS request events
+                        if event.event_type == EventTypes.TTS_REQUEST:
+                            # Process in background to not block consumer
+                            asyncio.create_task(_handle_tts_request_event(event))
+                        else:
+                            logger.debug(f"Ignoring event type: {event.event_type}")
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing TTS event {message_id}: {e}")
+                        
+        except asyncio.CancelledError:
+            logger.info("TTS event consumer cancelled")
+            break
+        except Exception as e:
+            logger.error(f"TTS event consumer error: {e}")
+            await asyncio.sleep(1.0)  # Back off on error
+    
+    logger.info("TTS event consumer stopped")
 
 
 # Request/Response Models

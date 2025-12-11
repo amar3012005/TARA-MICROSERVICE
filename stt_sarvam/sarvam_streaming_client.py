@@ -239,20 +239,54 @@ class SarvamStreamingClient:
         """
         logger.info("👂 Starting Sarvam receive loop...")
         message_count = 0
+        last_message_time = [time.time()]  # Use list for mutable reference
+        
+        # Start a watchdog to detect if we're not receiving messages
+        async def watchdog():
+            while True:
+                await asyncio.sleep(5.0)  # Check every 5 seconds
+                if time.time() - last_message_time[0] > 10.0 and message_count == 0:
+                    logger.warning("⚠️ No messages received in 10 seconds - WebSocket may be idle")
+                elif message_count > 0:
+                    logger.debug(f"📊 Receive loop active: {message_count} messages received")
+        
+        watchdog_task = asyncio.create_task(watchdog())
         
         try:
             async for message in self.ws_connection:
                 message_count += 1
                 self._last_activity = time.time()
+                last_message_time[0] = time.time()
+                
+                # Log ALL messages at INFO level for debugging
+                logger.info(f"📨 Received message #{message_count}: {type(message).__name__}")
+                
+                # Try to extract message content
+                if hasattr(message, '__dict__'):
+                    attrs = list(message.__dict__.keys())
+                    logger.info(f"   Message attributes: {attrs}")
+                    # Log key fields if they exist
+                    for attr in ['type', 'text', 'transcript', 'data', 'message']:
+                        if hasattr(message, attr):
+                            value = getattr(message, attr)
+                            logger.info(f"   {attr}: {value}")
+                elif isinstance(message, dict):
+                    logger.info(f"   Message keys: {list(message.keys())}")
+                    logger.info(f"   Message content: {message}")
+                else:
+                    logger.info(f"   Message repr: {repr(message)[:500]}")
                 
                 # Pass message to handler (VADManager will parse it)
                 try:
                     await self.on_message(message)
                 except Exception as callback_error:
                     logger.error(f"❌ Error in message callback: {callback_error}")
+                    import traceback
+                    logger.error(traceback.format_exc())
                     
         except asyncio.CancelledError:
             logger.debug("Receive loop cancelled (normal shutdown)")
+            watchdog_task.cancel()
             raise
         except Exception as e:
             error_str = str(e).lower()
@@ -272,6 +306,11 @@ class SarvamStreamingClient:
             else:
                 logger.error(f"❌ Error in receive loop: {e}")
         finally:
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except asyncio.CancelledError:
+                pass
             logger.info(f"🛑 Receive loop ended | Messages received: {message_count}")
             self.is_connected = False
             self.state = ConnectionState.DISCONNECTED

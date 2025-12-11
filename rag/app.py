@@ -26,6 +26,8 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 from leibniz_agent.services.shared.redis_client import get_redis_client, close_redis_client, ping_redis
+from leibniz_agent.services.shared.event_broker import EventBroker
+from leibniz_agent.services.shared.events import VoiceEvent, EventTypes
 from leibniz_agent.services.rag.config import RAGConfig
 from leibniz_agent.services.rag.rag_engine import RAGEngine
 from leibniz_agent.services.rag.index_builder import IndexBuilder
@@ -100,6 +102,7 @@ class IncrementalBufferResponse(BaseModel):
 # Global state (initialized in lifespan)
 rag_engine: Optional[RAGEngine] = None
 redis_client: Optional[redis.Redis] = None
+event_broker: Optional[EventBroker] = None
 cache_hits = 0
 cache_misses = 0
 app_start_time = 0.0
@@ -1017,7 +1020,7 @@ async def optimize_connections():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup/shutdown."""
-    global rag_engine, redis_client, cache_hits, cache_misses, app_start_time
+    global rag_engine, redis_client, event_broker, cache_hits, cache_misses, app_start_time
     
     # Startup
     logger.info("🚀 Starting RAG service with prewarming...")
@@ -1056,12 +1059,18 @@ async def lifespan(app: FastAPI):
             redis_client = await asyncio.wait_for(get_redis_client(), timeout=15.0)
             await asyncio.wait_for(ping_redis(redis_client), timeout=5.0)
             logger.info("🔗 Redis connected successfully")
+
+            # Initialize EventBroker for stream-based events
+            event_broker = EventBroker(redis_client)
+            logger.info("✅ EventBroker initialized for RAG events")
         except asyncio.TimeoutError:
             logger.warning("⏰ Redis connection timeout - service will run in degraded mode")
             redis_client = None
+            event_broker = None
         except Exception as redis_error:
             logger.warning(f"❌ Redis connection failed: {redis_error} - caching disabled")
             redis_client = None
+            event_broker = None
         
         # Initialize counters
         cache_hits = 0
@@ -1492,6 +1501,94 @@ async def incremental_query(request: IncrementalQueryRequest):
     except Exception as e:
         logger.error(f"❌ Incremental query error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Incremental query failed: {str(e)}")
+
+
+async def _process_rag_request_event(stream_key: str, message_id: str, fields: Dict[str, Any]):
+    """
+    Process a single RAG request event from Redis Streams.
+    """
+    global rag_engine
+    if not rag_engine:
+        logger.warning("RAG engine not initialized; skipping event")
+        return
+
+    try:
+        event = VoiceEvent.from_redis_dict(fields)
+        if event.event_type != "voice.rag.request":
+            return
+
+        session_id = event.session_id
+        text = event.payload.get("text", "")
+        if not text:
+            return
+
+        logger.info(f"[RAG Service] Event query for session {session_id}: '{text[:80]}'")
+
+        async def streaming_cb(chunk_text: str, is_final: bool):
+            # Emit RAG answer events back to orchestrator
+            answer_event = VoiceEvent(
+                event_type=EventTypes.RAG_ANSWER_READY,
+                session_id=session_id,
+                source="rag-service",
+                payload={"text": chunk_text, "is_final": is_final},
+                correlation_id=event.correlation_id,
+                metadata=event.metadata or {},
+            )
+            await event_broker.publish(f"voice:rag:session:{session_id}", answer_event)
+
+        # Use existing incremental RAG path for final text
+        # Here we treat incoming text as final; pre-buffering already happened via HTTP incremental API.
+        async for chunk in stream_rag_incremental(
+            text=text,
+            session_id=session_id,
+            rag_url="",  # Not used – we call engine directly below
+            language="te-mixed",
+            organization="TASK",
+        ):
+            await streaming_cb(chunk, is_final=False)
+
+        # Final marker
+        await streaming_cb("", is_final=True)
+    except Exception as e:
+        logger.error(f"RAG event processing failed: {e}", exc_info=True)
+
+
+@app.on_event("startup")
+async def start_rag_event_consumer():
+    """
+    Background task: consume RAG request events from Redis Streams.
+    """
+    global redis_client, event_broker
+    if not redis_client or not event_broker:
+        logger.warning("Redis or EventBroker not initialized; RAG event consumer disabled")
+        return
+
+    async def _consume_loop():
+        stream_key = "voice:rag:session:*"  # Pattern; we'll use XREAD with concrete keys added dynamically
+        logger.info("Starting RAG event consumer (per-session streams)")
+
+        # Simple polling over known sessions is complex; for now, consume from a shared requests stream.
+        # If orchestrator publishes to voice:rag:session:{sid}, consider also mirroring to voice:rag:requests.
+        requests_stream = "voice:rag:requests"
+        last_id = "$"
+
+        while True:
+            try:
+                messages = await redis_client.xread({requests_stream: last_id}, block=1000, count=10)
+                if not messages:
+                    continue
+
+                for skey, entries in messages:
+                    for msg_id, fields in entries:
+                        await _process_rag_request_event(skey, msg_id, fields)
+                        last_id = msg_id
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"RAG event consumer error: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+
+    asyncio.create_task(_consume_loop())
 
 
 

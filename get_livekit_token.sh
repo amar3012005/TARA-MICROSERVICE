@@ -38,3 +38,6 @@ echo ""
 echo "Use this token to connect at: https://livekit.io/connection-tester"
 echo "LiveKit URL: ws://localhost:7880"
 
+
+
+

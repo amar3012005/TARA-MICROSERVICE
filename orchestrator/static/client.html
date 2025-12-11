@@ -106,6 +106,14 @@
             transform: translateY(-2px);
             box-shadow: 0 4px 12px rgba(231, 76, 60, 0.4);
         }
+        .btn-success {
+            background: #28a745;
+            color: white;
+        }
+        .btn-success:hover:not(:disabled) {
+            background: #218838;
+            transform: translateY(-2px);
+        }
         .transcripts, .logs {
             max-height: 400px;
             overflow-y: auto;
@@ -171,51 +179,68 @@
         .session-info strong {
             color: #667eea;
         }
+        .mode-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .mode-badge.unified {
+            background: #28a745;
+            color: white;
+        }
+        .mode-badge.legacy {
+            background: #6c757d;
+            color: white;
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <header>
             <h1>🎙️ Leibniz Voice Agent</h1>
-            <p>Unified Client - STT Input & TTS Output</p>
+            <p>Phase 1: Single WebSocket Client <span class="mode-badge unified">UNIFIED</span></p>
         </header>
         
         <div class="content">
-            <!-- Left Panel: Audio Input (STT-VAD) -->
+            <!-- Left Panel: Audio Input -->
             <div class="panel">
-                <h2>🎤 Audio Input (STT-VAD)</h2>
-                <div id="sttStatus" class="status disconnected">Disconnected</div>
+                <h2>🎤 Audio Input</h2>
+                <div id="inputStatus" class="status disconnected">Disconnected</div>
                 <div class="session-info">
-                    <strong>STT FastRTC:</strong> <a href="http://localhost:5202/fastrtc" target="_blank">http://localhost:5202/fastrtc</a><br>
-                    <strong>Session ID:</strong> <span id="sttSessionId">-</span><br>
-                    <em>Note: Open STT FastRTC UI in separate tab</em>
+                    <strong>Connection:</strong> Single WebSocket at <code>/ws</code><br>
+                    <strong>Session ID:</strong> <span id="sessionId">-</span><br>
+                    <strong>Mode:</strong> Unified bidirectional
                 </div>
-                <div class="audio-visualizer" id="sttVisualizer">
+                <div class="audio-visualizer" id="inputVisualizer">
                     <span style="color: #999;">Microphone Input</span>
                 </div>
                 <div class="controls">
-                    <button id="startSTT" class="btn-primary">Start Microphone</button>
-                    <button id="stopSTT" class="btn-danger" disabled>Stop</button>
+                    <button id="startSession" class="btn-success">Start Session</button>
+                    <button id="startMic" class="btn-primary" disabled>Start Microphone</button>
+                    <button id="stopMic" class="btn-danger" disabled>Stop Microphone</button>
                 </div>
                 <h3>Transcripts</h3>
                 <div id="transcripts" class="transcripts"></div>
             </div>
             
-            <!-- Right Panel: Audio Output (Orchestrator) -->
+            <!-- Right Panel: Audio Output -->
             <div class="panel">
-                <h2>🔊 Audio Output (Orchestrator)</h2>
-                <div id="orchStatus" class="status disconnected">Disconnected</div>
+                <h2>🔊 Audio Output</h2>
+                <div id="outputStatus" class="status disconnected">Disconnected</div>
                 <div class="session-info">
-                    <strong>Orchestrator:</strong> <span id="orchServiceUrl">ws://localhost:5204</span><br>
-                    <strong>Session ID:</strong> <span id="orchSessionId">-</span><br>
-                    <strong>State:</strong> <span id="currentState">-</span>
+                    <strong>State:</strong> <span id="currentState">-</span><br>
+                    <strong>Audio Chunks:</strong> <span id="chunkCount">0</span> received<br>
+                    <strong>Playback:</strong> <span id="playbackStatus">Idle</span>
                 </div>
-                <div class="audio-visualizer" id="ttsVisualizer">
+                <div class="audio-visualizer" id="outputVisualizer">
                     <span style="color: #999;">Audio Output</span>
                 </div>
                 <div class="controls">
-                    <button id="connectOrch" class="btn-primary">Connect</button>
-                    <button id="disconnectOrch" class="btn-danger" disabled>Disconnect</button>
+                    <button id="endSession" class="btn-danger" disabled>End Session</button>
+                    <button id="interrupt" class="btn-primary" disabled>Interrupt</button>
                 </div>
                 <h3>System Logs</h3>
                 <div id="logs" class="logs"></div>
@@ -224,330 +249,460 @@
     </div>
 
     <script>
-        // Configuration - TARA Microservices
-        // TARA setup: Orchestrator=5204, STT FastRTC=5202, TTS=5205
-        const ORCH_SERVICE_URL = window.location.hostname === 'localhost' ? 'ws://localhost:5204' : `ws://${window.location.hostname}:5204`;
-        const STT_FASTRTC_URL = window.location.hostname === 'localhost' ? 'http://localhost:5202' : `http://${window.location.hostname}:5202`;
+        // ═══════════════════════════════════════════════════════════════════════
+        // PHASE 1: SINGLE WEBSOCKET CLIENT
+        // Unified bidirectional connection - sends audio, receives TTS via same socket
+        // ═══════════════════════════════════════════════════════════════════════
+        
         const SAMPLE_RATE = 16000;
+        const WS_URL = window.location.protocol === 'https:' 
+            ? `wss://${window.location.host}/ws` 
+            : `ws://${window.location.host}/ws`;
         
-        // State
-        let sttSocket = null;
-        let orchSocket = null;
-        let mediaStream = null;
-        let audioContext = null;
-        let processor = null;
-        let audioOutputContext = null;
-        let audioOutputSource = null;
-        let currentAudioChunks = [];
-        let sessionId = `session_${Date.now()}`;
-        let isPlayingAudio = false;
-        let isListening = false;
+        // ═══════════════════════════════════════════════════════════════════════
+        // OrchestratorClient: Single unified WebSocket connection
+        // ═══════════════════════════════════════════════════════════════════════
         
-        // DOM Elements
-        const sttStatus = document.getElementById('sttStatus');
-        const orchStatus = document.getElementById('orchStatus');
-        const startSTT = document.getElementById('startSTT');
-        const stopSTT = document.getElementById('stopSTT');
-        const connectOrch = document.getElementById('connectOrch');
-        const disconnectOrch = document.getElementById('disconnectOrch');
-        const transcripts = document.getElementById('transcripts');
-        const logs = document.getElementById('logs');
-        const sttVisualizer = document.getElementById('sttVisualizer');
-        const ttsVisualizer = document.getElementById('ttsVisualizer');
-        const sttSessionId = document.getElementById('sttSessionId');
-        const orchSessionId = document.getElementById('orchSessionId');
-        const currentState = document.getElementById('currentState');
-        
-        // Update session IDs
-        sttSessionId.textContent = sessionId;
-        orchSessionId.textContent = sessionId;
-        
-        // Logging helper
-        function addLog(message, type = 'info') {
-            const logItem = document.createElement('div');
-            logItem.className = `log-item ${type}`;
-            logItem.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
-            logs.appendChild(logItem);
-            logs.scrollTop = logs.scrollHeight;
-        }
-        
-        // Transcript helper
-        function addTranscript(text, isFinal = false) {
-            const item = document.createElement('div');
-            item.className = `transcript-item ${isFinal ? 'final' : 'fragment'}`;
-            item.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
-            transcripts.appendChild(item);
-            transcripts.scrollTop = transcripts.scrollHeight;
-        }
-        
-        // Update status
-        function updateStatus(element, status, message) {
-            element.className = `status ${status}`;
-            element.textContent = message;
-        }
-        
-        // Connect to Orchestrator
-        async function connectOrchestrator() {
-            if (orchSocket && orchSocket.readyState === WebSocket.OPEN) {
-                addLog('Already connected to orchestrator', 'warning');
-                return;
+        class OrchestratorClient {
+            constructor() {
+                this.ws = null;
+                this.sessionId = null;
+                this.state = 'idle';
+                this.audioContext = null;
+                this.audioQueue = [];
+                this.isProcessingQueue = false;
+                this.isPlayingAudio = false;
+                this.playbackStartTime = null;
+                this.currentSource = null;
+                this.chunkCount = 0;
+                
+                // Microphone state
+                this.mediaStream = null;
+                this.micAudioContext = null;
+                this.processor = null;
+                this.isMicActive = false;
+                
+                this.setupUI();
             }
             
-            updateStatus(orchStatus, 'connecting', 'Connecting to orchestrator...');
-            addLog('Connecting to orchestrator...', 'info');
-            
-            try {
-                orchSocket = new WebSocket(`${ORCH_SERVICE_URL}/orchestrate?session_id=${sessionId}`);
+            setupUI() {
+                // DOM Elements
+                this.inputStatus = document.getElementById('inputStatus');
+                this.outputStatus = document.getElementById('outputStatus');
+                this.sessionIdEl = document.getElementById('sessionId');
+                this.currentStateEl = document.getElementById('currentState');
+                this.chunkCountEl = document.getElementById('chunkCount');
+                this.playbackStatusEl = document.getElementById('playbackStatus');
+                this.inputVisualizer = document.getElementById('inputVisualizer');
+                this.outputVisualizer = document.getElementById('outputVisualizer');
+                this.transcripts = document.getElementById('transcripts');
+                this.logs = document.getElementById('logs');
                 
-                orchSocket.onopen = () => {
-                    updateStatus(orchStatus, 'connected', 'Connected to orchestrator');
-                    addLog('✅ Connected to orchestrator', 'success');
-                    connectOrch.disabled = true;
-                    disconnectOrch.disabled = false;
+                // Buttons
+                this.startSessionBtn = document.getElementById('startSession');
+                this.startMicBtn = document.getElementById('startMic');
+                this.stopMicBtn = document.getElementById('stopMic');
+                this.endSessionBtn = document.getElementById('endSession');
+                this.interruptBtn = document.getElementById('interrupt');
+                
+                // Event handlers
+                this.startSessionBtn.onclick = () => this.connect();
+                this.startMicBtn.onclick = () => this.startMicrophone();
+                this.stopMicBtn.onclick = () => this.stopMicrophone();
+                this.endSessionBtn.onclick = () => this.endSession();
+                this.interruptBtn.onclick = () => this.interrupt();
+            }
+            
+            // ───────────────────────────────────────────────────────────────────
+            // WebSocket Connection
+            // ───────────────────────────────────────────────────────────────────
+            
+            connect() {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.addLog('Already connected', 'warning');
+                    return;
+                }
+                
+                this.updateStatus(this.inputStatus, 'connecting', 'Connecting...');
+                this.updateStatus(this.outputStatus, 'connecting', 'Connecting...');
+                this.addLog('Connecting to orchestrator...', 'info');
+                
+                this.ws = new WebSocket(WS_URL);
+                
+                this.ws.onopen = () => {
+                    this.addLog('✅ WebSocket connected', 'success');
+                    this.updateStatus(this.inputStatus, 'connected', 'Connected');
+                    this.updateStatus(this.outputStatus, 'connected', 'Connected');
+                    
+                    this.startSessionBtn.disabled = true;
+                    this.startMicBtn.disabled = false;
+                    this.endSessionBtn.disabled = false;
+                    
+                    // Request session start
+                    this.send({ type: 'start_session', mode: 'conversation' });
                 };
                 
-                orchSocket.onmessage = async (event) => {
+                this.ws.onmessage = async (event) => {
                     try {
-                        if (event.data instanceof Blob) {
-                            // Binary audio data
-                            await handleAudioChunk(event.data);
-                        } else {
-                            // JSON message
-                            const data = JSON.parse(event.data);
-                            await handleOrchestratorMessage(data);
-                        }
+                        const data = JSON.parse(event.data);
+                        await this.handleMessage(data);
                     } catch (e) {
-                        console.error('Error handling orchestrator message:', e);
+                        console.error('Error handling message:', e);
                     }
                 };
                 
-                orchSocket.onerror = (error) => {
-                    addLog(`❌ Orchestrator error: ${error}`, 'error');
-                    updateStatus(orchStatus, 'disconnected', 'Connection error');
+                this.ws.onerror = (error) => {
+                    this.addLog(`❌ WebSocket error`, 'error');
+                    this.updateStatus(this.inputStatus, 'disconnected', 'Error');
+                    this.updateStatus(this.outputStatus, 'disconnected', 'Error');
                 };
                 
-                orchSocket.onclose = () => {
-                    updateStatus(orchStatus, 'disconnected', 'Disconnected from orchestrator');
-                    addLog('Disconnected from orchestrator', 'warning');
-                    connectOrch.disabled = false;
-                    disconnectOrch.disabled = true;
-                    orchSocket = null;
+                this.ws.onclose = () => {
+                    this.addLog('WebSocket disconnected', 'warning');
+                    this.updateStatus(this.inputStatus, 'disconnected', 'Disconnected');
+                    this.updateStatus(this.outputStatus, 'disconnected', 'Disconnected');
+                    this.ws = null;
+                    this.sessionId = null;
+                    
+                    this.startSessionBtn.disabled = false;
+                    this.startMicBtn.disabled = true;
+                    this.stopMicBtn.disabled = true;
+                    this.endSessionBtn.disabled = true;
+                    this.interruptBtn.disabled = true;
                 };
-            } catch (error) {
-                addLog(`❌ Failed to connect: ${error.message}`, 'error');
-                updateStatus(orchStatus, 'disconnected', 'Connection failed');
-            }
-        }
-        
-        // Handle orchestrator messages
-        async function handleOrchestratorMessage(data) {
-            const type = data.type;
-            
-            switch (type) {
-                case 'connected':
-                    addLog(`✅ Session connected: ${data.session_id}`, 'success');
-                    currentState.textContent = data.state || 'idle';
-                    break;
-                
-                case 'state_update':
-                    currentState.textContent = data.state;
-                    if (data.state === 'listening') {
-                        updateStatus(orchStatus, 'listening', 'Listening...');
-                        isListening = true;
-                    } else if (data.state === 'thinking') {
-                        updateStatus(orchStatus, 'thinking', 'Thinking...');
-                    } else if (data.state === 'speaking') {
-                        updateStatus(orchStatus, 'speaking', 'Speaking...');
-                        ttsVisualizer.classList.add('active');
-                    } else {
-                        updateStatus(orchStatus, 'connected', 'Ready');
-                        ttsVisualizer.classList.remove('active');
-                    }
-                    break;
-                
-                case 'response_ready':
-                    addLog(`✅ Response ready (${data.thinking_ms}ms): ${data.text.substring(0, 50)}...`, 'success');
-                    break;
-                
-                case 'turn_complete':
-                    addLog(`✅ Turn ${data.turn_number} complete`, 'success');
-                    currentState.textContent = data.state;
-                    updateStatus(orchStatus, 'connected', 'Ready for next turn');
-                    ttsVisualizer.classList.remove('active');
-                    isPlayingAudio = false;
-                    break;
-                
-                case 'interrupted':
-                    addLog(`⚡ ${data.message}`, 'warning');
-                    isPlayingAudio = false;
-                    ttsVisualizer.classList.remove('active');
-                    break;
-                
-                case 'tts_error':
-                    addLog(`❌ TTS error: ${data.message}`, 'error');
-                    break;
-                
-                default:
-                    addLog(`📨 ${type}: ${JSON.stringify(data)}`, 'info');
-            }
-        }
-        
-        // Handle audio chunks from orchestrator
-        async function handleAudioChunk(audioBlob) {
-            if (!audioOutputContext) {
-                audioOutputContext = new AudioContext({ sampleRate: 24000 });
             }
             
-            try {
-                const arrayBuffer = await audioBlob.arrayBuffer();
-                const audioBuffer = await audioOutputContext.decodeAudioData(arrayBuffer);
-                
-                if (!isPlayingAudio) {
-                    isPlayingAudio = true;
-                    ttsVisualizer.classList.add('active');
+            send(data) {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify(data));
                 }
-                
-                // Play audio
-                const source = audioOutputContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioOutputContext.destination);
-                source.start();
-                
-                // Detect barge-in: if user starts speaking, stop audio
-                if (isListening && sttSocket && sttSocket.readyState === WebSocket.OPEN) {
-                    // Send interrupt signal
-                    if (orchSocket && orchSocket.readyState === WebSocket.OPEN) {
-                        orchSocket.send(JSON.stringify({ type: 'user_speaking' }));
-                        addLog('⚡ Barge-in detected - stopping audio', 'warning');
-                        source.stop();
-                        ttsVisualizer.classList.remove('active');
-                        isPlayingAudio = false;
-                    }
-                }
-            } catch (error) {
-                console.error('Error playing audio:', error);
-            }
-        }
-        
-        // Connect to STT-VAD
-        function connectSTT() {
-            if (sttSocket && sttSocket.readyState === WebSocket.OPEN) {
-                addLog('Already connected to STT', 'warning');
-                return;
             }
             
-            updateStatus(sttStatus, 'connecting', 'Connecting to STT service...');
-            addLog('Connecting to STT service...', 'info');
+            // ───────────────────────────────────────────────────────────────────
+            // Message Handling
+            // ───────────────────────────────────────────────────────────────────
             
-            sttSocket = new WebSocket(`${STT_SERVICE_URL}/api/v1/transcribe/stream?session_id=${sessionId}`);
-            
-            sttSocket.onopen = () => {
-                updateStatus(sttStatus, 'connected', 'Connected to STT service');
-                addLog('✅ Connected to STT service', 'success');
-            };
-            
-            sttSocket.onmessage = (event) => {
-                try {
-                    const data = JSON.parse(event.data);
-                    if (data.type === 'fragment') {
-                        addTranscript(data.text, data.is_final);
-                        if (data.is_final) {
-                            addLog(`📝 Final transcript: ${data.text}`, 'info');
+            async handleMessage(data) {
+                const { type } = data;
+                
+                switch (type) {
+                    case 'session_ready':
+                        this.sessionId = data.session_id;
+                        this.sessionIdEl.textContent = this.sessionId;
+                        this.addLog(`✅ Session ready: ${this.sessionId}`, 'success');
+                        break;
+                    
+                    case 'state_update':
+                        this.state = data.state;
+                        this.currentStateEl.textContent = data.state;
+                        this.updateStateUI(data.state);
+                        break;
+                    
+                    case 'transcript':
+                        this.addTranscript(data.text, data.is_final);
+                        break;
+                    
+                    case 'agent_response':
+                        if (data.is_complete) {
+                            this.addLog(`🤖 Response: ${data.full_text?.substring(0, 50)}...`, 'success');
                         }
-                    }
-                } catch (e) {
-                    console.error('Error parsing STT message:', e);
+                        break;
+                    
+                    case 'audio_chunk':
+                        if (data.is_final) {
+                            this.addLog('🔊 Audio stream complete', 'info');
+                        } else if (data.audio) {
+                            await this.queueAudio(data.audio);
+                        }
+                        break;
+                    
+                    case 'playback_control':
+                        if (data.action === 'stop') {
+                            this.stopPlayback();
+                            this.addLog(`⚡ Playback stopped: ${data.reason}`, 'warning');
+                        }
+                        break;
+                    
+                    default:
+                        this.addLog(`📨 ${type}: ${JSON.stringify(data).substring(0, 100)}`, 'info');
                 }
-            };
+            }
             
-            sttSocket.onerror = (error) => {
-                addLog(`❌ STT error: ${error}`, 'error');
-                updateStatus(sttStatus, 'disconnected', 'Connection error');
-            };
+            updateStateUI(state) {
+                if (state === 'listening') {
+                    this.updateStatus(this.outputStatus, 'listening', 'Listening...');
+                    this.interruptBtn.disabled = true;
+                } else if (state === 'thinking') {
+                    this.updateStatus(this.outputStatus, 'thinking', 'Thinking...');
+                    this.interruptBtn.disabled = true;
+                } else if (state === 'speaking') {
+                    this.updateStatus(this.outputStatus, 'speaking', 'Speaking...');
+                    this.outputVisualizer.classList.add('active');
+                    this.interruptBtn.disabled = false;
+                } else {
+                    this.updateStatus(this.outputStatus, 'connected', 'Ready');
+                    this.outputVisualizer.classList.remove('active');
+                    this.interruptBtn.disabled = true;
+                }
+            }
             
-            sttSocket.onclose = () => {
-                updateStatus(sttStatus, 'disconnected', 'Disconnected from STT service');
-                addLog('Disconnected from STT service', 'warning');
-                sttSocket = null;
-            };
-        }
-        
-        // Start microphone
-        startSTT.onclick = async () => {
-            try {
-                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                audioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
-                const source = audioContext.createMediaStreamSource(mediaStream);
-                processor = audioContext.createScriptProcessor(4096, 1, 1);
-                
-                source.connect(processor);
-                processor.connect(audioContext.destination);
-                
-                processor.onaudioprocess = (e) => {
-                    if (sttSocket && sttSocket.readyState === WebSocket.OPEN) {
+            // ───────────────────────────────────────────────────────────────────
+            // Microphone Handling
+            // ───────────────────────────────────────────────────────────────────
+            
+            async startMicrophone() {
+                try {
+                    this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    this.micAudioContext = new AudioContext({ sampleRate: SAMPLE_RATE });
+                    const source = this.micAudioContext.createMediaStreamSource(this.mediaStream);
+                    this.processor = this.micAudioContext.createScriptProcessor(4096, 1, 1);
+                    
+                    source.connect(this.processor);
+                    this.processor.connect(this.micAudioContext.destination);
+                    
+                    // Voice activity detection for barge-in
+                    const VAD_THRESHOLD = 0.02;
+                    let consecutiveVoiceFrames = 0;
+                    const VOICE_FRAMES_FOR_BARGE_IN = 3;
+                    
+                    this.processor.onaudioprocess = (e) => {
+                        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+                        
                         const inputData = e.inputBuffer.getChannelData(0);
                         const pcmData = new Int16Array(inputData.length);
+                        
+                        // Calculate RMS for VAD
+                        let sum = 0;
                         for (let i = 0; i < inputData.length; i++) {
                             pcmData[i] = Math.max(-1, Math.min(1, inputData[i])) * 0x7FFF;
+                            sum += inputData[i] * inputData[i];
                         }
-                        sttSocket.send(pcmData.buffer);
+                        const rms = Math.sqrt(sum / inputData.length);
                         
-                        // Visual feedback
-                        sttVisualizer.classList.add('active');
-                        isListening = true;
-                    }
-                };
-                
-                startSTT.disabled = true;
-                stopSTT.disabled = false;
-                updateStatus(sttStatus, 'listening', 'Recording...');
-                addLog('🎤 Microphone started', 'success');
-                
-                if (!sttSocket || sttSocket.readyState !== WebSocket.OPEN) {
-                    connectSTT();
+                        // Barge-in detection
+                        if (rms > VAD_THRESHOLD) {
+                            consecutiveVoiceFrames++;
+                            if (this.isPlayingAudio && consecutiveVoiceFrames >= VOICE_FRAMES_FOR_BARGE_IN) {
+                                this.interrupt();
+                                consecutiveVoiceFrames = 0;
+                            }
+                        } else {
+                            consecutiveVoiceFrames = 0;
+                        }
+                        
+                        // Send audio chunk (base64 encoded)
+                        const audioB64 = this.arrayBufferToBase64(pcmData.buffer);
+                        this.send({
+                            type: 'audio_chunk',
+                            data: audioB64,
+                            timestamp: Date.now() / 1000,
+                            sequence: this.chunkCount++
+                        });
+                        
+                        this.inputVisualizer.classList.add('active');
+                    };
+                    
+                    this.isMicActive = true;
+                    this.startMicBtn.disabled = true;
+                    this.stopMicBtn.disabled = false;
+                    this.updateStatus(this.inputStatus, 'listening', 'Recording...');
+                    this.addLog('🎤 Microphone started', 'success');
+                    
+                } catch (err) {
+                    this.addLog(`❌ Microphone error: ${err.message}`, 'error');
                 }
-            } catch (err) {
-                addLog(`❌ Error accessing microphone: ${err.message}`, 'error');
-                updateStatus(sttStatus, 'disconnected', 'Microphone error');
-            }
-        };
-        
-        // Stop microphone
-        stopSTT.onclick = () => {
-            if (mediaStream) {
-                mediaStream.getTracks().forEach(track => track.stop());
-            }
-            if (audioContext) {
-                audioContext.close();
-            }
-            if (sttSocket) {
-                sttSocket.close();
             }
             
-            startSTT.disabled = false;
-            stopSTT.disabled = true;
-            updateStatus(sttStatus, 'disconnected', 'Stopped');
-            sttVisualizer.classList.remove('active');
-            isListening = false;
-            addLog('🛑 Microphone stopped', 'info');
-        };
-        
-        // Connect/disconnect orchestrator
-        connectOrch.onclick = connectOrchestrator;
-        disconnectOrch.onclick = () => {
-            if (orchSocket) {
-                orchSocket.close();
+            stopMicrophone() {
+                if (this.mediaStream) {
+                    this.mediaStream.getTracks().forEach(track => track.stop());
+                }
+                if (this.micAudioContext) {
+                    this.micAudioContext.close();
+                }
+                
+                this.isMicActive = false;
+                this.startMicBtn.disabled = false;
+                this.stopMicBtn.disabled = true;
+                this.inputVisualizer.classList.remove('active');
+                this.updateStatus(this.inputStatus, 'connected', 'Microphone stopped');
+                this.addLog('🛑 Microphone stopped', 'info');
             }
-        };
+            
+            // ───────────────────────────────────────────────────────────────────
+            // Audio Playback
+            // ───────────────────────────────────────────────────────────────────
+            
+            async queueAudio(audioB64) {
+                if (!this.audioContext) {
+                    this.audioContext = new AudioContext({ sampleRate: 24000 });
+                }
+                
+                try {
+                    const audioBytes = Uint8Array.from(atob(audioB64), c => c.charCodeAt(0));
+                    
+                    // Convert raw PCM to playable format
+                    const audioBuffer = this.audioContext.createBuffer(1, audioBytes.length / 2, 24000);
+                    const channelData = audioBuffer.getChannelData(0);
+                    const int16View = new Int16Array(audioBytes.buffer);
+                    
+                    for (let i = 0; i < int16View.length; i++) {
+                        channelData[i] = int16View[i] / 32768.0;
+                    }
+                    
+                    this.audioQueue.push(audioBuffer);
+                    this.chunkCount++;
+                    this.chunkCountEl.textContent = this.chunkCount;
+                    
+                    if (!this.isProcessingQueue) {
+                        this.processAudioQueue();
+                    }
+                } catch (error) {
+                    console.error('Audio decode error:', error);
+                }
+            }
+            
+            async processAudioQueue() {
+                if (this.isProcessingQueue || this.audioQueue.length === 0) return;
+                
+                this.isProcessingQueue = true;
+                
+                while (this.audioQueue.length > 0) {
+                    const audioBuffer = this.audioQueue.shift();
+                    
+                    if (!this.isPlayingAudio) {
+                        this.isPlayingAudio = true;
+                        this.playbackStartTime = Date.now();
+                        this.playbackStatusEl.textContent = 'Playing...';
+                        this.outputVisualizer.classList.add('active');
+                    }
+                    
+                    await this.playAudioBuffer(audioBuffer);
+                }
+                
+                // All audio played
+                if (this.isPlayingAudio) {
+                    this.isPlayingAudio = false;
+                    this.playbackStatusEl.textContent = 'Complete';
+                    this.outputVisualizer.classList.remove('active');
+                    
+                    const duration = this.playbackStartTime ? Date.now() - this.playbackStartTime : 0;
+                    this.addLog(`🔊 Playback complete (${duration}ms)`, 'info');
+                    
+                    // Notify server
+                    this.send({
+                        type: 'playback_done',
+                        duration_ms: duration,
+                        timestamp: Date.now() / 1000
+                    });
+                    
+                    this.playbackStartTime = null;
+                }
+                
+                this.isProcessingQueue = false;
+            }
+            
+            playAudioBuffer(audioBuffer) {
+                return new Promise((resolve) => {
+                    const source = this.audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(this.audioContext.destination);
+                    
+                    this.currentSource = source;
+                    source.onended = () => {
+                        this.currentSource = null;
+                        resolve();
+                    };
+                    
+                    source.start();
+                });
+            }
+            
+            stopPlayback() {
+                if (this.currentSource) {
+                    try {
+                        this.currentSource.stop();
+                    } catch (e) {}
+                    this.currentSource = null;
+                }
+                
+                this.audioQueue = [];
+                this.isPlayingAudio = false;
+                this.isProcessingQueue = false;
+                this.playbackStatusEl.textContent = 'Stopped';
+                this.outputVisualizer.classList.remove('active');
+            }
+            
+            // ───────────────────────────────────────────────────────────────────
+            // Session Control
+            // ───────────────────────────────────────────────────────────────────
+            
+            interrupt() {
+                if (!this.isPlayingAudio) return;
+                
+                this.addLog('⚡ Interrupt sent', 'warning');
+                this.stopPlayback();
+                
+                this.send({
+                    type: 'interrupt',
+                    reason: 'user_speaking',
+                    timestamp: Date.now() / 1000
+                });
+            }
+            
+            endSession() {
+                this.stopMicrophone();
+                this.stopPlayback();
+                
+                this.send({ type: 'end_session' });
+                
+                if (this.ws) {
+                    this.ws.close();
+                }
+            }
+            
+            // ───────────────────────────────────────────────────────────────────
+            // Utilities
+            // ───────────────────────────────────────────────────────────────────
+            
+            arrayBufferToBase64(buffer) {
+                let binary = '';
+                const bytes = new Uint8Array(buffer);
+                for (let i = 0; i < bytes.byteLength; i++) {
+                    binary += String.fromCharCode(bytes[i]);
+                }
+                return btoa(binary);
+            }
+            
+            updateStatus(element, status, message) {
+                element.className = `status ${status}`;
+                element.textContent = message;
+            }
+            
+            addLog(message, type = 'info') {
+                const logItem = document.createElement('div');
+                logItem.className = `log-item ${type}`;
+                logItem.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+                this.logs.appendChild(logItem);
+                this.logs.scrollTop = this.logs.scrollHeight;
+            }
+            
+            addTranscript(text, isFinal = false) {
+                const item = document.createElement('div');
+                item.className = `transcript-item ${isFinal ? 'final' : 'fragment'}`;
+                item.textContent = `[${new Date().toLocaleTimeString()}] ${text}`;
+                this.transcripts.appendChild(item);
+                this.transcripts.scrollTop = this.transcripts.scrollHeight;
+            }
+        }
         
-        // Auto-connect orchestrator on load
+        // Initialize client
+        const client = new OrchestratorClient();
+        
+        // Log ready state
         window.addEventListener('load', () => {
-            addLog('🚀 Page loaded - ready to connect', 'info');
-            setTimeout(() => {
-                connectOrchestrator();
-            }, 500);
+            client.addLog('🚀 Page loaded - click "Start Session" to connect', 'info');
         });
     </script>
 </body>
 </html>
-

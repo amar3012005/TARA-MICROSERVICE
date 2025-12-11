@@ -51,3 +51,6 @@ The streaming endpoint returns NDJSON (newline-delimited JSON) with chunks:
 
 Each line is a JSON object. The complete response is all `text` fields concatenated.
 
+
+
+

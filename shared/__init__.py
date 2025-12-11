@@ -27,6 +27,8 @@ from .redis_client import (
     close_redis_client,
     ping_redis,
     get_redis_info,
+    get_stream_length,
+    get_redis_stream_client,
     RedisConfig,
 )
 
@@ -35,6 +37,49 @@ from .health_check import (
     check_service_health,
     check_all_services,
     HealthCheckResult,
+)
+
+from .events import (
+    VoiceEvent,
+    EventTypes,
+)
+
+from .event_broker import (
+    EventBroker,
+)
+
+from .event_consumer import (
+    EventConsumer,
+    MultiStreamConsumer,
+    ConsumerConfig,
+    ConsumerMetrics,
+    ProcessingResult,
+    create_consumer,
+)
+
+from .observability import (
+    setup_tracing,
+    get_tracer,
+    trace_span,
+    traced,
+    inject_trace_context,
+    extract_trace_context,
+    setup_metrics,
+    get_metrics_response,
+    record_event_processed,
+    record_event_error,
+    record_stt_latency,
+    record_intent_latency,
+    record_rag_latency,
+    record_tts_first_chunk_latency,
+    record_e2e_latency,
+    set_active_sessions,
+    set_stream_queue_size,
+    time_event_processing,
+    MetricTimer,
+    EVENTS_TOTAL,
+    EVENT_PROCESSING_DURATION,
+    E2E_LATENCY,
 )
 
 __all__ = [
@@ -50,4 +95,38 @@ __all__ = [
     "check_service_health",
     "check_all_services",
     "HealthCheckResult",
+    # Event utilities
+    "VoiceEvent",
+    "EventTypes",
+    "EventBroker",
+    # Event consumer utilities
+    "EventConsumer",
+    "MultiStreamConsumer",
+    "ConsumerConfig",
+    "ConsumerMetrics",
+    "ProcessingResult",
+    "create_consumer",
+    # Observability utilities
+    "setup_tracing",
+    "get_tracer",
+    "trace_span",
+    "traced",
+    "inject_trace_context",
+    "extract_trace_context",
+    "setup_metrics",
+    "get_metrics_response",
+    "record_event_processed",
+    "record_event_error",
+    "record_stt_latency",
+    "record_intent_latency",
+    "record_rag_latency",
+    "record_tts_first_chunk_latency",
+    "record_e2e_latency",
+    "set_active_sessions",
+    "set_stream_queue_size",
+    "time_event_processing",
+    "MetricTimer",
+    "EVENTS_TOTAL",
+    "EVENT_PROCESSING_DURATION",
+    "E2E_LATENCY",
 ]

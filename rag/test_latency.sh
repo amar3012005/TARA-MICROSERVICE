@@ -160,3 +160,6 @@ echo "  3. Non-blocking validation (saves 40ms)"
 echo "  4. Parallel chunk processing (pre-populates buffer)"
 echo ""
 
+
+
+

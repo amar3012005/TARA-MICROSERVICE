@@ -31,7 +31,8 @@ from config import VADConfig
 from vad_manager import VADManager
 from utils import validate_audio_chunk, format_transcript_fragment
 from sarvam_client import SarvamSTTClient
-from shared.redis_client import get_redis_client, close_redis_client, ping_redis
+from shared.redis_client import get_redis_client, close_redis_client, ping_redis, get_event_broker
+from shared.events import VoiceEvent, EventTypes
 from fastrtc import Stream
 from fastrtc_handler import FastRTCSTTHandler
 import gradio as gr
@@ -46,6 +47,7 @@ logger = logging.getLogger(__name__)
 # Global state
 vad_manager: VADManager = None
 redis_client = None
+event_broker = None
 sarvam_client: SarvamSTTClient = None
 active_sessions: Dict[str, Any] = {}
 app_start_time: float = time.time()
@@ -56,7 +58,7 @@ fastrtc_stream: Stream = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan handler for application startup/shutdown"""
-    global vad_manager, redis_client, sarvam_client
+    global vad_manager, redis_client, event_broker, sarvam_client
     
     logger.info("=" * 70)
     logger.info("🚀 Starting STT/VAD Microservice (Sarvam Saarika)")
@@ -93,10 +95,10 @@ async def lifespan(app: FastAPI):
     logger.info("✅ STT/VAD Microservice Ready (Redis connecting in background)")
     logger.info("=" * 70)
     
-    # Start Redis connection in background task (non-blocking)
+    # Start Redis + EventBroker connection in background task (non-blocking)
     async def connect_redis_background():
         """Connect to Redis in background without blocking service startup"""
-        global redis_client
+        global redis_client, event_broker
         logger.info("🔌 Connecting to Redis (background)...")
         
         # Set Redis environment variables if not already set
@@ -116,6 +118,15 @@ async def lifespan(app: FastAPI):
                 # Test connection
                 await ping_redis(redis_client)
                 logger.info(f"✅ Redis connected (attempt {retry_attempt + 1})")
+
+                # Initialize Event Broker
+                try:
+                    event_broker = await get_event_broker()
+                    logger.info("✅ EventBroker initialized for STT events")
+                except Exception as e:
+                    event_broker = None
+                    logger.warning(f"⚠️ Failed to initialize EventBroker: {e}")
+
                 # Update VAD manager with Redis client
                 vad_manager.redis_client = redis_client
                 break
@@ -361,21 +372,27 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
     # Reduced to 20 (~1 second buffer) for ultra-low latency
     # Leaky bucket strategy: drops oldest chunks when full to prioritize real-time audio
     audio_queue = asyncio.Queue(maxsize=20)
+    
+    # Detect session type based on session_id pattern
+    session_type = "orchestrator" if session_id.startswith("ws_session_") else "fastrtc"
+    
     active_sessions[session_id] = {
         "audio_queue": audio_queue,
         "websocket": websocket,
         "last_activity": time.time(),
         "continuous_mode": False,
-        "capture_task": None
+        "capture_task": None,
+        "audio_chunks_received": 0
     }
     
     logger.info("=" * 70)
-    logger.info(f"🔌 WebSocket session established")
-    logger.info(f"   Session ID: {session_id}")
-    logger.info(f"   Remote: {websocket.client}")
+    logger.info(f"[{session_id}] 🔌 WebSocket session established")
+    logger.info(f"[{session_id}]    Session ID: {session_id}")
+    logger.info(f"[{session_id}]    Session type: {session_type}")
+    logger.info(f"[{session_id}]    Remote: {websocket.client}")
     logger.info("=" * 70)
     
-    logger.info(f"📡 Ready to receive audio chunks")
+    logger.info(f"[{session_id}] 📡 Ready to receive audio chunks")
 
     try:
         while True:
@@ -387,7 +404,7 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                 )
             except (WebSocketDisconnect, RuntimeError):
                 # Normal disconnection or "Cannot call receive..." error
-                logger.info(f"🔌 WebSocket disconnected/closed for session {session_id}")
+                logger.info(f"[{session_id}] 🔌 WebSocket disconnected/closed")
                 break
             except asyncio.TimeoutError:
                 # Send timeout message and close
@@ -406,7 +423,17 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
             if "bytes" in message:
                 audio_data = message["bytes"]
                 
-                logger.debug(f"📥 Audio chunk received | Size: {len(audio_data)} bytes")
+                # Increment chunk counter
+                active_sessions[session_id]["audio_chunks_received"] += 1
+                chunk_count = active_sessions[session_id]["audio_chunks_received"]
+                
+                # Log first chunk and every 50th chunk at INFO level
+                if chunk_count == 1:
+                    logger.info(f"[{session_id}] 📥 First audio chunk received | Size: {len(audio_data)} bytes")
+                elif chunk_count % 50 == 0:
+                    logger.info(f"[{session_id}] 📥 Audio chunk #{chunk_count} received | Size: {len(audio_data)} bytes")
+                else:
+                    logger.debug(f"[{session_id}] 📥 Audio chunk #{chunk_count} received | Size: {len(audio_data)} bytes")
                 
                 # Leaky Bucket Strategy: Add to queue, dropping oldest if full
                 # This ensures we always process the most recent audio for ultra-low latency
@@ -418,14 +445,14 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                     try:
                         dropped_chunk = audio_queue.get_nowait()
                         audio_queue.put_nowait(audio_data)
-                        logger.debug(f"⚠️ Queue full - dropped oldest chunk ({len(dropped_chunk)} bytes) to make room for new audio")
+                        logger.debug(f"[{session_id}] ⚠️ Queue full - dropped oldest chunk ({len(dropped_chunk)} bytes) to make room for new audio")
                     except asyncio.QueueEmpty:
                         # Shouldn't happen, but handle gracefully
-                        logger.warning(f"⚠️ Queue state inconsistent - attempting to add chunk anyway")
+                        logger.warning(f"[{session_id}] ⚠️ Queue state inconsistent - attempting to add chunk anyway")
                         try:
                             audio_queue.put_nowait(audio_data)
                         except asyncio.QueueFull:
-                            logger.error(f"❌ Failed to add chunk even after dropping oldest")
+                            logger.error(f"[{session_id}] ❌ Failed to add chunk even after dropping oldest")
                             continue
                 
                 active_sessions[session_id]["last_activity"] = time.time()
@@ -433,8 +460,9 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                 # Auto-start continuous capture
                 if not active_sessions[session_id]["continuous_mode"]:
                     logger.info("=" * 70)
-                    logger.info("🚀 Auto-starting continuous capture")
-                    logger.info("   Processing audio in real-time...")
+                    logger.info(f"[{session_id}] 🚀 Auto-starting continuous capture")
+                    logger.info(f"[{session_id}]    Processing audio in real-time...")
+                    logger.info(f"[{session_id}]    Session type: {session_type}")
                     logger.info("=" * 70)
                     
                     active_sessions[session_id]["continuous_mode"] = True
@@ -452,7 +480,7 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                     if command.get("type") == "start_capture":
                         # Start capture mode
                         if not active_sessions[session_id]["continuous_mode"]:
-                            logger.info(f"Starting capture for session {session_id}")
+                            logger.info(f"[{session_id}] 🚀 Starting capture (manual command)")
                             active_sessions[session_id]["continuous_mode"] = True
 
                             # Start continuous capture task
@@ -469,7 +497,7 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
 
                     elif command.get("type") == "stop_capture":
                         # Stop capture mode
-                        logger.info(f"Stopping capture for session {session_id}")
+                        logger.info(f"[{session_id}] 🛑 Stopping capture (manual command)")
                         active_sessions[session_id]["continuous_mode"] = False
 
                         # Cancel capture task
@@ -498,6 +526,7 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                         })
 
                 except json.JSONDecodeError:
+                    logger.warning(f"[{session_id}] ⚠️ Invalid JSON command received")
                     await websocket.send_json({
                         "type": "error",
                         "text": "Invalid JSON command",
@@ -506,30 +535,35 @@ async def transcribe_stream(websocket: WebSocket, session_id: str = Query(...)):
                     })
 
     except (WebSocketDisconnect, RuntimeError):
-        logger.info(f"🔌 WebSocket disconnected/closed for session {session_id}")
+        logger.info(f"[{session_id}] 🔌 WebSocket disconnected/closed")
     
     except Exception as e:
-        logger.error(f"❌ Unexpected WebSocket error for session {session_id}: {e}")
+        logger.error(f"[{session_id}] ❌ Unexpected WebSocket error: {e}", exc_info=True)
 
     finally:
         # Cleanup
+        logger.info(f"[{session_id}] 🧹 Cleaning up session")
         if session_id in active_sessions:
             session_data = active_sessions[session_id]
 
             # Cancel any running capture task
             capture_task = session_data.get("capture_task")
             if capture_task and not capture_task.done():
+                logger.info(f"[{session_id}]    Cancelling capture task")
                 capture_task.cancel()
                 try:
                     await capture_task
                 except asyncio.CancelledError:
                     pass
 
+            chunks_received = session_data.get("audio_chunks_received", 0)
+            logger.info(f"[{session_id}]    Session processed {chunks_received} audio chunks")
             del active_sessions[session_id]
         
         # Unregister from Sarvam Streaming (Cleanup)
         if vad_manager:
             await vad_manager.unregister_session(session_id)
+            logger.info(f"[{session_id}]    Unregistered from VAD manager")
 
 
 async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, websocket: WebSocket):
@@ -545,13 +579,14 @@ async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, w
         websocket: WebSocket for sending transcripts
     """
     logger.info("=" * 70)
-    logger.info(f"🔄 Starting continuous capture loop | Session: {session_id}")
-    logger.info("📊 Processing audio chunks in real-time (no buffering)")
+    logger.info(f"[{session_id}] 🔄 Starting continuous capture loop")
+    logger.info(f"[{session_id}] 📊 Processing audio chunks in real-time (no buffering)")
     logger.info("=" * 70)
 
     # Streaming callback for real-time transcripts
     def streaming_callback(text: str, is_final: bool):
-        """Send transcript fragments with enhanced Docker logging"""
+        """Send transcript fragments to WebSocket and emit events to Redis Streams."""
+
         async def send_fragment():
             try:
                 fragment = {
@@ -559,20 +594,56 @@ async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, w
                     "text": text,
                     "is_final": is_final,
                     "session_id": session_id,
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
                 }
-                await websocket.send_json(fragment)
                 
-                # CRITICAL: Log to Docker console for visibility
+                # Log BEFORE sending for debugging
                 status = "✅ FINAL" if is_final else "🔄 PARTIAL"
-                logger.info(f"📝 [{status}] STT Fragment")
-                logger.info(f"   Text: '{text[:150]}'")
-                if is_final:
-                    logger.info(f"   Session: {session_id}")
+                logger.info(f"[{session_id}] 📝 [{status}] STT Fragment")
+                logger.info(f"[{session_id}]    Text: '{text[:150]}'")
                 
+                # 1) Send to WebSocket client (for UI feedback)
+                # Check WebSocket state before sending (if available)
+                try:
+                    # Check if WebSocket is still connected (FastAPI WebSocket state)
+                    if hasattr(websocket, 'client_state'):
+                        if websocket.client_state.name != "CONNECTED":
+                            logger.warning(f"[{session_id}] ⚠️ WebSocket not connected (state: {websocket.client_state.name}), cannot send fragment")
+                            return
+                except (AttributeError, Exception) as state_check_error:
+                    # Fallback - try to send anyway, will catch error if disconnected
+                    logger.debug(f"[{session_id}] WebSocket state check skipped: {state_check_error}")
+                
+                try:
+                    await websocket.send_json(fragment)
+                    logger.info(f"[{session_id}]    📤 Sent fragment to WebSocket client")
+                except Exception as send_error:
+                    logger.error(f"[{session_id}] ❌ Failed to send fragment to WebSocket: {send_error}")
+                    # Don't raise - fragment sending failure shouldn't break the loop
+                    return
+
+                # 2) Emit event to Redis Streams for orchestrator FSM
+                if event_broker:
+                    try:
+                        evt_type = EventTypes.STT_FINAL if is_final else EventTypes.STT_PARTIAL
+                        event = VoiceEvent(
+                            event_type=evt_type,
+                            session_id=session_id,
+                            source="stt-sarvam",
+                            payload={
+                                "text": text,
+                                "confidence": 1.0,  # TODO: wire actual confidence from VAD/Sarvam if available
+                                "is_final": is_final,
+                            },
+                        )
+                        await event_broker.publish(f"voice:stt:session:{session_id}", event)
+                        logger.info(f"[{session_id}]    📢 Published to Redis Streams")
+                    except Exception as e:
+                        logger.warning(f"[{session_id}] ⚠️ Failed to emit STT event to Redis Streams: {e}")
+
             except Exception as e:
-                logger.warning(f"⚠️ Failed to send fragment: {e}")
-    
+                logger.warning(f"[{session_id}] ⚠️ Failed to handle streaming callback: {e}", exc_info=True)
+
         asyncio.create_task(send_fragment())
 
     try:
@@ -591,9 +662,8 @@ async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, w
             try:
                 # Use VAD manager to process chunk
                 if vad_manager:
-                    # Log chunk received
                     chunk_size = len(audio_chunk)
-                    logger.debug(f"📥 Audio chunk received | Size: {chunk_size} bytes | Session: {session_id}")
+                    logger.debug(f"[{session_id}] 🔄 Processing audio chunk | Size: {chunk_size} bytes")
                     
                     # For continuous mode, we process each chunk individually
                     # This provides real-time streaming without waiting for turn completion
@@ -602,16 +672,18 @@ async def continuous_capture_loop(session_id: str, audio_queue: asyncio.Queue, w
                         audio_chunk,
                         streaming_callback
                     )
+                else:
+                    logger.warning(f"[{session_id}] ⚠️ VAD manager not available, cannot process audio chunk")
 
             except Exception as e:
-                logger.error(f"❌ Error processing audio chunk for session {session_id}: {e}")
+                logger.error(f"[{session_id}] ❌ Error processing audio chunk: {e}", exc_info=True)
                 # Continue processing other chunks even if one fails
 
     except asyncio.CancelledError:
-        logger.info(f"🛑 Continuous capture loop cancelled | Session: {session_id}")
+        logger.info(f"[{session_id}] 🛑 Continuous capture loop cancelled")
         raise
     except Exception as e:
-        logger.error(f"❌ Continuous capture loop error | Session: {session_id} | Error: {e}")
+        logger.error(f"[{session_id}] ❌ Continuous capture loop error: {e}", exc_info=True)
 
 
 @app.get("/health")

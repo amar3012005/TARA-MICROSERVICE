@@ -10,8 +10,13 @@ import json
 import logging
 import time
 from enum import Enum
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, Optional, List
 from dataclasses import dataclass, asdict
+
+from redis.asyncio import Redis
+from leibniz_agent.services.shared.events import VoiceEvent, EventTypes
+from leibniz_agent.services.shared.event_broker import EventBroker
+from .structured_logger import StructuredLogger
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +28,43 @@ class State(Enum):
     THINKING = "thinking"
     SPEAKING = "speaking"
     INTERRUPT = "interrupt"
+
+
+class StateContract:
+    """Define what MUST happen when entering each state."""
+    
+    # Map state value (str) to contract details
+    CONTRACTS = {
+        State.IDLE.value: {
+            "microphone": "CLOSED",
+            "audio_playback": "STOPPED",
+            "side_effects": [],
+        },
+        State.LISTENING.value: {
+            "microphone": "OPEN",
+            "audio_playback": "STOPPED",
+            "side_effects": [],
+        },
+        State.THINKING.value: {
+            "microphone": "GATED",
+            "audio_playback": "STOPPED",
+            "side_effects": ["play_immediate_filler"],
+        },
+        State.SPEAKING.value: {
+            "microphone": "GATED",
+            "audio_playback": "STREAMING",
+            "side_effects": ["cancel_filler"],
+        },
+        State.INTERRUPT.value: {
+            "microphone": "GATED",
+            "audio_playback": "STOPPED",
+            "side_effects": ["cancel_tts", "cancel_filler"],
+        }
+    }
+    
+    @classmethod
+    def get(cls, state: State) -> dict:
+        return cls.CONTRACTS.get(state.value, {})
 
 
 @dataclass
@@ -80,10 +122,12 @@ class StateManager:
     Latency target: <100ms per transition
     """
     
-    def __init__(self, session_id: str, redis_client):
+    def __init__(self, session_id: str, redis_client: Redis, broker: Optional[EventBroker] = None):
         self.session_id = session_id
         self.redis = redis_client
+        self.broker = broker
         self.state = State.IDLE
+        self.structured_logger = StructuredLogger(logger)
         self.context = ConversationContext(
             session_id=session_id, 
             state=State.IDLE.value,
@@ -92,6 +136,27 @@ class StateManager:
         self.transition_callbacks: Dict[str, list[Callable]] = {
             state.value: [] for state in State
         }
+        
+        # Valid state transitions
+        self.valid_transitions = {
+            State.IDLE: [State.LISTENING, State.SPEAKING],  # SPEAKING for intro/timeout prompts
+            State.LISTENING: [State.THINKING, State.INTERRUPT, State.IDLE, State.SPEAKING],  # SPEAKING for fillers/timeout
+            State.THINKING: [State.SPEAKING, State.IDLE, State.LISTENING],  # LISTENING for quick returns
+            State.SPEAKING: [State.LISTENING, State.INTERRUPT, State.IDLE],
+            State.INTERRUPT: [State.LISTENING, State.IDLE],
+        }
+        
+        # Side-effect handlers per state
+        self.handlers = {
+            State.IDLE: self.handle_idle_state,
+            State.LISTENING: self.handle_listening_state,
+            State.THINKING: self.handle_thinking_state,
+            State.SPEAKING: self.handle_speaking_state,
+            State.INTERRUPT: self.handle_interrupt_state,
+        }
+        # Simple in-memory latency tracking per transition key
+        self.latencies: Dict[str, List[float]] = {}
+        self._last_transition_ts: float = time.time()
         
     async def initialize(self):
         """Load session state from Redis or create new"""
@@ -109,7 +174,12 @@ class StateManager:
                         self.context.text_buffer = json.loads(existing.get("text_buffer", "[]"))
                     if existing.get("last_activity_time"):
                         self.context.last_activity_time = float(existing.get("last_activity_time", time.time()))
-                    self.state = State(self.context.state)
+                    try:
+                        self.state = State(self.context.state)
+                    except ValueError:
+                        logger.warning(f"Invalid state in Redis: {self.context.state}, resetting to IDLE")
+                        self.state = State.IDLE
+                        self.context.state = State.IDLE.value
                 else:
                     logger.info(f"[{self.session_id}] 🆕 Created new session")
                     await self.save_state()
@@ -118,7 +188,7 @@ class StateManager:
     
     async def transition(self, new_state: State, trigger: str, data: Optional[Dict] = None):
         """
-        Atomic state transition with logging and Redis persistence.
+        Atomic state transition with logging, Redis persistence, and event emission.
         
         Args:
             new_state: Target state
@@ -126,8 +196,46 @@ class StateManager:
             data: Optional context data
         """
         old_state = self.state
-        timestamp = time.time()
         
+        # Validate transition
+        if new_state not in self.valid_transitions.get(old_state, []):
+            # Allow resetting to IDLE from anywhere on error
+            if new_state == State.IDLE and trigger == "error":
+                pass
+            else:
+                logger.error(
+                    f"[{self.session_id}] ❌ INVALID TRANSITION: "
+                    f"{old_state.value.upper()} → {new_state.value.upper()} "
+                    f"(trigger: {trigger})"
+                )
+                logger.error(
+                    f"[{self.session_id}] Valid next states from {old_state.value}: "
+                    f"{[s.value for s in self.valid_transitions.get(old_state, [])]}"
+                )
+                return
+
+        # Preconditions for specific states
+        if new_state == State.SPEAKING:
+            # Accept either "response" or "text" key for SPEAKING transitions
+            # This allows flexibility for different call sites (intro/timeout use "response", 
+            # while some legacy code might use "text")
+            if not data or (not data.get("response") and not data.get("text")):
+                logger.error(
+                    f"[{self.session_id}] Cannot transition to SPEAKING without response text "
+                    f"(data keys: {list(data.keys()) if data else 'None'})"
+                )
+                return
+        
+        timestamp = time.time()
+        transition_key = f"{old_state.value}→{new_state.value}"
+
+        # Latency since last transition (best-effort)
+        delta_ms = (timestamp - self._last_transition_ts) * 1000.0
+        self._last_transition_ts = timestamp
+
+        # Track latency history per transition
+        self.latencies.setdefault(transition_key, []).append(delta_ms)
+
         # Update state
         self.state = new_state
         self.context.state = new_state.value
@@ -151,6 +259,25 @@ class StateManager:
         # Persist to Redis (O(1) operation)
         await self.save_state()
         
+        # Emit state change event (non-blocking, audit logging only)
+        # Phase 2: Event emission is fire-and-forget, does not block transitions
+        if self.broker:
+            event = VoiceEvent(
+                event_type=EventTypes.ORCHESTRATOR_STATE,
+                session_id=self.session_id,
+                source="orchestrator",
+                payload={
+                    "old_state": old_state.value,
+                    "new_state": new_state.value,
+                    "trigger": trigger,
+                    "data": data or {}
+                }
+            )
+            asyncio.create_task(
+                self._emit_event_async(event),
+                name=f"audit_log_{self.session_id}_{new_state.value}"
+            )
+        
         # Emit logs with emojis for Docker console visibility
         state_emoji = {
             State.IDLE: "🟢",
@@ -161,12 +288,39 @@ class StateManager:
         }
         
         logger.info(
-            f"[{self.session_id}] {state_emoji[old_state]} {old_state.value.upper()} "
-            f"→ {state_emoji[new_state]} {new_state.value.upper()} "
+            f"[{self.session_id}] {state_emoji.get(old_state, '')} {old_state.value.upper()} "
+            f"→ {state_emoji.get(new_state, '')} {new_state.value.upper()} "
             f"({trigger})"
         )
+        # Structured state transition + latency record
+        self.structured_logger.state_transition(
+            self.session_id,
+            old_state.value,
+            new_state.value,
+            trigger,
+            data=data or {},
+        )
+        self.structured_logger.latency_recorded(
+            self.session_id,
+            operation=f"{old_state.value}_to_{new_state.value}",
+            duration_ms=delta_ms,
+        )
         
-        # Fire callbacks
+        # Execute contract
+        await self.execute_contract(new_state, data)
+        
+        # Execute legacy side-effect handlers (if any remain)
+        handler = self.handlers.get(new_state)
+        if handler:
+            try:
+                if asyncio.iscoroutinefunction(handler):
+                    await handler(trigger, data)
+                else:
+                    handler(trigger, data)
+            except Exception as e:
+                logger.error(f"[{self.session_id}] ❌ State handler error: {e}", exc_info=True)
+        
+        # Fire registered callbacks
         for callback in self.transition_callbacks.get(new_state.value, []):
             try:
                 if asyncio.iscoroutinefunction(callback):
@@ -198,29 +352,23 @@ class StateManager:
         except Exception as e:
             logger.warning(f"[{self.session_id}] ⚠️ Redis save failed: {e}")
     
+    async def _emit_event_async(self, event: VoiceEvent):
+        """
+        Non-blocking event emission for audit logging.
+        
+        Errors are logged but do not affect the main flow.
+        This is fire-and-forget - used for state change audit trail only.
+        """
+        try:
+            await self.broker.publish(f"voice:orchestrator:session:{self.session_id}", event)
+        except Exception as e:
+            # Log but don't fail - audit logging is optional
+            logger.debug(f"[{self.session_id}] Audit event emission failed (non-critical): {e}")
+    
     async def load_state(self):
         """Load state from Redis"""
-        redis_key = f"orchestrator:session:{self.session_id}"
-        
-        try:
-            if self.redis:
-                data = await self.redis.hgetall(redis_key)
-                if data:
-                    self.context.state = data.get("state", "idle")
-                    self.context.turn_number = int(data.get("turn_number", 0))
-                    if data.get("text_buffer"):
-                        self.context.text_buffer = json.loads(data.get("text_buffer", "[]"))
-                    if data.get("intent"):
-                        self.context.intent = json.loads(data.get("intent", "{}"))
-                    if data.get("rag_results"):
-                        self.context.rag_results = json.loads(data.get("rag_results", "{}"))
-                    self.context.llm_response = data.get("llm_response", "")
-                    if data.get("last_activity_time"):
-                        self.context.last_activity_time = float(data.get("last_activity_time", time.time()))
-                    self.state = State(self.context.state)
-                    logger.debug(f"[{self.session_id}] ✅ State loaded from Redis")
-        except Exception as e:
-            logger.error(f"[{self.session_id}] ❌ Load failed: {e}")
+        # Alias for initialize to keep compatibility
+        await self.initialize()
     
     def on_transition(self, state: State):
         """Register callback for state transitions"""
@@ -230,28 +378,81 @@ class StateManager:
         return decorator
     
     async def get_latency_breakdown(self) -> Dict[str, float]:
-        """Calculate latencies between state transitions"""
-        latencies = {}
-        timestamps = self.context.timestamps
+        """
+        Calculate simple latency statistics between state transitions.
+
+        Returns a mapping of transition key -> average latency in milliseconds.
+        """
+        breakdown: Dict[str, float] = {}
+        for key, samples in self.latencies.items():
+            if samples:
+                breakdown[key] = sum(samples) / len(samples)
+        return breakdown
+
+    async def execute_contract(self, state: State, data: Optional[Dict]):
+        """Execute state contract side effects."""
+        contract = StateContract.get(state)
         
-        state_sequence = [
-            ("idle_to_listening", "STT Wait"),
-            ("listening_to_thinking", "End-of-Turn"),
-            ("thinking_to_speaking", "LLM Wait"),
-            ("speaking_to_idle", "TTS Complete"),
-        ]
+        # 1. Microphone control
+        mic_state = contract.get("microphone")
+        if mic_state == "OPEN":
+            await self._control_mic(gate_off=True)
+            logger.info(f"[{self.session_id}] 🎤 Microphone OPEN")
+        elif mic_state in ("GATED", "CLOSED"):
+            await self._control_mic(gate_off=False)
+            logger.info(f"[{self.session_id}] 🎤 Microphone GATED")
+            
+        # 2. Side effects (logging for now, as app.py handles most)
+        for effect in contract.get("side_effects", []):
+            logger.debug(f"[{self.session_id}] Contract requires side effect: {effect}")
+
+    # =========================================================================
+    # State Handlers (Legacy / Specific Logic)
+    # =========================================================================
+    
+    async def handle_idle_state(self, trigger: str, data: dict):
+        """Side effects for IDLE state"""
+        # Contract handles mic
+        # Maybe clean up buffers?
+        self.context.text_buffer = []
+
+    async def handle_listening_state(self, trigger: str, data: dict):
+        """Side effects for LISTENING state"""
+        # Contract handles mic
+        pass
+
+    async def handle_thinking_state(self, trigger: str, data: dict):
+        """Side effects for THINKING state"""
+        # Contract handles mic
         
-        prev_ts = 0
-        for transition, label in state_sequence:
-            if transition in timestamps:
-                latencies[label] = (timestamps[transition] - prev_ts) * 1000  # ms
-                prev_ts = timestamps[transition]
-        
-        return latencies
+        if data and data.get("text"):
+            text = data["text"]
+            logger.info(f"[{self.session_id}] Processing: '{text[:50]}...'")
+
+    async def handle_speaking_state(self, trigger: str, data: dict):
+        """Side effects for SPEAKING state"""
+        # Contract handles mic
+        pass
+
+    async def handle_interrupt_state(self, trigger: str, data: dict):
+        """Side effects for INTERRUPT state (barge-in)"""
+        logger.info(f"[{self.session_id}] User interrupted agent speech")
+        # Contract handles mic
+        # TTS cancellation handled by app.py task management
 
 
-
-
-
-
-
+    async def _control_mic(self, gate_off: bool):
+        """Emit mic control event to Unified FastRTC via Redis"""
+        if self.broker:
+            # Action: gate_off=True -> mic open (gate disabled)
+            # Action: gate_off=False -> mic closed/gated (gate enabled)
+            action = "gate_off" if gate_off else "gate_on"
+            
+            # This relies on unified_fastrtc listening to this stream
+            # or orchestrator forwarding it.
+            # Ideally orchestrator consumes this state event and calls broadcast_orchestrator_state
+            # But we can also emit a direct control event if needed.
+            
+            # For now, the orchestrator app.py (FSM consumer) will see the state change
+            # and call broadcast_orchestrator_state().
+            pass

@@ -19,6 +19,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as redis
 
+from shared.event_broker import EventBroker
+from shared.events import VoiceEvent, EventTypes
+
 from config import IntentConfig
 from intent_classifier import IntentClassifier
 
@@ -31,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 # Global state
 redis_client: Optional[redis.Redis] = None
+event_broker: Optional[EventBroker] = None
 classifier: Optional[IntentClassifier] = None
 config: Optional[IntentConfig] = None
 
@@ -142,7 +146,7 @@ async def lifespan(app: FastAPI):
     """
     Manage service lifecycle (startup/shutdown)
     """
-    global redis_client, classifier, config
+    global redis_client, event_broker, classifier, config
     
     logger.info(" Starting Intent Classification service...")
     
@@ -158,10 +162,13 @@ async def lifespan(app: FastAPI):
     try:
         redis_client = await asyncio.wait_for(
             redis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True),
-            timeout=5.0
+            timeout=5.0,
         )
         await asyncio.wait_for(redis_client.ping(), timeout=2.0)
         logger.info(f" Redis connected: {REDIS_URL}")
+
+        # Initialize EventBroker for stream-based events
+        event_broker = EventBroker(redis_client)
     except asyncio.TimeoutError:
         logger.warning("️ Redis connection timeout - continuing without cache")
         redis_client = None
@@ -278,6 +285,81 @@ async def classify_intent_endpoint(request: ClassifyRequest):
     except Exception as e:
         logger.error(f" Classification error: {e}")
         raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+
+
+async def _process_event_message(stream_key: str, message_id: str, fields: Dict[str, Any]):
+    """
+    Internal helper: process one message from a Redis stream as an event.
+    """
+    global classifier, event_broker
+
+    if not classifier or not event_broker:
+        logger.warning("Classifier or EventBroker not initialized; skipping event")
+        return
+
+    try:
+        event = VoiceEvent.from_redis_dict(fields)
+        if event.event_type != "voice.intent.request":
+            return
+
+        text = event.payload.get("text", "")
+        if not text:
+            return
+
+        logger.info(f"[Intent Service] Event classify: '{text[:80]}' (session={event.session_id})")
+
+        # Perform classification (reuse core classifier)
+        result = await classifier.classify_intent(text, event.metadata or None)
+
+        response_event = VoiceEvent(
+            event_type=EventTypes.INTENT_DETECTED,
+            session_id=event.session_id,
+            source="intent-service",
+            payload=result,
+            correlation_id=event.correlation_id,
+            metadata=event.metadata or {},
+        )
+
+        await event_broker.publish(f"voice:intent:session:{event.session_id}", response_event)
+    except Exception as e:
+        logger.error(f"Intent event processing failed: {e}", exc_info=True)
+
+
+@app.on_event("startup")
+async def start_intent_event_consumer():
+    """
+    Background task: consume intent request events from Redis Streams.
+    """
+    global redis_client, event_broker
+    if not redis_client:
+        logger.warning("Redis not initialized; event-driven intent consumer disabled")
+        return
+
+    if not event_broker:
+        event_broker = EventBroker(redis_client)
+
+    async def _consume_loop():
+        stream_key = "voice:intent:requests"
+        last_id = "$"  # only new messages
+        logger.info(f"Starting intent event consumer on stream: {stream_key}")
+
+        while True:
+            try:
+                messages = await redis_client.xread({stream_key: last_id}, block=1000, count=10)
+                if not messages:
+                    continue
+
+                for skey, entries in messages:
+                    for msg_id, fields in entries:
+                        await _process_event_message(skey, msg_id, fields)
+                        last_id = msg_id
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Intent event consumer error: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+
+    asyncio.create_task(_consume_loop())
 
 
 @app.get("/health", response_model=HealthResponse)

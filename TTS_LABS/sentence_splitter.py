@@ -109,3 +109,6 @@ def split_into_sentences(text: str, min_words: int = 10) -> List[str]:
             valid_sentences.append(' '.join(chunk))
     
     return valid_sentences
+
+
+

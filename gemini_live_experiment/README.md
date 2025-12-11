@@ -83,3 +83,6 @@ docker-compose -f docker-compose.experiment.yml up --build
 - Tool response format may need adjustment based on Gemini Live API version
 - Audio format conversion assumes 16kHz mono PCM
 - RAG service must be running and accessible
+
+
+

@@ -125,3 +125,6 @@ class RAGClient:
             await self.client.aclose()
             self.client = None
             logger.info("🔌 RAG Client closed")
+
+
+

@@ -225,6 +225,47 @@ async def get_redis_info(client: Optional[redis.Redis] = None) -> Dict[str, Any]
         return {"error": str(e)}
 
 
+async def get_stream_length(stream_key: str, client: Optional[redis.Redis] = None) -> int:
+    """
+    Get the length of a Redis stream.
+    
+    Args:
+        stream_key: The key of the stream
+        client: Redis client instance (optional)
+        
+    Returns:
+        int: Length of the stream
+    """
+    try:
+        if client is None:
+            client = await get_redis_client()
+        return await client.xlen(stream_key)
+    except Exception as e:
+        logger.error(f"Failed to get stream length for {stream_key}: {e}")
+        return 0
+
+
+async def get_redis_stream_client() -> redis.Redis:
+    """
+    Get a Redis client configured for stream operations.
+    Currently returns the standard client, but allows for future specialization.
+    
+    Returns:
+        redis.Redis: Async Redis client instance
+    """
+    return await get_redis_client()
+
+
+async def get_event_broker():
+    """
+    Get an EventBroker instance backed by the shared Redis client.
+    """
+    from .event_broker import EventBroker
+    client = await get_redis_client()
+    return EventBroker(client)
+
+
+
 async def close_redis_client():
     """
     Gracefully close Redis client and connection pool.

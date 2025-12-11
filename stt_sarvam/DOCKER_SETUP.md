@@ -18,8 +18,8 @@ stt-sarvam:
 
 ## Ports
 
-- **2002**: Main API and WebSocket endpoint (`/api/v1/transcribe/stream`)
-- **2013**: FastRTC UI for browser-based testing (`/fastrtc`)
+- **2016**: Main API and WebSocket endpoint (`/api/v1/transcribe/stream`)
+- **2017**: FastRTC UI for browser-based testing (`/fastrtc`)
 
 ## Environment Variables
 
@@ -61,12 +61,12 @@ docker-compose -f docker-compose-tara-task.yml up --build stt-sarvam
 ### 3. Verify Health
 
 ```bash
-curl http://localhost:2002/health
+curl http://localhost:2016/health
 ```
 
 ### 4. Test FastRTC UI
 
-Navigate to: `http://localhost:2013/fastrtc`
+Navigate to: `http://localhost:2017/fastrtc`
 
 ## Switching Between STT Services
 
@@ -109,22 +109,22 @@ docker-compose -f docker-compose-tara-task.yml up orchestrator
 
 ### WebSocket Transcription
 ```
-ws://localhost:2002/api/v1/transcribe/stream?session_id=<session_id>
+ws://localhost:2016/api/v1/transcribe/stream?session_id=<session_id>
 ```
 
 ### Health Check
 ```
-GET http://localhost:2002/health
+GET http://localhost:2016/health
 ```
 
 ### Metrics
 ```
-GET http://localhost:2002/metrics
+GET http://localhost:2016/metrics
 ```
 
 ### Reset Sessions
 ```
-POST http://localhost:2002/admin/reset_session
+POST http://localhost:2016/admin/reset_session
 ```
 
 ## Monitoring
@@ -142,7 +142,7 @@ SUBSCRIBE leibniz:events:stt
 
 ### View Metrics
 ```bash
-curl http://localhost:2002/metrics | jq
+curl http://localhost:2016/metrics | jq
 ```
 
 ## Troubleshooting
@@ -156,7 +156,7 @@ curl http://localhost:2002/metrics | jq
 1. Verify API key is valid
 2. Check network connectivity to Sarvam API
 3. Review logs for rate limit errors
-4. Test with FastRTC UI: `http://localhost:2013/fastrtc`
+4. Test with FastRTC UI: `http://localhost:2017/fastrtc`
 
 ### High Latency
 1. Ensure `SARVAM_HIGH_VAD_SENSITIVITY=true`
@@ -179,3 +179,6 @@ Browser → FastRTC → FastRTCSTTHandler → VADManager → SarvamStreamingClie
 - **orchestrator**: Master controller (can use stt-sarvam)
 - **rag**: Knowledge base service (consumes transcripts from Redis)
 - **redis**: Message broker for inter-service communication
+
+
+
